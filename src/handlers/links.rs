@@ -1,4 +1,3 @@
-#![allow(unused_variables)]
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -76,72 +75,49 @@ pub async fn create_link(
     .await;
     match result {
         Ok(_) => {
-            let _ = log_audit(&pool, &session.username, "create_link", Some(&payload.title), None).await;
+            let _ = log_audit(&pool, &session.username, "create_link", Some(&payload.title), None, None, None).await;
             (StatusCode::CREATED, "链接添加成功").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("添加失败: {}", e)).into_response(),
     }
 }
 
-// 更新链接
+// 更新链接（使用 COALESCE 避免动态 SQL 拼接）
 pub async fn update_link(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateLinkRequest>,
 ) -> impl IntoResponse {
-    let row = sqlx::query("SELECT id FROM links WHERE id = ? AND username = ?")
-        .bind(id)
-        .bind(&session.username)
-        .fetch_optional(&pool)
-        .await;
-    if row.is_err() || row.unwrap().is_none() {
-        return (StatusCode::NOT_FOUND, "链接不存在或无权操作").into_response();
-    }
-
-    let mut updates = Vec::new();
-    let mut bind_idx = 1;
-    if let Some(title) = &payload.title {
-        updates.push(format!("title = ?{}", bind_idx));
-        bind_idx += 1;
-    }
-    if let Some(url) = &payload.url {
+    // URL 格式校验（若提供）
+    if let Some(ref url) = payload.url {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return (StatusCode::BAD_REQUEST, "URL必须以http://或https://开头").into_response();
         }
-        updates.push(format!("url = ?{}", bind_idx));
-        bind_idx += 1;
     }
-    if let Some(icon) = &payload.icon {
-        updates.push(format!("icon = ?{}", bind_idx));
-        bind_idx += 1;
-    }
-    if let Some(order) = payload.sort_order {
-        updates.push(format!("sort_order = ?{}", bind_idx));
-        bind_idx += 1;
-    }
-    if updates.is_empty() {
+    if payload.title.as_ref().map_or(true, |t| t.trim().is_empty())
+        && payload.url.is_none()
+        && payload.icon.is_none()
+        && payload.sort_order.is_none()
+    {
         return (StatusCode::BAD_REQUEST, "没有要更新的字段").into_response();
     }
-    let query_str = format!("UPDATE links SET {} WHERE id = ?{}", updates.join(", "), bind_idx);
-    let mut query = sqlx::query(&query_str);
-    if let Some(title) = &payload.title {
-        query = query.bind(title);
-    }
-    if let Some(url) = &payload.url {
-        query = query.bind(url);
-    }
-    if let Some(icon) = &payload.icon {
-        query = query.bind(icon);
-    }
-    if let Some(order) = payload.sort_order {
-        query = query.bind(order);
-    }
-    query = query.bind(id);
-    let result = query.execute(&pool).await;
+
+    let result = sqlx::query(
+        "UPDATE links SET title = COALESCE(?, title), url = COALESCE(?, url), icon = COALESCE(?, icon), sort_order = COALESCE(?, sort_order) WHERE id = ? AND username = ?"
+    )
+    .bind(&payload.title)
+    .bind(&payload.url)
+    .bind(&payload.icon)
+    .bind(payload.sort_order)
+    .bind(id)
+    .bind(&session.username)
+    .execute(&pool)
+    .await;
+
     match result {
         Ok(_) => {
-            let _ = log_audit(&pool, &session.username, "update_link", Some(&id.to_string()), None).await;
+            let _ = log_audit(&pool, &session.username, "update_link", Some(&id.to_string()), None, None, None).await;
             (StatusCode::OK, "链接更新成功").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e)).into_response(),
@@ -161,7 +137,7 @@ pub async fn delete_link(
         .await;
     match result {
         Ok(_) => {
-            let _ = log_audit(&pool, &session.username, "delete_link", Some(&id.to_string()), None).await;
+            let _ = log_audit(&pool, &session.username, "delete_link", Some(&id.to_string()), None, None, None).await;
             (StatusCode::OK, "链接删除成功").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败: {}", e)).into_response(),

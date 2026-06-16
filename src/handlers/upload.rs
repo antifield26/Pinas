@@ -11,9 +11,9 @@ use crate::handlers::utils::{
     is_allowed_mime_streaming,
     is_blocked_extension,
     safe_join_sandbox,
-    update_user_used_mb,
     user_dir_path,
     log_audit,
+    bytes_to_mb_ceil,
 };
 use pinas_core::UserSession;
 
@@ -53,10 +53,10 @@ pub async fn check_chunk(
     let username = &session.username;
     let identifier = &query.identifier;
 
-    // 检查文件是否已完全上传（通过 files 表中记录）
-    let file_exists = sqlx::query("SELECT 1 FROM files WHERE username = ? AND size_mb LIKE ? LIMIT 1")
+    // 检查文件是否已完全上传（通过文件的 content identifier 匹配）
+    let file_exists = sqlx::query("SELECT 1 FROM files WHERE username = ? AND identifier = ? LIMIT 1")
         .bind(username)
-        .bind(&format!("%{}%", identifier))
+        .bind(identifier)
         .fetch_optional(&pool)
         .await
         .unwrap_or(None)
@@ -91,38 +91,75 @@ pub async fn check_chunk(
     })
 }
 
-// --- 4. 处理分片上传 (核心：必须完整消费 Multipart 防止前端网络错误) ---
+// --- 4. 处理分片上传（流式写入磁盘，避免内存缓冲） ---
+use crate::constants::MAX_CHUNK_SIZE_BYTES as MAX_CHUNK_SIZE;
+
 pub async fn upload_chunk(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Query(params): Query<ChunkParams>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let mut chunk_data = Vec::new();
-    while let Ok(Some(mut field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            while let Ok(Some(chunk)) = field.chunk().await {
-                chunk_data.extend_from_slice(&chunk);
-            }
-        }
+    // 校验分片索引合法性
+    if params.chunk_index < 0 || params.chunk_index >= params.total_chunks {
+        return (StatusCode::BAD_REQUEST, "分片索引超出范围").into_response();
+    }
+    if params.total_chunks <= 0 || params.total_chunks > crate::constants::MAX_CHUNKS_PER_FILE {
+        return (StatusCode::BAD_REQUEST, "总分片数不合法").into_response();
     }
 
-    if chunk_data.is_empty() {
-        return (StatusCode::BAD_REQUEST, "分片数据流为空").into_response();
-    }
-    if params.chunk_index == 0 && !is_allowed_mime(&chunk_data) {
-        return (StatusCode::FORBIDDEN, "非法执行文件伪装漏洞防护阻断").into_response();
-    }
-
+    // 确保临时目录存在
     let tmp_dir = format!("uploads/tmp/{}", params.identifier);
     let _ = tokio::fs::create_dir_all(&tmp_dir).await;
     let chunk_path = format!("{}/{}", tmp_dir, params.chunk_index);
 
-    if let Err(e) = tokio::fs::write(&chunk_path, &chunk_data).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("写入分片失败: {}", e)).into_response();
+    // 直接创建文件，流式写入
+    let mut file = match tokio::fs::File::create(&chunk_path).await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("创建分片文件失败: {}", e)).into_response(),
+    };
+
+    let mut total_written: u64 = 0;
+    let mut mime_buf = [0u8; crate::constants::MIME_HEADER_BUF_SIZE];
+    let mut mime_read: usize = 0;
+    let is_first_chunk = params.chunk_index == 0;
+
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            while let Ok(Some(chunk)) = field.chunk().await {
+                total_written += chunk.len() as u64;
+                if total_written > MAX_CHUNK_SIZE {
+                    let _ = tokio::fs::remove_file(&chunk_path).await;
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "分片超过 100 MB 上限").into_response();
+                }
+
+                // 首个分片：保留前 512 字节用于 MIME 检测
+                if is_first_chunk && mime_read < crate::constants::MIME_HEADER_BUF_SIZE {
+                    let to_copy = std::cmp::min(chunk.len(), crate::constants::MIME_HEADER_BUF_SIZE - mime_read);
+                    mime_buf[mime_read..mime_read + to_copy].copy_from_slice(&chunk[..to_copy]);
+                    mime_read += to_copy;
+                }
+
+                if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
+                    let _ = tokio::fs::remove_file(&chunk_path).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("写入分片失败: {}", e)).into_response();
+                }
+            }
+        }
     }
 
-    // 记录总分片数（若不存在则插入）
+    if total_written == 0 {
+        let _ = tokio::fs::remove_file(&chunk_path).await;
+        return (StatusCode::BAD_REQUEST, "分片数据流为空").into_response();
+    }
+
+    // 首分片 MIME 安全校验
+    if is_first_chunk && !is_allowed_mime(&mime_buf[..mime_read]) {
+        let _ = tokio::fs::remove_file(&chunk_path).await;
+        return (StatusCode::FORBIDDEN, "非法执行文件伪装漏洞防护阻断").into_response();
+    }
+
+    // 记录总分数（若不存在则插入）
     let _ = sqlx::query(
         "INSERT OR IGNORE INTO upload_chunks (username, identifier, total_chunks) VALUES (?, ?, ?)"
     )
@@ -183,7 +220,7 @@ pub async fn merge_chunks(
     }
 
     let parent_path = user_dir_path(Some(payload.parent_path));
-    let base_path = std::path::Path::new("uploads");
+    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let user_dir = safe_join_sandbox(base_path, &format!("{}/{}", username, parent_path));
     let _ = tokio::fs::create_dir_all(&user_dir).await;
     let target_file_path = user_dir.join(&payload.file_name);
@@ -221,33 +258,42 @@ pub async fn merge_chunks(
 
     // 获取文件元数据
     let meta = target_file_path.metadata().map(|m| m.len()).unwrap_or(0);
-    let file_size_mb = (meta as f64 / 1048576.0).ceil() as i64;
+    let file_size_mb = bytes_to_mb_ceil(meta);
 
-    // 检查用户配额（不使用 ?）
-    let current_used: i64 = match sqlx::query_scalar("SELECT used_mb FROM users WHERE username = ?")
-        .bind(username)
-        .fetch_one(&pool)
-        .await
-    {
-        Ok(v) => v,
+    // 使用事务避免 TOCTOU 竞态：在事务内原子地检查并扣减配额
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
         Err(e) => {
             let _ = tokio::fs::remove_file(&target_file_path).await;
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("开启事务失败: {}", e)).into_response();
+        }
+    };
+
+    // 在事务内原子读取 used_mb + quota_mb
+    let (current_used, quota): (i64, i64) = match sqlx::query_as(
+        "SELECT used_mb, quota_mb FROM users WHERE username = ?"
+    )
+    .bind(username)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let _ = tokio::fs::remove_file(&target_file_path).await;
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            return (StatusCode::NOT_FOUND, "用户不存在").into_response();
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&target_file_path).await;
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询用户配额失败: {}", e)).into_response();
         }
     };
-    let quota: i64 = match sqlx::query_scalar("SELECT quota_mb FROM users WHERE username = ?")
-        .bind(username)
-        .fetch_one(&pool)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询用户配额失败: {}", e)).into_response();
-        }
-    };
+
     if current_used + file_size_mb > quota {
         let _ = tokio::fs::remove_file(&target_file_path).await;
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
         return (StatusCode::FORBIDDEN, format!("存储空间不足，配额 {} MB，已使用 {} MB", quota, current_used)).into_response();
     }
 
@@ -264,20 +310,39 @@ pub async fn merge_chunks(
         }
     }
 
-    let size_mb = format!("{:.2}", meta as f64 / 1048576.0);
-    let _ = sqlx::query(
-        "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)"
+    // 在事务内插入文件记录并更新配额（原子操作）
+    if let Err(e) = sqlx::query(
+        "INSERT INTO files (username, name, parent_path, is_dir, size_mb, identifier) VALUES (?, ?, ?, 0, ?, ?)"
     )
     .bind(username)
     .bind(&payload.file_name)
     .bind(&parent_path)
-    .bind(&size_mb)
-    .execute(&pool)
-    .await;
+    .bind(file_size_mb)
+    .bind(&payload.identifier)
+    .execute(&mut *tx)
+    .await
+    {
+        let _ = tokio::fs::remove_file(&target_file_path).await;
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("数据库录入失败: {}", e)).into_response();
+    }
 
-    // 更新用户已使用容量
-    if let Err(e) = update_user_used_mb(&pool, username).await {
-        tracing::error!("更新用户容量失败: {}", e);
+    // 在事务内更新用户已用容量
+    if let Err(e) = sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
+        .bind(file_size_mb)
+        .bind(username)
+        .execute(&mut *tx)
+        .await
+    {
+        let _ = tokio::fs::remove_file(&target_file_path).await;
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("更新用户容量失败: {}", e)).into_response();
+    }
+
+    if let Err(e) = tx.commit().await {
+        let _ = tokio::fs::remove_file(&target_file_path).await;
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("提交事务失败: {}", e)).into_response();
     }
 
     // 审计日志：记录上传操作
@@ -286,8 +351,8 @@ pub async fn merge_chunks(
     } else {
         format!("{}/{}", parent_path, payload.file_name)
     };
-    let details = format!("{} MB", size_mb);
-    let _ = log_audit(&pool, username, "upload", Some(&target), Some(&details)).await;
+    let details = format!("{} MB", file_size_mb);
+    let _ = log_audit(&pool, username, "upload", Some(&target), Some(&details), None, None).await;
 
     (StatusCode::OK, "文件上传合并成功").into_response()
 }

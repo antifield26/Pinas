@@ -10,7 +10,7 @@ use uuid::Uuid;
 use zip::write::FileOptions;
 use tokio::io::{AsyncSeekExt, AsyncReadExt};
 
-use crate::handlers::utils::{safe_join_sandbox, user_dir_path, update_user_used_mb, log_audit};
+use crate::handlers::utils::{safe_join_sandbox, user_dir_path, update_user_used_mb, log_audit, bytes_to_mb_string};
 use crate::handlers::BatchDownloadRequest;
 use pinas_core::UserSession;
 
@@ -25,14 +25,27 @@ pub struct EditSaveRequest {
     pub content: String,
 }
 
+/// 编辑器读取的最大文件大小 (50 MB，防止内存耗尽)
+use crate::constants::MAX_EDITOR_READ_SIZE_BYTES as MAX_EDITOR_READ_SIZE;
+
 // 编辑器读取（只读，不记录审计日志）
 pub async fn get_file_content_handler(
     Extension(session): Extension<UserSession>,
     Query(query): Query<EditGetQuery>,
 ) -> impl IntoResponse {
     let username = &session.username;
-    let base_path = std::path::Path::new("uploads");
+    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let full_p = safe_join_sandbox(base_path, &format!("{}/{}", username, query.path));
+
+    // 检查文件大小，防止读取超大文件耗尽内存
+    if let Ok(meta) = tokio::fs::metadata(&full_p).await {
+        if meta.len() > MAX_EDITOR_READ_SIZE {
+            return (StatusCode::BAD_REQUEST,
+                format!("文件过大（{} MB），编辑器最大支持 {} MB",
+                    meta.len() / 1024 / 1024, MAX_EDITOR_READ_SIZE / 1024 / 1024)
+            ).into_response();
+        }
+    }
 
     match tokio::fs::read_to_string(&full_p).await {
         Ok(text) => (StatusCode::OK, text).into_response(),
@@ -40,14 +53,21 @@ pub async fn get_file_content_handler(
     }
 }
 
+/// 编辑器保存的最大文件大小 (10 MB)
+use crate::constants::MAX_EDIT_SAVE_SIZE_BYTES as MAX_EDIT_SIZE;
+
 // 编辑器保存
 pub async fn save_file_content_handler(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<EditSaveRequest>,
 ) -> impl IntoResponse {
+    if payload.content.len() > MAX_EDIT_SIZE {
+        return (StatusCode::BAD_REQUEST, format!("文件过大，编辑器最大支持 {} MB", MAX_EDIT_SIZE / 1024 / 1024)).into_response();
+    }
+
     let username = &session.username;
-    let base_path = std::path::Path::new("uploads");
+    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let full_p = safe_join_sandbox(base_path, &format!("{}/{}", username, payload.path));
 
     if let Err(e) = tokio::fs::write(&full_p, payload.content.as_bytes()).await {
@@ -60,7 +80,7 @@ pub async fn save_file_content_handler(
     let parent_cleaned = if parent == "/" { "".to_string() } else { parent };
 
     let meta = full_p.metadata().map(|m| m.len()).unwrap_or(0);
-    let size_mb = format!("{:.2}", meta as f64 / 1048576.0);
+    let size_mb = bytes_to_mb_string(meta);
 
     let _ = sqlx::query("UPDATE files SET size_mb = ? WHERE username = ? AND name = ? AND parent_path = ?")
         .bind(&size_mb).bind(username).bind(&name).bind(&parent_cleaned).execute(&pool).await;
@@ -68,7 +88,7 @@ pub async fn save_file_content_handler(
     let _ = update_user_used_mb(&pool, username).await;
 
     // 审计日志：保存文件
-    let _ = log_audit(&pool, username, "edit_save", Some(&payload.path), Some(&size_mb)).await;
+    let _ = log_audit(&pool, username, "edit_save", Some(&payload.path), Some(&size_mb), None, None).await;
 
     (StatusCode::OK, "在线保存成功").into_response()
 }
@@ -80,7 +100,7 @@ pub async fn media_proxy(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let username = &session.username;
-    let base_path = std::path::Path::new("uploads");
+    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let full_path = safe_join_sandbox(base_path, &format!("{}/{}", username, raw_path));
 
     if !full_path.exists() {
@@ -186,7 +206,7 @@ pub async fn download_zip(
 ) -> impl IntoResponse {
     let username = session.username;
     let parent_path = user_dir_path(payload.current_path);
-    let base_path = std::path::Path::new("uploads");
+    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let user_root = base_path.join(&username);
     let base_dir = if parent_path.is_empty() {
         user_root.clone()
@@ -196,7 +216,9 @@ pub async fn download_zip(
 
     let mut items = Vec::new();
     for name in &payload.names {
-        let target_path = base_dir.join(name);
+        // 使用 safe_join_sandbox 而非 Path::starts_with，后者不规范化 .. 组件，
+        // 可能导致路径穿越攻击（如 ../../../etc/passwd）
+        let target_path = safe_join_sandbox(&base_dir, name);
         if target_path.starts_with(&user_root) && target_path.exists() {
             items.push((name.clone(), target_path));
         }
@@ -218,7 +240,7 @@ pub async fn download_zip(
     } else {
         parent_path.clone()
     };
-    let _ = log_audit(&pool, &username, "download_zip", Some(&target), Some(&details)).await;
+    let _ = log_audit(&pool, &username, "download_zip", Some(&target), Some(&details), None, None).await;
 
     let temp_dir = std::env::temp_dir();
     let temp_file_name = format!("zip_{}.tmp", Uuid::new_v4());
@@ -245,11 +267,14 @@ pub async fn download_zip(
         Ok(())
     }).await;
 
-    if let Err(join_err) = zip_result {
-        let _ = tokio::fs::remove_file(&temp_path_clone).await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("压缩任务失败: {}", join_err)).into_response();
-    }
-    if let Err(e) = zip_result.unwrap() {
+    let zip_inner = match zip_result {
+        Ok(inner) => inner,
+        Err(join_err) => {
+            let _ = tokio::fs::remove_file(&temp_path_clone).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("压缩任务失败: {}", join_err)).into_response();
+        }
+    };
+    if let Err(e) = zip_inner {
         let _ = tokio::fs::remove_file(&temp_path_clone).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("压缩失败: {}", e)).into_response();
     }

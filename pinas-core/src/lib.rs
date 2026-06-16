@@ -1,4 +1,5 @@
 ﻿pub mod auth;
+pub use auth::hash_token;
 
 use serde::{Serialize, Deserialize};
 

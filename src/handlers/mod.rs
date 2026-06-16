@@ -9,8 +9,13 @@ mod admin;
 mod media;
 mod system;
 mod links;
+pub mod rate_limit;
+mod todos;
+mod agent;
+mod settings;
 
 // 公共导出
+pub use utils::*;
 pub use auth::*;
 pub use file_ops::*;
 pub use upload::*;
@@ -20,6 +25,9 @@ pub use admin::*;
 pub use media::*;
 pub use system::*;
 pub use links::*;
+pub use todos::*;
+pub use agent::*;
+pub use settings::*;
 
 // 公共 DTO
 use serde::Deserialize;

@@ -10,7 +10,7 @@ use crate::UserSession;
 use sha2::{Sha256, Digest};
 use tracing::{warn, error};
 
-fn hash_token(token: &str) -> String {
+pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -26,8 +26,6 @@ pub async fn auth_middleware(
     if uri_path.starts_with("/s/") {
         return Ok(next.run(req).await);
     }
-
-    let is_download = uri_path.starts_with("/downloads/");
 
     // 获取 token：media 路径支持 query 参数，其他路径仅支持 Header
     let target_token = if uri_path.starts_with("/api/media/") {
@@ -85,22 +83,6 @@ pub async fn auth_middleware(
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
-
-    // 下载权限检查保持不变...
-    if is_download {
-        let remaining_encoded = &uri_path["/downloads/".len()..]; 
-        let remaining_path = urlencoding::decode(remaining_encoded)
-            .map(|c| c.into_owned())
-            .unwrap_or_else(|_| remaining_encoded.to_string());
-
-        if role != "admin" {
-            let user_prefix = format!("{}/", username);
-            if !remaining_path.starts_with(&user_prefix) && remaining_path != username {
-                warn!("[Auth Error] 普通用户越权下载: user={}, path={}", username, remaining_path);
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-    }
 
     req.extensions_mut().insert(UserSession { username, role });
     Ok(next.run(req).await)

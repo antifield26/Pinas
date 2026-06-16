@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+/* 显式指定内容路径 — 确保 Tailwind 扫描所有模板字面量中的类名 */
+@source "../js/**/*.js";
+@source "../js/**/*.html";
+@source "../../static/index.html";
+
+/* 启用 class-based 暗色模式：JS 通过 .dark class 切换，不再仅依赖 prefers-color-scheme */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ====== 自定义组件类 ====== */
+/* 卡片容器 */
+.card {
+  @apply bg-white dark:bg-gray-800 rounded-2xl border border-gray-100 dark:border-gray-700 shadow-sm;
+}
+
+/* 输入框 */
+.input-field {
+  @apply w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-lg text-sm
+         bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200
+         focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent
+         placeholder-gray-400 dark:placeholder-gray-400 transition;
+}
+
+/* 按钮 - 主要 */
+.btn-primary {
+  @apply bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm;
+}
+
+/* 按钮 - 次要 */
+.btn-secondary {
+  @apply bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-lg text-sm font-medium transition;
+}
+
+/* 自定义动画 */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(100%); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes toast-out {
+  from { opacity: 0; transform: translateX(0); }
+  to { opacity: 1; transform: translateX(100%); }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes progress-stripes {
+  from { background-position: 1rem 0; }
+  to { background-position: 0 0; }
+}
+
+@utility animate-fade-in { animation: fade-in 0.2s ease-out; }
+@utility animate-slide-up { animation: slide-up 0.3s ease-out; }
+@utility animate-toast-in { animation: toast-in 0.3s ease-out; }
+@utility animate-toast-out { animation: toast-out 0.3s ease-in forwards; }
+
+/* 自定义滚动条 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+.dark ::-webkit-scrollbar-thumb { background: #4b5563; }
+.dark ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+
+::selection { background-color: #c7d2fe; color: #3730a3; }
+.dark ::selection { background-color: #3730a3; color: #c7d2fe; }
+
+/* 文件拖拽上传区域 */
+.drop-zone {
+  border: 2px dashed #d1d5db;
+  border-radius: 0.75rem;
+  transition: all 0.2s;
+}
+.drop-zone.active {
+  border-color: #818cf8;
+  background-color: rgba(238, 242, 255, 0.5);
+}
+.dark .drop-zone { border-color: #4b5563; }
+.dark .drop-zone.active { background-color: rgba(49, 46, 129, 0.2); }
+
+/* 进度条条纹 */
+.progress-striped {
+  background-image: linear-gradient(45deg,
+    rgba(255,255,255,.15) 25%, transparent 25%, transparent 50%,
+    rgba(255,255,255,.15) 50%, rgba(255,255,255,.15) 75%, transparent 75%, transparent);
+  background-size: 1rem 1rem;
+  animation: progress-stripes 1s linear infinite;
+}

@@ -5,9 +5,8 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7" }
-tokio = { version = "1.0", features = ["full", "fs"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
 sqlx = { version = "0.7", features = [ "runtime-tokio", "sqlite", "macros" ] }
 serde = { version = "1.0", features = ["derive"] }
-urlencoding = "2.1"
 sha2 = "0.10"
 tracing = "0.1"

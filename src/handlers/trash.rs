@@ -3,10 +3,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
-use crate::handlers::utils::{safe_join_sandbox, update_user_used_mb, log_audit};
+use crate::handlers::utils::{safe_join_sandbox, update_user_used_mb, log_audit, bytes_to_mb_string};
 use pinas_core::UserSession;
 
 #[derive(Serialize, FromRow)]
@@ -14,6 +14,11 @@ pub struct TrashItem {
     pub id: i64,
     pub original_path: String,
     pub deleted_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct TrashActionRequest {
+    pub id: i64,
 }
 
 // 列出回收站（只读，不记录审计日志）
@@ -33,9 +38,9 @@ pub async fn list_trash(
 pub async fn restore_trash(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<TrashActionRequest>,
 ) -> impl IntoResponse {
-    let id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let id = payload.id;
     let username = &session.username;
 
     let trash_meta = sqlx::query("SELECT original_path, trash_uuid FROM trash WHERE id = ? AND username = ?")
@@ -49,7 +54,7 @@ pub async fn restore_trash(
         let orig_path: String = row.get("original_path");
         let trash_uuid: String = row.get("trash_uuid");
 
-        let base_path = std::path::Path::new("uploads");
+        let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
         let src = base_path.join("tmp").join("trash").join(&trash_uuid);
         let dst = safe_join_sandbox(base_path, &format!("{}/{}", username, orig_path));
 
@@ -74,7 +79,7 @@ pub async fn restore_trash(
             let _ = restore_dir_recursive(&pool, username, &dst, &parent_cleaned).await;
         } else {
             let meta = dst.metadata().map(|m| m.len()).unwrap_or(0);
-            let size_mb = format!("{:.2}", meta as f64 / 1048576.0);
+            let size_mb = bytes_to_mb_string(meta);
             let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)")
                 .bind(username)
                 .bind(&name)
@@ -90,7 +95,7 @@ pub async fn restore_trash(
         }
 
         // 审计日志：还原文件
-        let _ = log_audit(&pool, username, "restore", Some(&orig_path), None).await;
+        let _ = log_audit(&pool, username, "restore", Some(&orig_path), None, None, None).await;
         return (StatusCode::OK, "目标已恢复原位").into_response();
     }
 
@@ -125,7 +130,7 @@ async fn restore_dir_recursive(
                 Box::pin(restore_dir_recursive(pool, username, &p, &new_parent)).await?;
             } else {
                 let m = p.metadata().map(|m| m.len()).unwrap_or(0);
-                let size_mb = format!("{:.2}", m as f64 / 1048576.0);
+                let size_mb = bytes_to_mb_string(m);
                 let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)")
                     .bind(username)
                     .bind(&n)
@@ -143,9 +148,9 @@ async fn restore_dir_recursive(
 pub async fn delete_trash_permanent(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<TrashActionRequest>,
 ) -> impl IntoResponse {
-    let id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let id = payload.id;
     let username = &session.username;
 
     if let Ok(Some(row)) = sqlx::query("SELECT trash_uuid, original_path FROM trash WHERE id = ? AND username = ?")
@@ -171,7 +176,7 @@ pub async fn delete_trash_permanent(
         }
 
         // 审计日志：永久删除
-        let _ = log_audit(&pool, username, "permanent_delete", Some(&original_path), None).await;
+        let _ = log_audit(&pool, username, "permanent_delete", Some(&original_path), None, None, None).await;
         return (StatusCode::OK, "已从磁盘彻底碎纸抹除").into_response();
     }
     (StatusCode::NOT_FOUND, "未匹配到相关项").into_response()
@@ -214,7 +219,7 @@ pub async fn clear_trash(
 
     // 审计日志：清空回收站
     let details = format!("{} items", count);
-    let _ = log_audit(&pool, username, "clear_trash", None, Some(&details)).await;
+    let _ = log_audit(&pool, username, "clear_trash", None, Some(&details), None, None).await;
     (StatusCode::OK, "回收站已清空").into_response()
 }
 

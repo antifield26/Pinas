@@ -12,7 +12,7 @@ pub async fn health_check() -> impl IntoResponse {
 pub async fn get_system_status(
     Extension(session): Extension<UserSession>,
 ) -> impl IntoResponse {
-    if session.role != "admin" {
+    if session.role != crate::constants::ROLE_ADMIN {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "管理员权限不足" }))).into_response();
     }
 

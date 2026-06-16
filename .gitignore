@@ -1,0 +1,32 @@
+# 环境变量（含密码）
+.env
+
+# 数据库文件
+cloud_disk.db
+cloud_disk.db-shm
+cloud_disk.db-wal
+
+# 编译产物
+/target/
+
+# 日志
+/logs/
+
+# Node.js 依赖
+/node_modules/
+
+# IDE
+/.vs/
+*.swp
+*.swo
+*~
+
+# Clast MCP 工具缓存
+/.clast/
+
+# Visual Studio Code
+/.vscode/
+
+# Tailwind CSS 编译输出（可由 npm run css:build 重新生成）
+# assets/css/tailwind.min.css 通常建议提交以方便部署，取消下行注释可不提交:
+# /assets/css/tailwind.min.css

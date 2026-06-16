@@ -8,11 +8,9 @@ use chrono::{Utc, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 use uuid::Uuid;
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-use argon2::Argon2;
 use tokio_util::io::ReaderStream;
 
-use crate::handlers::utils::{safe_join_sandbox, verify_password, log_audit};
+use crate::handlers::utils::{hash_password, safe_join_sandbox, verify_password, log_audit};
 use pinas_core::UserSession;
 
 // --- DTOs ---
@@ -50,14 +48,17 @@ pub async fn create_share(
     let share_code = Uuid::new_v4().to_string().chars().take(12).collect::<String>();
     let is_dir_val = if payload.is_dir { 1 } else { 0 };
     
-    // 处理密码：如果提供了密码，则计算 Argon2 哈希；否则存储 NULL
+    // 处理密码：如果提供了密码，则计算 Argon2 哈希（spawn_blocking）；否则存储 NULL
     let password_hash = match &payload.password {
         Some(pwd) if !pwd.is_empty() => {
-            let salt = SaltString::generate(&mut OsRng);
-            match Argon2::default().hash_password(pwd.as_bytes(), &salt) {
-                Ok(hash) => Some(hash.to_string()),
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("密码哈希失败: {}", e)).into_response();
+            let pwd = pwd.clone();
+            match tokio::task::spawn_blocking(move || hash_password(&pwd)).await {
+                Ok(Ok(hash)) => Some(hash),
+                Ok(Err(e)) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                }
+                Err(_) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
                 }
             }
         }
@@ -67,7 +68,8 @@ pub async fn create_share(
 
     let expires_at = payload.expire_hours.map(|h| {
         chrono::Utc::now().checked_add_signed(chrono::Duration::hours(h as i64))
-            .unwrap().format("%Y-%m-%d %H:%M:%S").to_string()
+            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(24))
+            .format("%Y-%m-%d %H:%M:%S").to_string()
     });
 
     let result = sqlx::query(
@@ -87,7 +89,7 @@ pub async fn create_share(
         Ok(_) => {
             // 审计日志：创建分享
             let details = format!("code={}, expire={:?}, has_password={}", share_code, expires_at, has_pwd);
-            let _ = log_audit(&pool, username, "create_share", Some(&payload.file_path), Some(&details)).await;
+            let _ = log_audit(&pool, username, "create_share", Some(&payload.file_path), Some(&details), None, None).await;
             (StatusCode::OK, Json(serde_json::json!({ "code": share_code }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("提取外链发生冲突: {}", e)).into_response(),
@@ -109,13 +111,18 @@ pub async fn list_shares(
     Json(rows)
 }
 
+#[derive(Deserialize)]
+pub struct DeleteShareRequest {
+    pub code: String,
+}
+
 // --- 14. 删除分享外链 ---
 pub async fn delete_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<DeleteShareRequest>,
 ) -> impl IntoResponse {
-    let code = payload.get("code").and_then(|v| v.as_str()).unwrap_or_default();
+    let code = &payload.code;
     let _ = sqlx::query("DELETE FROM shares WHERE code = ? AND username = ?")
         .bind(code)
         .bind(&session.username)
@@ -123,7 +130,7 @@ pub async fn delete_share(
         .await;
 
     // 审计日志：删除分享
-    let _ = log_audit(&pool, &session.username, "delete_share", Some(code), None).await;
+    let _ = log_audit(&pool, &session.username, "delete_share", Some(code), None, None, None).await;
     (StatusCode::OK, "分享链条已切断").into_response()
 }
 
@@ -135,16 +142,18 @@ pub async fn access_share(
     let share_meta = sqlx::query("SELECT file_path, username FROM shares WHERE code = ? AND (expires_at IS NULL OR expires_at > datetime('now'))")
         .bind(&code).fetch_optional(&pool).await.unwrap_or(None);
 
-    if let Some(row) = share_meta {
-        let f_path: String = row.get("file_path");
-        return (StatusCode::OK, format!("Share accessible: {}", f_path)).into_response();
+    if share_meta.is_some() {
+        return (StatusCode::OK, "分享链接有效").into_response();
     }
     (StatusCode::GONE, "外链已失效或过期").into_response()
 }
 
-// --- 分享页面入口 ---
-pub async fn share_page() -> Html<&'static str> {
-    Html(include_str!("../../static/index.html"))
+// --- 分享页面入口（从磁盘读取，避免嵌入二进制） ---
+pub async fn share_page() -> Result<Html<String>, (StatusCode, &'static str)> {
+    match tokio::fs::read_to_string("static/index.html").await {
+        Ok(html) => Ok(Html(html)),
+        Err(_) => Err((StatusCode::NOT_FOUND, "页面文件缺失")),
+    }
 }
 
 // --- 访问分享下的具体文件或子目录 ---
@@ -173,10 +182,14 @@ pub async fn share_subfile(
     let db_password: Option<String> = share.get("password");
     let expires_at: Option<String> = share.get("expires_at");
 
-    // 2. 校验密码（如果有）
+    // 2. 校验密码（如果有）— spawn_blocking 避免阻塞
     if let Some(pwd_hash) = db_password {
-        let input_pwd = params.password.unwrap_or_default();
-        if !verify_password(&pwd_hash, &input_pwd) {
+        let input_pwd = params.password.unwrap_or_default().to_string();
+        let hash_clone = pwd_hash.clone();
+        let is_valid = tokio::task::spawn_blocking(move || {
+            verify_password(&hash_clone, &input_pwd)
+        }).await.unwrap_or(false);
+        if !is_valid {
             return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
         }
     }
@@ -190,7 +203,7 @@ pub async fn share_subfile(
         }
     }
 
-    let user_root = std::path::PathBuf::from("uploads").join(&username);
+    let user_root = std::path::PathBuf::from(crate::constants::UPLOADS_DIR).join(&username);
     let share_base = safe_join_sandbox(&user_root, &share_root_path);
     let target_path = safe_join_sandbox(&share_base, &file_path);
 
@@ -207,7 +220,7 @@ pub async fn share_subfile(
         return (StatusCode::OK, Json(items)).into_response();
     }
 
-    // 增加下载计数（异步）
+    // 增加下载计数（异步，不阻塞响应）
     let share_code = share_id.clone();
     let pool_clone = pool.clone();
     tokio::spawn(async move {
