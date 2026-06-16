@@ -94,6 +94,7 @@ pub async fn save_file_content_handler(
 }
 
 // 多媒体代理（只读，不记录审计日志）
+#[tracing::instrument(skip(session, req))]
 pub async fn media_proxy(
     Extension(session): Extension<UserSession>,
     Path(raw_path): Path<String>,

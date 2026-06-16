@@ -5,8 +5,24 @@ use axum::{
 };
 use pinas_core::UserSession;
 
-pub async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+pub async fn health_check(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+) -> impl IntoResponse {
+    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&pool).await {
+        Ok(1) => {
+            let body = serde_json::json!({
+                "status": "healthy",
+                "database": "connected",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(_) => (StatusCode::SERVICE_UNAVAILABLE, "数据库异常").into_response(),
+        Err(e) => {
+            tracing::error!("健康检查数据库连接失败: {}", e);
+            (StatusCode::SERVICE_UNAVAILABLE, "数据库连接失败").into_response()
+        }
+    }
 }
 
 pub async fn get_system_status(

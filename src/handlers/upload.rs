@@ -173,6 +173,7 @@ pub async fn upload_chunk(
 }
 
 // --- 5. 分片合并（读取所有已上传分片，按索引排序合并）---
+#[tracing::instrument(skip(pool, session, payload))]
 pub async fn merge_chunks(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,

@@ -1,0 +1,28 @@
+# Rust 编译产物
+target/
+
+# Git
+.git/
+.gitignore
+
+# Node.js
+node_modules/
+
+# 日志和数据库
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# 环境变量（含密码）
+.env
+
+# IDE
+.vs/
+.vscode/
+.clast/
+*.swp
+*~
+
+# 上传文件
+uploads/

@@ -55,6 +55,7 @@ fn extract_ua(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
+#[tracing::instrument(skip(pool, config, headers, payload))]
 pub async fn login(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(config): Extension<Config>,
@@ -124,6 +125,7 @@ pub async fn login(
     (StatusCode::UNAUTHORIZED, "账号或访问密码校验失败").into_response()
 }
 
+#[tracing::instrument(skip(pool, headers, payload))]
 pub async fn register(
     Extension(pool): Extension<sqlx::SqlitePool>,
     headers: HeaderMap,
