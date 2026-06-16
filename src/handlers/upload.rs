@@ -52,6 +52,7 @@ pub async fn check_chunk(
 ) -> impl IntoResponse {
     let username = &session.username;
     let identifier = &query.identifier;
+    if let Err(e) = validate_identifier(identifier) { return e.into_response(); }
 
     // 检查文件是否已完全上传（通过文件的 content identifier 匹配）
     let file_exists = sqlx::query("SELECT 1 FROM files WHERE username = ? AND identifier = ? LIMIT 1")
@@ -67,11 +68,11 @@ pub async fn check_chunk(
             exists: true,
             chunk_exists: None,
             uploaded_chunks: None,
-        });
+        }).into_response();
     }
 
     // 扫描临时分片目录，获取已上传的分片索引
-    let tmp_dir = format!("uploads/tmp/{}", identifier);
+    let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, identifier);
     let mut uploaded_chunks = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -88,11 +89,21 @@ pub async fn check_chunk(
         exists: false,
         chunk_exists: None,
         uploaded_chunks: Some(uploaded_chunks),
-    })
+    }).into_response()
 }
 
 // --- 4. 处理分片上传（流式写入磁盘，避免内存缓冲） ---
 use crate::constants::MAX_CHUNK_SIZE_BYTES as MAX_CHUNK_SIZE;
+
+/// 校验上传标识符安全性（仅允许字母数字及连字符，防止路径穿越）
+fn validate_identifier(identifier: &str) -> Result<(), (StatusCode, &'static str)> {
+    if identifier.is_empty()
+        || !identifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err((StatusCode::BAD_REQUEST, "非法的文件标识符"));
+    }
+    Ok(())
+}
 
 pub async fn upload_chunk(
     Extension(pool): Extension<sqlx::SqlitePool>,
@@ -107,6 +118,7 @@ pub async fn upload_chunk(
     if params.total_chunks <= 0 || params.total_chunks > crate::constants::MAX_CHUNKS_PER_FILE {
         return (StatusCode::BAD_REQUEST, "总分片数不合法").into_response();
     }
+    if let Err(e) = validate_identifier(&params.identifier) { return e.into_response(); }
 
     // 确保临时目录存在
     let tmp_dir = format!("uploads/tmp/{}", params.identifier);
@@ -183,6 +195,7 @@ pub async fn merge_chunks(
     if is_blocked_extension(&payload.file_name) {
         return (StatusCode::FORBIDDEN, "安全策略阻断：不允许上传高危执行文件扩展名").into_response();
     }
+    if let Err(e) = validate_identifier(&payload.identifier) { return e.into_response(); }
 
     // 从数据库获取总分片数（可选，也可直接从文件系统推断）
     let total_chunks: Option<i32> = sqlx::query_scalar(

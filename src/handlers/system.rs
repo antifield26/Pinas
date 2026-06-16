@@ -63,7 +63,7 @@ pub async fn get_system_status(
         if let Ok(stat_str) = tokio::fs::read_to_string("/proc/stat").await {
             if let Some(first_line) = stat_str.lines().next() {
                 let parts: Vec<&str> = first_line.split_whitespace().collect();
-                if parts.len() >= 5 {
+                if parts.len() >= 8 {
                     let user: u64 = parts[1].parse().unwrap_or(0);
                     let nice: u64 = parts[2].parse().unwrap_or(0);
                     let system: u64 = parts[3].parse().unwrap_or(0);

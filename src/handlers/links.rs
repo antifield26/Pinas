@@ -85,6 +85,12 @@ pub async fn update_link(
             return Err(AppError::bad_request("URL必须以http://或https://开头"));
         }
     }
+    // 不允许将标题更新为空字符串
+    if let Some(ref t) = payload.title {
+        if t.trim().is_empty() {
+            return Err(AppError::bad_request("标题不能为空"));
+        }
+    }
     if payload.title.as_ref().map_or(true, |t| t.trim().is_empty())
         && payload.url.is_none()
         && payload.icon.is_none()
@@ -93,7 +99,7 @@ pub async fn update_link(
         return Err(AppError::bad_request("没有要更新的字段"));
     }
 
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE links SET title = COALESCE(?, title), url = COALESCE(?, url), icon = COALESCE(?, icon), sort_order = COALESCE(?, sort_order) WHERE id = ? AND username = ?"
     )
     .bind(&payload.title)
@@ -105,6 +111,10 @@ pub async fn update_link(
     .execute(&pool)
     .await?;
 
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("记录不存在或无权操作"));
+    }
+
     let _ = log_audit(&pool, &session.username, "update_link", Some(&id.to_string()), None, None, None).await;
     Ok((StatusCode::OK, "链接更新成功"))
 }
@@ -115,11 +125,15 @@ pub async fn delete_link(
     Extension(session): Extension<UserSession>,
     Path(id): Path<i64>,
 ) -> AppResult<(StatusCode, &'static str)> {
-    sqlx::query("DELETE FROM links WHERE id = ? AND username = ?")
+    let result = sqlx::query("DELETE FROM links WHERE id = ? AND username = ?")
         .bind(id)
         .bind(&session.username)
         .execute(&pool)
         .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("记录不存在或无权操作"));
+    }
 
     let _ = log_audit(&pool, &session.username, "delete_link", Some(&id.to_string()), None, None, None).await;
     Ok((StatusCode::OK, "链接删除成功"))

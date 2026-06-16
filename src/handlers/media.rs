@@ -283,9 +283,10 @@ pub async fn download_zip(
     match tokio::fs::File::open(&temp_path_clone).await {
         Ok(file) => {
             let path_for_cleanup = temp_path_clone.clone();
+            // 延迟清理临时文件（10 分钟，足够大多数下载完成）
             tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let _ = tokio::fs::remove_file(path_for_cleanup).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+                let _ = tokio::fs::remove_file(&path_for_cleanup).await;
             });
             let stream = ReaderStream::new(file);
             let body = Body::from_stream(stream);

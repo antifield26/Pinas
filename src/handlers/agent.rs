@@ -20,7 +20,7 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 // ====== 模型列表 ======
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
-    ("deepseek-v4-pro[1m]", "DeepSeek V4 Pro (推荐)[1M]"),
+    ("deepseek-v4-pro", "DeepSeek V4 Pro (推荐)"),
     ("deepseek-v4-flash", "DeepSeek V4 Flash (快速)"),
 ];
 

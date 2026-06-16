@@ -83,8 +83,16 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
     let mut result = base.to_path_buf();
     for component in std::path::Path::new(&normalized).components() {
         match component {
+            std::path::Component::ParentDir => {
+                tracing::warn!("[路径安全] 检测到路径穿越攻击 (ParentDir), path='{}'", user_raw_path);
+                return base.to_path_buf();
+            }
+            std::path::Component::CurDir => {
+                // 跳过 . 组件（无害）
+                continue;
+            }
             std::path::Component::Normal(p) => {
-                // 拒绝 .. 路径穿越，跳过 . 和空白伪装
+                // 拒绝 .. 路径穿越（Unix 上 .. 可能作为 Normal 出现），跳过 . 和空白伪装
                 let s = p.to_string_lossy();
                 if s == ".." {
                     tracing::warn!("[路径安全] 检测到路径穿越攻击，返回安全回退: component='{}', path='{}'", s, user_raw_path);
@@ -100,7 +108,6 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 tracing::warn!("[路径安全] 阻断绝对路径/盘符注入: path='{}'", user_raw_path);
             }
-            _ => {}
         }
     }
 

@@ -137,24 +137,36 @@ pub async fn reset_user_password(
         Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response(),
     };
-    let result = sqlx::query("UPDATE users SET password = ? WHERE username = ?")
+    // 事务内执行：先清除会话（强制重新登录），再更新密码
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("开启事务失败: {}", e)).into_response(),
+    };
+
+    if let Err(e) = sqlx::query("DELETE FROM sessions WHERE username = ?")
+        .bind(&payload.username)
+        .execute(&mut *tx)
+        .await
+    {
+        tracing::error!("reset_password: 清除用户 {} 会话失败: {}", payload.username, e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "清除会话失败").into_response();
+    }
+
+    if let Err(e) = sqlx::query("UPDATE users SET password = ? WHERE username = ?")
         .bind(&hashed)
         .bind(&payload.username)
-        .execute(&pool)
-        .await;
-    // 清除该用户的所有会话（强制重新登录）
-    let _ = sqlx::query("DELETE FROM sessions WHERE username = ?")
-        .bind(&payload.username)
-        .execute(&pool)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let _ = log_audit(&pool, &session.username, "reset_password", Some(&payload.username), None, None, None).await;
-            (StatusCode::OK, "密码重置成功").into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e)).into_response(),
+        .execute(&mut *tx)
+        .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("更新密码失败: {}", e)).into_response();
     }
+
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("提交事务失败: {}", e)).into_response();
+    }
+
+    let _ = log_audit(&pool, &session.username, "reset_password", Some(&payload.username), None, None, None).await;
+    (StatusCode::OK, "密码重置成功").into_response()
 }
 
 // 审计日志项

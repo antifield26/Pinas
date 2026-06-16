@@ -34,6 +34,10 @@ fn spawn_temp_chunk_cleanup(_pool: sqlx::SqlitePool, hours: u64) {
 /// 清理过期日志（保留指定天数）
 fn spawn_log_cleanup() {
     tokio::spawn(async move {
+        // 启动时立即清理
+        if let Err(e) = clean_old_logs(LOG_RETENTION_DAYS).await {
+            tracing::error!("初始清理过期日志失败: {}", e);
+        }
         let mut interval = tokio::time::interval(Duration::from_secs(LOG_CLEANUP_INTERVAL_SECS));
         loop {
             interval.tick().await;
@@ -58,9 +62,14 @@ fn spawn_rate_limit_cleanup() {
 /// 清理过期回收站条目
 fn spawn_trash_cleanup(pool: sqlx::SqlitePool, days: u32, interval_hours: u64) {
     tokio::spawn(async move {
+        // 启动时立即清理
+        if let Err(e) = handlers::clean_expired_trash(&pool, days).await {
+            tracing::error!("初始清理过期回收站失败: {}", e);
+        } else {
+            tracing::info!("初始清理：已清理超过{}天的回收站记录", days);
+        }
         let interval_secs = interval_hours * 3600;
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        interval.tick().await;
         loop {
             interval.tick().await;
             if let Err(e) = handlers::clean_expired_trash(&pool, days).await {

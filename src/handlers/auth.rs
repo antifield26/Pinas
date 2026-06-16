@@ -164,14 +164,25 @@ pub async fn register(
         .unwrap_or(0);
     let role = if count == 0 { ROLE_ADMIN } else { ROLE_USER };
 
-    let _ = sqlx::query("INSERT INTO users (username, password, role) VALUES (?, ?, ?)")
+    // 直接 INSERT，依赖 UNIQUE 约束防止 TOCTOU 竞态
+    let insert_result = sqlx::query("INSERT INTO users (username, password, role) VALUES (?, ?, ?)")
         .bind(&payload.username)
         .bind(&hashed_password)
         .bind(role)
         .execute(&pool)
         .await;
 
-    let _ = tokio::fs::create_dir_all(format!("uploads/{}", payload.username)).await;
+    if let Err(e) = insert_result {
+        if let Some(db_err) = e.as_database_error() {
+            if db_err.is_unique_violation() {
+                return (StatusCode::CONFLICT, "用户已被注册").into_response();
+            }
+        }
+        tracing::error!("注册用户失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "注册失败").into_response();
+    }
+
+    let _ = tokio::fs::create_dir_all(format!("{}/{}", crate::constants::UPLOADS_DIR, payload.username)).await;
 
     let _ = log_audit(&pool, &payload.username, "register", None, None, extract_ip(&headers), extract_ua(&headers)).await;
 
