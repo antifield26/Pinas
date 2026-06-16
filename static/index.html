@@ -2,20 +2,37 @@
 <html lang="zh-CN" class="">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Antifield Cloud</title>
+
+  <!-- PWA: 基础元数据 -->
+  <meta name="description" content="自托管 NAS 网盘 — 文件管理、待办日程、AI 助手">
+  <meta name="theme-color" content="#4f46e5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1e1b4b" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Antifield">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="format-detection" content="telephone=no">
+
+  <!-- PWA: Web App Manifest -->
+  <link rel="manifest" href="/assets/manifest.json">
+
+  <!-- PWA: Apple Touch Icons (base64 SVG) -->
+  <link rel="apple-touch-icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxOTIgMTkyIiBmaWxsPSJub25lIj48cmVjdCB3aWR0aD0iMTkyIiBoZWlnaHQ9IjE5MiIgcng9IjI0IiBmaWxsPSIjNEY0NkU1Ii8+PHRleHQgeD0iOTYiIHk9IjEyMCIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iOTAiIGZvbnQtd2VpZ2h0PSJib2xkIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjZmZmIiBmaWx0ZXI9ImRyb3Atc2hhZG93KDAgMXB4IDJweCByZ2JhKDAsMCwwLDAuMikpIj5BPC90ZXh0Pjwvc3ZnPg==">
+
   <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=10">
   <script src="/assets/marked.min.js?v=8"></script>
   <script src="/assets/purify.min.js?v=9"></script>
 
-  <!-- AppGuard + SW 清理：必须在所有 onclick 引用 App 之前执行 -->
+  <!-- AppGuard + PWA Service Worker：必须在所有 onclick 引用 App 之前执行 -->
   <script>
     (function() {
       // ===== AppGuard: 递归 Proxy 安全占位 =====
       // 在 app.js 模块加载完成前，拦截所有 window.App.xxx.yyy() 调用
       var guard = new Proxy(function(){}, {
         get: function(_, prop) {
-          if (prop === 'then') return undefined; // 防止被 Promise 机制误判
+          if (prop === 'then') return undefined;
           return guard;
         },
         apply: function() {
@@ -25,41 +42,39 @@
       });
       window.App = guard;
 
-      // ===== Service Worker 清理（异步，不阻塞页面） =====
-      if (navigator.serviceWorker) {
-        var swContainer = navigator.serviceWorker;
-        swContainer.getRegistrations().then(function(regs) {
-          if (regs.length) {
-            console.log('[SWClean] 正在注销 ' + regs.length + ' 个旧 Service Worker...');
-            regs.forEach(function(r) { r.unregister().then(function(ok) {
-              console.log('[SWClean] 注销' + (ok ? '成功' : '失败') + ': ' + r.scope);
-            });});
-          }
-        }).catch(function(e) { console.warn('[SWClean] 查询失败:', e); });
-
-        // 同步检查：如果当前无 SW 控制，无需额外操作
-        if (swContainer.controller) {
-          console.log('[SWClean] 检测到活跃的 Service Worker，已请求注销。建议在新标签页中打开以避免缓存问题。');
-        }
-      }
-
-      // 清除 Cache API 缓存
-      if (window.caches && window.caches.keys) {
-        window.caches.keys().then(function(names) {
-          if (names.length) {
-            console.log('[CacheClean] 清除 ' + names.length + ' 个缓存...');
-            names.forEach(function(n) { caches.delete(n); });
-          }
+      // ===== PWA: 注册 Service Worker =====
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function() {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' })
+            .then(function(reg) {
+              console.log('[PWA] Service Worker 已注册, scope:', reg.scope);
+              // 检查更新
+              reg.addEventListener('updatefound', function() {
+                var newWorker = reg.installing;
+                if (!newWorker) return;
+                newWorker.addEventListener('statechange', function() {
+                  if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                    console.log('[PWA] 新版本已就绪，刷新页面后生效');
+                    window._pwaUpdateReady = true;
+                    var ev = new CustomEvent('pwa-update-ready', { detail: reg });
+                    window.dispatchEvent(ev);
+                  }
+                });
+              });
+            })
+            .catch(function(err) {
+              console.warn('[PWA] SW 注册失败:', err);
+            });
         });
       }
 
       // 安全超时：10 秒后若模块仍未加载，显示提示
       setTimeout(function() {
         if (window.App === guard) {
-          console.error('[AppGuard] 应用模块加载超时（10 秒）。请尝试：1) 硬刷新 (Ctrl+Shift+R) 2) 清除浏览器缓存 3) 打开新无痕窗口');
+          console.error('[AppGuard] 应用模块加载超时（10 秒）。');
           var errEl = document.getElementById('login-error');
           if (errEl) {
-            errEl.innerText = '应用加载超时，请硬刷新 (Ctrl+Shift+R) 或清除浏览器缓存后重试';
+            errEl.innerText = '应用加载超时，请硬刷新 (Ctrl+Shift+R) 后重试';
             errEl.classList.remove('hidden');
           }
         }

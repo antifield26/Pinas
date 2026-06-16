@@ -19,7 +19,11 @@ use crate::middleware::csp::csp_middleware;
 /// 构建完整的 Axum Router（注入 pool + config）
 pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
     // --- 公开路由（无需认证）---
+    // Service Worker（必须从根路径服务）
+    let sw_service = tower_http::services::ServeFile::new("static/sw.js");
+
     let public_routes = Router::new()
+        .route_service("/sw.js", sw_service)
         .route("/api/login", post(handlers::login))
         .route("/api/register", post(handlers::register))
         .route("/api/logout", post(handlers::logout))

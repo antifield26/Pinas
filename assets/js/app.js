@@ -235,6 +235,74 @@ function setupOfflineDetection() {
   });
 }
 
+// ====== PWA: 安装提示 ======
+let deferredInstallPrompt = null;
+
+function setupPWAInstallPrompt() {
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    console.log('[PWA] 安装提示已就绪');
+    // 延迟 3 秒后显示自定义安装按钮（避免干扰首次加载）
+    setTimeout(() => {
+      if (deferredInstallPrompt) showInstallButton();
+    }, 3000);
+  });
+
+  window.addEventListener('appinstalled', () => {
+    console.log('[PWA] 应用已安装');
+    deferredInstallPrompt = null;
+    const btn = document.getElementById('pwa-install-btn');
+    if (btn) btn.remove();
+    toast('应用已安装到主屏幕', 'success');
+  });
+
+  // 如果已在 standalone 模式，隐藏安装按钮
+  if (window.matchMedia('(display-mode: standalone)').matches) {
+    console.log('[PWA] 当前运行在 standalone 模式');
+    deferredInstallPrompt = null;
+  }
+}
+
+function showInstallButton() {
+  const existing = document.getElementById('pwa-install-btn');
+  if (existing) return;
+
+  const btn = document.createElement('button');
+  btn.id = 'pwa-install-btn';
+  btn.innerHTML = '安装应用';
+  btn.title = '将 Antifield Cloud 安装到设备';
+  btn.className = 'fixed bottom-20 right-4 z-40 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg transition-all duration-300 animate-slide-up flex items-center gap-2';
+  btn.onclick = async () => {
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    const { outcome } = await deferredInstallPrompt.userChoice;
+    console.log('[PWA] 用户选择:', outcome);
+    if (outcome === 'accepted') {
+      btn.remove();
+    }
+    deferredInstallPrompt = null;
+  };
+  document.body.appendChild(btn);
+}
+
+// ====== PWA: 更新通知 ======
+function setupPWAUpdateNotification() {
+  window.addEventListener('pwa-update-ready', () => {
+    const btn = document.createElement('button');
+    btn.id = 'pwa-update-btn';
+    btn.innerHTML = '新版本已就绪，点击刷新';
+    btn.title = '新版本已下载，刷新页面即可更新';
+    btn.className = 'fixed bottom-20 right-4 z-40 bg-green-600 hover:bg-green-700 text-white text-sm font-medium px-4 py-2.5 rounded-xl shadow-lg transition-all duration-300 animate-slide-up';
+    btn.onclick = () => {
+      window.location.reload();
+    };
+    document.body.appendChild(btn);
+    // 10 秒后自动隐藏
+    setTimeout(() => { const b = document.getElementById('pwa-update-btn'); if (b) b.remove(); }, 10000);
+  });
+}
+
 // ====== 用户徽章 ======
 store.on('auth:change', ({ username, role }) => {
   const badge = document.getElementById('user-badge');
@@ -376,6 +444,10 @@ try {
   console.log('[App] ✅ 暗色模式已设置');
   setupOfflineDetection();
   console.log('[App] ✅ 离线检测已设置');
+  setupPWAInstallPrompt();
+  console.log('[App] ✅ PWA 安装提示已设置');
+  setupPWAUpdateNotification();
+  console.log('[App] ✅ PWA 更新通知已设置');
   DriveView.setupDropZone();
   console.log('[App] ✅ 拖拽区域已设置');
 } catch (e) {
