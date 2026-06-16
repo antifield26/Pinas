@@ -84,10 +84,14 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
     for component in std::path::Path::new(&normalized).components() {
         match component {
             std::path::Component::Normal(p) => {
-                // 过滤 .. 和 . 以及包含空格的空白伪装
+                // 拒绝 .. 路径穿越，跳过 . 和空白伪装
                 let s = p.to_string_lossy();
-                if s == ".." || s == "." || s.trim().is_empty() {
-                    tracing::warn!("[路径安全] 阻断路径穿越尝试: component='{}', path='{}'", s, user_raw_path);
+                if s == ".." {
+                    tracing::warn!("[路径安全] 检测到路径穿越攻击，返回安全回退: component='{}', path='{}'", s, user_raw_path);
+                    return base.to_path_buf();
+                }
+                if s == "." || s.trim().is_empty() {
+                    tracing::warn!("[路径安全] 跳过无效路径组件: component='{}', path='{}'", s, user_raw_path);
                     continue;
                 }
                 result.push(p);
@@ -228,13 +232,14 @@ mod tests {
     #[test]
     fn test_safe_join_sandbox() {
         let base = std::path::Path::new("/uploads");
+        // .. 组件现在拒绝并返回 base（安全回退）
         let result = safe_join_sandbox(base, "user/../passwd");
-        assert_eq!(result, base.join("user").join("passwd"));
+        assert_eq!(result, base);
         let result2 = safe_join_sandbox(base, "../../../etc/passwd");
-        assert_eq!(result2, base.join("etc").join("passwd"));
+        assert_eq!(result2, base);
         let result3 = safe_join_sandbox(base, "folder/./subfolder");
         assert_eq!(result3, base.join("folder").join("subfolder"));
-        // 空组件和空白伪装
+        // 空组件和空白伪装（仍然跳过）
         let result4 = safe_join_sandbox(base, "folder/   /subfolder");
         assert_eq!(result4, base.join("folder").join("subfolder"));
         // Windows 反斜杠分隔符
