@@ -232,6 +232,23 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
                     .bind(ROLE_ADMIN).bind(&hash).bind(ROLE_ADMIN).bind(config.default_quota_mb)
                     .execute(pool).await?;
             }
+
+            // 自检：立即从数据库读回哈希并验证密码
+            let stored_hash: String = sqlx::query_scalar(
+                "SELECT password FROM users WHERE username = ?"
+            ).bind(ROLE_ADMIN).fetch_one(pool).await.map_err(|e| {
+                format!("无法读取 admin 密码哈希用于自检: {}", e)
+            })?;
+            if crate::handlers::verify_password(&stored_hash, &pwd) {
+                info!("[Init] ✅ admin 密码自检通过");
+            } else {
+                let msg = format!(
+                    "[Init] ❌ admin 密码自检失败！hash={}..., pwd_len={}",
+                    &stored_hash[..stored_hash.len().min(40)], pwd.len()
+                );
+                tracing::error!("{}", msg);
+                eprintln!("{}", msg);
+            }
             pwd
         }
         _ => {
