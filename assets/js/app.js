@@ -13,6 +13,9 @@ import * as ShareView from './views/share.js';
 import * as LinksView from './views/links.js';
 import * as TodosView from './views/todos.js';
 import * as AgentView from './views/agent.js';
+import * as UploadView from './views/upload.js';
+import * as PlayerView from './views/player.js';
+import * as EditorView from './views/editor.js';
 
 // ====== 全局事件委托 ======
 function setupGlobalDelegation() {
@@ -336,15 +339,15 @@ window.App = {
     createFolder: () => DriveView.createFolder(),
     moveSelected: () => DriveView.moveSelected(),
     downloadSelectedZip: () => DriveView.downloadSelectedZip(),
-    uploadFile: () => DriveView.uploadFile(),
+    uploadFile: () => UploadView.uploadFile(),
     toggleSelectAll: (cb) => DriveView.toggleSelectAll(cb),
     handleSearch: () => DriveView.fetchFilesDebounced(),
     handleSort: () => DriveView.fetchFiles(1),
-    openEditor: (n) => DriveView.openEditor(n),
-    saveFileContent: () => DriveView.saveFileContent(),
-    toggleEditorMode: () => DriveView.toggleEditorMode(),
-    closeEditor: () => DriveView.closeEditor(),
-    closePlayer: () => DriveView.closePlayer(),
+    openEditor: (n) => EditorView.openEditor(n),
+    saveFileContent: () => EditorView.saveFileContent(),
+    toggleEditorMode: () => EditorView.toggleEditorMode(),
+    closeEditor: () => EditorView.closeEditor(),
+    closePlayer: () => PlayerView.closePlayer(),
     navigateTo: (p) => DriveView.navigateTo(p),
     refreshList: () => { DriveView.fetchFiles(store.get('currentPage')); toast('列表已刷新'); },
     confirmCreateShare: () => ShareView.confirmCreateShare(),

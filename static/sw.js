@@ -24,6 +24,9 @@ const PRE_CACHE_URLS = [
   '/assets/js/views/links.js',
   '/assets/js/views/todos.js',
   '/assets/js/views/agent.js',
+  '/assets/js/views/upload.js',
+  '/assets/js/views/player.js',
+  '/assets/js/views/editor.js',
 ];
 
 // ====== Install: 预缓存核心资源 ======

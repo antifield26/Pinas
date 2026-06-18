@@ -5,9 +5,10 @@ import { toast } from '../components/toast.js';
 import { confirmDialog, promptDialog, dangerConfirmDialog } from '../components/modal.js';
 import { renderFileTable, renderPagination } from '../components/file-table.js';
 import { escapeHtml, debounce } from '../utils.js';
-import { CHUNK_SIZE, DEFAULT_PAGE_SIZE } from '../constants.js';
-
-let currentUploadAbort = null;
+import { DEFAULT_PAGE_SIZE } from '../constants.js';
+import { openEditor } from './editor.js';
+import { playMedia } from './player.js';
+import { uploadFile } from './upload.js';
 
 // ====== 文件列表 ======
 export async function fetchFiles(page = 1) {
@@ -223,91 +224,6 @@ export function goToPage(page) {
   fetchFiles(page);
 }
 
-// ====== 上传 ======
-export async function uploadFile() {
-  const fileInput = document.getElementById('fileInput');
-  if (!fileInput?.files.length) return toast('请先挂载待上传的文件', 'warning');
-  const file = fileInput.files[0];
-
-  const identifier = btoa(encodeURIComponent(file.name)) + `_${file.size}_${file.lastModified}`;
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-  const pContainer = document.getElementById('progressContainer');
-  const pStatus = document.getElementById('uploadStatus');
-  const pText = document.getElementById('progressText');
-  const pBar = document.getElementById('progressBar');
-
-  const updateUI = (index, total) => {
-    const pct = Math.round((index / total) * 100);
-    if (pText) pText.innerText = `${pct}%`;
-    if (pBar) pBar.style.width = `${pct}%`;
-  };
-
-  if (pContainer) pContainer.classList.remove('hidden');
-  if (pStatus) pStatus.innerText = '正在验证断点续传状态...';
-  updateUI(0, totalChunks);
-
-  // 检查已上传分片
-  let uploadedChunks = [];
-  try {
-    const checkRes = await api.checkChunks(identifier);
-    if (checkRes.ok) {
-      const checkData = await checkRes.json();
-      uploadedChunks = checkData.uploaded_chunks || [];
-    }
-  } catch (err) {
-    if (err.status === 401) { if (pContainer) pContainer.classList.add('hidden'); return; }
-    if (pContainer) pContainer.classList.add('hidden');
-    return toast('秒传校验链路故障', 'error');
-  }
-
-  // 上传每个分片
-  for (let i = 0; i < totalChunks; i++) {
-    if (uploadedChunks.includes(i)) { updateUI(i + 1, totalChunks); continue; }
-
-    if (pStatus) pStatus.innerText = `正在传输第 ${i + 1}/${totalChunks} 块分片...`;
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(file.size, start + CHUNK_SIZE);
-    const blob = file.slice(start, end);
-    const formData = new FormData();
-    formData.append('file', blob);
-
-    try {
-      const res = await api.uploadChunk(formData, identifier, i, totalChunks, file.name, store.get('currentPath'));
-      if (res.status === 401) {
-        document.getElementById('login-overlay')?.classList.remove('hidden');
-        if (pContainer) pContainer.classList.add('hidden');
-        return;
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      updateUI(i + 1, totalChunks);
-    } catch (err) {
-      if (err.status === 401) { if (pContainer) pContainer.classList.add('hidden'); return; }
-      if (pStatus) pStatus.innerText = '传输中断';
-      return toast(`切片 ${i + 1} 上传失败，请重试`, 'error');
-    }
-  }
-
-  // 合并
-  if (pStatus) pStatus.innerText = '全部分片发送完毕，正在整合落盘...';
-  try {
-    const mergeRes = await api.mergeChunks(identifier, file.name, store.get('currentPath'));
-    if (mergeRes.ok) {
-      toast('上传成功', 'success');
-      fileInput.value = '';
-      fetchFiles(store.get('currentPage'));
-      setTimeout(() => pContainer?.classList.add('hidden'), 2000);
-    } else {
-      const errMsg = await mergeRes.text();
-      toast(`合并失败: ${errMsg}`, 'error');
-      if (pStatus) pStatus.innerText = '落盘终止';
-    }
-  } catch (e) {
-    if (e.status === 401) { if (pContainer) pContainer.classList.add('hidden'); return; }
-    if (pStatus) pStatus.innerText = '网关响应错误';
-  }
-}
-
 // ====== 下载 ======
 async function downloadFile(url, filename) {
   try {
@@ -321,104 +237,6 @@ async function downloadFile(url, filename) {
       URL.revokeObjectURL(blobUrl);
     } else { toast('下载失败', 'error'); }
   } catch (e) { if (e.status !== 401) toast('下载请求异常', 'error'); }
-}
-
-// ====== 编辑器 ======
-export function openEditor(name) {
-  // name 已经由 handleFileAction 中的 decodeURIComponent(dataset.filename) 解码
-  // 此处不再重复解码，避免双重解码损坏含 % 字符的文件名
-  store.set('editingFile', name);
-  const titleEl = document.getElementById('editor-title');
-  if (titleEl) titleEl.innerText = `编辑器 ⟴ ${name}`;
-
-  const filePath = store.get('currentPath') ? `${store.get('currentPath')}/${name}` : name;
-  const textarea = document.getElementById('editor-textarea');
-  const preview = document.getElementById('editor-preview');
-  const btn = document.getElementById('btn-preview-toggle');
-
-  store.set('isPreviewMode', false);
-  if (textarea) textarea.classList.remove('hidden');
-  if (preview) preview.classList.add('hidden');
-  if (btn) btn.innerText = '预览';
-
-  api.getFileContent(filePath).then(res => {
-    if (res.ok) {
-      return res.text().then(text => {
-        if (textarea) textarea.value = text;
-        document.getElementById('editor-modal')?.classList.remove('hidden');
-      });
-    }
-    toast('无法读取文本流内容', 'error');
-  }).catch(e => { if (e.status !== 401) toast('读取文件失败', 'error'); });
-}
-
-export async function saveFileContent() {
-  const filePath = store.get('currentPath') ? `${store.get('currentPath')}/${store.get('editingFile')}` : store.get('editingFile');
-  const content = document.getElementById('editor-textarea')?.value;
-  if (content === undefined) return;
-  try {
-    const res = await api.saveFileContent(filePath, content);
-    if (res.ok) { toast('保存成功', 'success'); fetchFiles(store.get('currentPage')); }
-    else { const err = await res.text(); toast(`保存失败: ${err}`, 'error'); }
-  } catch (e) { if (e.status !== 401) toast('保存请求异常', 'error'); }
-}
-
-export function toggleEditorMode() {
-  const textarea = document.getElementById('editor-textarea');
-  const previewEl = document.getElementById('editor-preview');
-  const btn = document.getElementById('btn-preview-toggle');
-  const isPreview = !store.get('isPreviewMode');
-  store.set('isPreviewMode', isPreview);
-
-  if (isPreview) {
-    const raw = textarea?.value || '';
-    const cleanHtml = window.DOMPurify.sanitize(window.marked.parse(raw));
-    if (previewEl) { previewEl.innerHTML = cleanHtml; previewEl.classList.remove('hidden'); }
-    if (textarea) textarea.classList.add('hidden');
-    if (btn) btn.innerText = '编辑';
-  } else {
-    if (previewEl) previewEl.classList.add('hidden');
-    if (textarea) textarea.classList.remove('hidden');
-    if (btn) btn.innerText = '预览';
-  }
-}
-
-export function closeEditor() {
-  document.getElementById('editor-modal')?.classList.add('hidden');
-  store.set('editingFile', '');
-}
-
-// ====== 媒体播放 ======
-function playMedia(fullPath, type, encodedName) {
-  const token = localStorage.getItem('cloud_auth_token');
-  if (!token) return toast('请先登录', 'error');
-
-  const mediaUrl = `/api/media/${encodeURIComponent(fullPath)}?token=${encodeURIComponent(token)}`;
-  const name = decodeURIComponent(encodedName);
-  const titleEl = document.getElementById('player-title');
-  const contentZone = document.getElementById('player-content');
-  if (titleEl) titleEl.innerText = `查看: ${name}`;
-
-  if (type === 'image') {
-    if (contentZone) contentZone.innerHTML = `<img src="${mediaUrl}" class="max-w-full max-h-[70vh] object-contain rounded-lg shadow-lg" alt="${escapeHtml(name)}">`;
-  } else if (type === 'pdf') {
-    if (contentZone) contentZone.innerHTML = `<iframe src="${mediaUrl}" class="w-full h-[80vh] border-0 rounded-lg"></iframe>`;
-  } else if (type === 'video') {
-    if (contentZone) contentZone.innerHTML = `<video src="${mediaUrl}" controls autoplay class="w-full max-h-[60vh] object-contain"></video>`;
-  } else if (type === 'audio') {
-    if (contentZone) contentZone.innerHTML = `<audio src="${mediaUrl}" controls autoplay class="w-full py-4"></audio>`;
-  }
-  document.getElementById('player-modal')?.classList.remove('hidden');
-}
-
-export function closePlayer() {
-  const contentZone = document.getElementById('player-content');
-  const video = contentZone?.querySelector('video');
-  const audio = contentZone?.querySelector('audio');
-  if (video) { video.pause(); video.src = ''; }
-  if (audio) { audio.pause(); audio.src = ''; }
-  if (contentZone) contentZone.innerHTML = '';
-  document.getElementById('player-modal')?.classList.add('hidden');
 }
 
 // ====== 分享 ======
