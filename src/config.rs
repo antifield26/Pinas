@@ -33,7 +33,7 @@ impl Default for Config {
             server_host: "0.0.0.0".to_string(),
             server_port: 3000,
             database_url: "sqlite:cloud_disk.db".to_string(),
-            upload_limit_mb: 5 * 1024,  // 5 GB 单文件上限（分块上传）
+            upload_limit_mb: 5 * 1024,
             session_days: 7,
             temp_cleanup_hours: 24,
             trash_cleanup_days: 30,
@@ -50,17 +50,38 @@ impl Default for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, config::ConfigError> {
-        let _ = dotenvy::dotenv();
+        // 加载 .env 文件（显式处理错误）
+        match dotenvy::dotenv() {
+            Ok(path) => eprintln!("[Config] 已加载 .env: {}", path.display()),
+            Err(e) => {
+                // .env 不存在时不报错（首次部署可能没有），但其他错误要报告
+                if !matches!(&e, dotenvy::Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound) {
+                    eprintln!("[Config] 警告: .env 加载失败: {}", e);
+                }
+            }
+        }
+
+        // 验证关键环境变量是否已设置
+        match std::env::var("PINAS_ADMIN_PASSWORD") {
+            Ok(ref pwd) if !pwd.is_empty() => {
+                eprintln!("[Config] PINAS_ADMIN_PASSWORD: 已设置 ({} 字符)", pwd.len());
+            }
+            _ => {
+                eprintln!("[Config] PINAS_ADMIN_PASSWORD: 未设置，将自动生成随机密码");
+            }
+        }
+
         let config = config::Config::builder()
             .add_source(config::Environment::default().prefix("PINAS").separator("_"))
             .build()?;
-        let cfg: Config = match config.try_deserialize() {
-            Ok(c) => c,
+
+        match config.try_deserialize() {
+            Ok(c) => Ok(c),
             Err(e) => {
-                tracing::warn!("环境变量解析失败，将使用默认配置。请检查 PINAS_* 环境变量格式是否正确。错误: {}", e);
-                Config::default()
+                eprintln!("[Config] 环境变量解析失败，使用默认配置。错误: {}", e);
+                eprintln!("[Config] 环境变量格式应为 PINAS_前缀+下划线分隔，如 PINAS_ADMIN_PASSWORD=xxx");
+                Ok(Config::default())
             }
-        };
-        Ok(cfg)
+        }
     }
 }
