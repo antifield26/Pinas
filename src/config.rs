@@ -2,15 +2,24 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default = "default_server_host")]
     pub server_host: String,
+    #[serde(default = "default_server_port")]
     pub server_port: u16,
+    #[serde(default = "default_database_url")]
     pub database_url: String,
+    #[serde(default)]
     #[allow(dead_code)]
     pub upload_limit_mb: u64,
+    #[serde(default = "default_session_days")]
     pub session_days: i64,
+    #[serde(default = "default_temp_cleanup_hours")]
     pub temp_cleanup_hours: u64,
+    #[serde(default = "default_trash_cleanup_days")]
     pub trash_cleanup_days: u32,
+    #[serde(default = "default_trash_cleanup_interval_hours")]
     pub trash_cleanup_interval_hours: u64,
+    #[serde(default = "default_quota_mb")]
     pub default_quota_mb: i64,
     #[serde(default)]
     pub admin_password: Option<String>,
@@ -24,9 +33,16 @@ pub struct Config {
     pub deepseek_api_key: Option<String>,
 }
 
+fn default_server_host() -> String { "0.0.0.0".to_string() }
+fn default_server_port() -> u16 { 3000 }
+fn default_database_url() -> String { "sqlite:cloud_disk.db".to_string() }
+fn default_session_days() -> i64 { 7 }
+fn default_temp_cleanup_hours() -> u64 { 24 }
+fn default_trash_cleanup_days() -> u32 { 30 }
+fn default_trash_cleanup_interval_hours() -> u64 { 24 }
+fn default_quota_mb() -> i64 { 10240 }
 fn default_deepseek_api_base() -> String { "https://api.deepseek.com".to_string() }
 fn default_deepseek_model() -> String { "deepseek-v4-flash".to_string() }
-
 impl Default for Config {
     fn default() -> Self {
         Self {
