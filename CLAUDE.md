@@ -16,7 +16,7 @@
 
 ```
 ├── src/
-│   ├── main.rs              # 入口点 (~56 行，加载配置/日志/DB/路由/任务)
+│   ├── main.rs              # 入口点 (~60 行，加载配置/日志/DB/路由/任务)
 │   ├── config.rs            # Config 结构体 (PINAS_* 环境变量)
 │   ├── constants.rs         # 全局常量 (路径/角色/限制/间隔)
 │   ├── error.rs             # AppError 统一错误类型 + AppResult<T>
@@ -38,8 +38,8 @@
 │       ├── file_ops.rs      # list_files, create_folder, rename_item, move_item, move_batch, delete_item
 │       ├── upload.rs        # check_chunk, upload_chunk, merge_chunks (分片/秒传)
 │       ├── media.rs         # media_proxy (Range 支持), download_zip, editor read/save
-│       ├── share.rs         # create_share, list_shares, delete_share, access_share, share_page
-│       ├── trash.rs         # list_trash, restore_trash, delete_trash_permanent, clear_trash
+│       ├── share.rs         # create_share, list_shares, delete_share, access_share, share_page, share_subfile
+│       ├── trash.rs         # list_trash, restore_trash, delete_trash_permanent, clear_trash, clean_expired_trash
 │       ├── admin.rs         # get_user_quota, set_user_quota, list_users, reset_user_password, audit_logs
 │       ├── system.rs        # health_check (DB SELECT 1), get_system_status (CPU/内存/温度)
 │       ├── links.rs         # CRUD 链接收藏 (AppResult 模式)
@@ -52,7 +52,7 @@
 │       └── auth.rs          # hash_token (SHA-256) + auth_middleware
 ├── assets/
 │   ├── css/  (input.css, tailwind.min.css)
-│   ├── js/   (app.js, api.js, state.js, constants.js, utils.js, components/, views/)
+│   ├── js/   (app.js, api.js, state.js, constants.js, utils.js, components/toast+modal+file-table.js, views/home+drive+trash+admin+share+links+todos+agent.js)
 │   ├── marked.min.js, purify.min.js
 │   └── manifest.json        # PWA Web App Manifest
 ├── static/
@@ -113,7 +113,7 @@
 
 ### 性能
 - SQLite WAL 模式 (`Normal` synchronous), 连接池 16, busy_timeout 10s
-- 16 个索引覆盖高频查询 (username, parent_path, identifier, code, expires_at 等)
+- 15 个显式索引覆盖高频查询 (username, parent_path, identifier, code, expires_at 等)
 - 大文件分块上传 (100 MB/块, 最多 10,000 块, 秒传去重)
 - ZIP 打包下载 `spawn_blocking` 不阻塞异步运行时
 - 后台任务: 临时分片清理/日志轮转(7天)/回收站过期(30天)/速率过期清理
@@ -163,7 +163,7 @@ npm run css:build
 
 ## 代码约定
 
-- **错误处理**: `AppError` 枚举 (10 种 HTTP 状态码映射) + `AppResult<T>` 类型别名, 支持 `?` 传播
+- **错误处理**: `AppError` 枚举 (11 种 HTTP 状态码映射) + `AppResult<T>` 类型别名, 支持 `?` 传播
 - **路由 Handler 返回**: `links.rs` 使用 `AppResult<T>` 模式, 其他 handler 使用 `impl IntoResponse`
 - **数据库**: 查询用 `sqlx::query` (不用 ORM), 事务用 `pool.begin().await`, 兼容性迁移用 `ALTER TABLE ... IF NOT EXISTS` 模式 (忽略重复列错误)
 - **路径**: 所有文件系统路径通过 `safe_join_sandbox` 校验, 目录常量来自 `constants.rs`
