@@ -13,6 +13,22 @@ use crate::handlers::{hash_password, generate_random_password};
 
 /// 创建 SQLite 连接池（WAL 模式，高并发读）
 pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
+    // 清理孤儿 WAL 文件：如果主 DB 文件不存在但 -wal/-shm 残留，
+    // SQLite 会从 WAL 恢复旧数据库，导致"删除 .db 重建"无效
+    let db_path = database_url.strip_prefix("sqlite:").unwrap_or(database_url);
+    if !std::path::Path::new(db_path).exists() {
+        let wal = format!("{}-wal", db_path);
+        let shm = format!("{}-shm", db_path);
+        if std::path::Path::new(&wal).exists() {
+            let _ = std::fs::remove_file(&wal);
+            tracing::info!("[DB] 已清理孤儿 WAL 文件: {}", wal);
+        }
+        if std::path::Path::new(&shm).exists() {
+            let _ = std::fs::remove_file(&shm);
+            tracing::info!("[DB] 已清理孤儿 SHM 文件: {}", shm);
+        }
+    }
+
     let connection_options = database_url.parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
