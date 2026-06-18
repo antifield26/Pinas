@@ -77,9 +77,18 @@ pub async fn save_agent_settings(
         "INSERT INTO user_settings (username, deepseek_api_key, deepseek_api_base, deepseek_model)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(username) DO UPDATE SET
-             deepseek_api_key = COALESCE(excluded.deepseek_api_key, user_settings.deepseek_api_key),
-             deepseek_api_base = COALESCE(excluded.deepseek_api_base, user_settings.deepseek_api_base),
-             deepseek_model = COALESCE(excluded.deepseek_model, user_settings.deepseek_model)"
+             deepseek_api_key = CASE
+                 WHEN excluded.deepseek_api_key IS NULL THEN user_settings.deepseek_api_key
+                 ELSE NULLIF(excluded.deepseek_api_key, '')
+             END,
+             deepseek_api_base = CASE
+                 WHEN excluded.deepseek_api_base IS NULL THEN user_settings.deepseek_api_base
+                 ELSE NULLIF(excluded.deepseek_api_base, '')
+             END,
+             deepseek_model = CASE
+                 WHEN excluded.deepseek_model IS NULL THEN user_settings.deepseek_model
+                 ELSE NULLIF(excluded.deepseek_model, '')
+             END"
     )
     .bind(&session.username)
     .bind(&payload.deepseek_api_key)

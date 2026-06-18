@@ -45,7 +45,7 @@ pub async fn create_share(
     Json(payload): Json<CreateShareRequest>,
 ) -> impl IntoResponse {
     let username = &session.username;
-    let share_code = Uuid::new_v4().to_string().chars().take(12).collect::<String>();
+    let share_code = Uuid::new_v4().to_string();
     let is_dir_val = if payload.is_dir { 1 } else { 0 };
     
     // 处理密码：如果提供了密码，则计算 Argon2 哈希（spawn_blocking）；否则存储 NULL
