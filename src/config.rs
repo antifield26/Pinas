@@ -50,38 +50,70 @@ impl Default for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, config::ConfigError> {
-        // 加载 .env 文件（显式处理错误）
+        // 将 .env 加载到进程环境中
         match dotenvy::dotenv() {
             Ok(path) => eprintln!("[Config] 已加载 .env: {}", path.display()),
-            Err(e) => {
-                // .env 不存在时不报错（首次部署可能没有），但其他错误要报告
-                if !matches!(&e, dotenvy::Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound) {
-                    eprintln!("[Config] 警告: .env 加载失败: {}", e);
-                }
-            }
+            Err(e) => match &e {
+                _ if e.to_string().contains("not found") || e.to_string().contains("NotFound") => {}
+                _ => eprintln!("[Config] .env 加载失败: {}", e),
+            },
         }
 
-        // 验证关键环境变量是否已设置
+        // 直接验证关键变量是否在进程环境中
         match std::env::var("PINAS_ADMIN_PASSWORD") {
             Ok(ref pwd) if !pwd.is_empty() => {
-                eprintln!("[Config] PINAS_ADMIN_PASSWORD: 已设置 ({} 字符)", pwd.len());
+                eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = \"{}\" ({})", pwd, pwd.len());
             }
-            _ => {
-                eprintln!("[Config] PINAS_ADMIN_PASSWORD: 未设置，将自动生成随机密码");
+            Ok(_) => eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = \"\" (空字符串)"),
+            Err(std::env::VarError::NotPresent) => {
+                eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = 未找到");
             }
+            Err(e) => eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD 错误: {}", e),
         }
 
-        let config = config::Config::builder()
-            .add_source(config::Environment::default().prefix("PINAS").separator("_"))
+        // BUGFIX: 不使用 separator("_") — config crate 会将它用作嵌套键分隔符，
+        // 导致 PINAS_ADMIN_PASSWORD → admin.password (嵌套) 而非 admin_password (扁平)。
+        // 默认行为只将 _ 用于前缀分隔，剩余部分直接小写为扁平键名。
+        let settings = config::Config::builder()
+            .add_source(config::Environment::with_prefix("PINAS"))
             .build()?;
 
-        match config.try_deserialize() {
-            Ok(c) => Ok(c),
+        match settings.try_deserialize::<Config>() {
+            Ok(c) => {
+                eprintln!("[Config] admin_password = {:?}", c.admin_password.as_ref().map(|p| format!("{}字符", p.len())));
+                eprintln!("[Config] server_port = {}", c.server_port);
+                Ok(c)
+            }
             Err(e) => {
-                eprintln!("[Config] 环境变量解析失败，使用默认配置。错误: {}", e);
-                eprintln!("[Config] 环境变量格式应为 PINAS_前缀+下划线分隔，如 PINAS_ADMIN_PASSWORD=xxx");
+                eprintln!("[Config] 反序列化失败: {}", e);
                 Ok(Config::default())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_env_prefix_maps_flat_keys() {
+        // 核心验证: Environment::with_prefix("PINAS") 去除 PINAS_ 前缀后，
+        // 剩余部分直接小写为扁平键名（admin_password），不拆分为 admin.password
+        std::env::set_var("PINAS_ADMIN_PASSWORD", "antifield");
+        std::env::set_var("PINAS_SERVER_HOST", "0.0.0.0");
+        std::env::set_var("PINAS_SERVER_PORT", "3000");
+        std::env::set_var("PINAS_DATABASE_URL", "sqlite:test.db");
+
+        let settings = config::Config::builder()
+            .add_source(config::Environment::with_prefix("PINAS"))
+            .build()
+            .unwrap();
+
+        assert_eq!(settings.get::<String>("admin_password").unwrap(), "antifield");
+        assert_eq!(settings.get::<String>("server_host").unwrap(), "0.0.0.0");
+
+        std::env::remove_var("PINAS_ADMIN_PASSWORD");
+        std::env::remove_var("PINAS_SERVER_HOST");
+        std::env::remove_var("PINAS_SERVER_PORT");
+        std::env::remove_var("PINAS_DATABASE_URL");
     }
 }
