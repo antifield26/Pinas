@@ -1558,7 +1558,6 @@ dependencies = [
  "axum",
  "chrono",
  "config",
- "dotenvy",
  "infer",
  "mime_guess",
  "password-hash 0.5.0",

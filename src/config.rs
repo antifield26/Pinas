@@ -48,39 +48,96 @@ impl Default for Config {
     }
 }
 
+/// 手动加载 .env 文件 — 逐行解析 KEY=VALUE 并注入进程环境
+/// 不使用 dotenvy 以避免平台差异（中文 Windows 下的错误信息匹配等）
+fn load_dotenv_manual() {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[Config] 无法获取当前目录: {}", e);
+            return;
+        }
+    };
+    eprintln!("[Config] 工作目录: {}", cwd.display());
+
+    // 尝试多个可能的 .env 路径
+    let candidates = [
+        cwd.join(".env"),
+        std::path::PathBuf::from(".env"),
+    ];
+
+    let mut loaded = false;
+    for path in &candidates {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                eprintln!("[Config] ✓ 读取 .env: {}", path.display());
+                for (lineno, line) in content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    // 跳过空行和注释
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    // 解析 KEY=VALUE
+                    if let Some(eq_pos) = trimmed.find('=') {
+                        let key = trimmed[..eq_pos].trim();
+                        let value = trimmed[eq_pos + 1..].trim();
+                        // 去掉引号（如果有）
+                        let value = value
+                            .strip_prefix('"').unwrap_or(value)
+                            .strip_suffix('"').unwrap_or(value);
+                        std::env::set_var(key, value);
+
+                        if key == "PINAS_ADMIN_PASSWORD" {
+                            let masked = if value.len() <= 3 {
+                                value.to_string()
+                            } else {
+                                format!("{}***", &value[..3])
+                            };
+                            eprintln!("[Config]   L{}: {}={}", lineno + 1, key, masked);
+                        }
+                    } else if !trimmed.is_empty() {
+                        eprintln!("[Config]   L{}: 跳过无效行: {}", lineno + 1, trimmed);
+                    }
+                }
+                loaded = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("[Config] .env 未找到: {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("[Config] 读取 {} 失败: {}", path.display(), e);
+            }
+        }
+    }
+
+    if !loaded {
+        eprintln!("[Config] 未找到 .env 文件，使用默认配置");
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, config::ConfigError> {
-        // 将 .env 加载到进程环境中
-        match dotenvy::dotenv() {
-            Ok(path) => eprintln!("[Config] 已加载 .env: {}", path.display()),
-            Err(e) => match &e {
-                _ if e.to_string().contains("not found") || e.to_string().contains("NotFound") => {}
-                _ => eprintln!("[Config] .env 加载失败: {}", e),
-            },
-        }
+        // 手动加载 .env（避免 dotenvy 平台差异）
+        load_dotenv_manual();
 
-        // 直接验证关键变量是否在进程环境中
+        // 直接验证 PINAS_ADMIN_PASSWORD 是否在进程环境中
         match std::env::var("PINAS_ADMIN_PASSWORD") {
             Ok(ref pwd) if !pwd.is_empty() => {
-                eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = \"{}\" ({})", pwd, pwd.len());
+                eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = \"{}\" ({} 字符)", pwd, pwd.len());
             }
             Ok(_) => eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = \"\" (空字符串)"),
-            Err(std::env::VarError::NotPresent) => {
-                eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = 未找到");
-            }
-            Err(e) => eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD 错误: {}", e),
+            Err(_) => eprintln!("[Config] std::env PINAS_ADMIN_PASSWORD = 未找到！"),
         }
 
-        // BUGFIX: 不使用 separator("_") — config crate 会将它用作嵌套键分隔符，
-        // 导致 PINAS_ADMIN_PASSWORD → admin.password (嵌套) 而非 admin_password (扁平)。
-        // 默认行为只将 _ 用于前缀分隔，剩余部分直接小写为扁平键名。
+        // config crate 从进程环境读取（已由 load_dotenv_manual 注入）
         let settings = config::Config::builder()
             .add_source(config::Environment::with_prefix("PINAS"))
             .build()?;
 
         match settings.try_deserialize::<Config>() {
             Ok(c) => {
-                eprintln!("[Config] admin_password = {:?}", c.admin_password.as_ref().map(|p| format!("{}字符", p.len())));
+                eprintln!("[Config] admin_password = {:?}", c.admin_password.as_ref().map(|p| format!("{} 字符", p.len())));
                 eprintln!("[Config] server_port = {}", c.server_port);
                 Ok(c)
             }
@@ -96,8 +153,6 @@ impl Config {
 mod tests {
     #[test]
     fn test_env_prefix_maps_flat_keys() {
-        // 核心验证: Environment::with_prefix("PINAS") 去除 PINAS_ 前缀后，
-        // 剩余部分直接小写为扁平键名（admin_password），不拆分为 admin.password
         std::env::set_var("PINAS_ADMIN_PASSWORD", "antifield");
         std::env::set_var("PINAS_SERVER_HOST", "0.0.0.0");
         std::env::set_var("PINAS_SERVER_PORT", "3000");
