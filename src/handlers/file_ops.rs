@@ -448,7 +448,7 @@ pub async fn delete_item(
     if !physical_src.exists() { return (StatusCode::NOT_FOUND, "目标实体不存在").into_response(); }
 
     let trash_uuid = Uuid::new_v4().to_string();
-    let trash_dir = base_path.join("tmp").join("trash");
+    let trash_dir = std::path::Path::new(crate::constants::TRASH_DIR);
     let _ = tokio::fs::create_dir_all(&trash_dir).await;
     let physical_dst = trash_dir.join(&trash_uuid);
 

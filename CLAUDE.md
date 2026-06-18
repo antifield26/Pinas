@@ -1,6 +1,6 @@
 # Antifield Cloud (Pi-NAS)
 
-自托管 NAS 网盘应用，面向 Raspberry Pi 5 (ARM64 Linux)，提供文件管理、待办日程、AI 助手、链接收藏等功能。
+自托管 NAS 网盘应用，面向 Raspberry Pi 5 (8GB RAM, Debian13)，提供文件管理、待办日程、AI 助手、链接收藏等功能。
 
 ## 技术栈
 

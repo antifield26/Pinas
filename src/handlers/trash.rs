@@ -161,10 +161,7 @@ pub async fn delete_trash_permanent(
     {
         let uuid: String = row.get("trash_uuid");
         let original_path: String = row.get("original_path");
-        let p = std::path::Path::new("uploads")
-            .join("tmp")
-            .join("trash")
-            .join(&uuid);
+        let p = std::path::Path::new(crate::constants::TRASH_DIR).join(&uuid);
         if p.is_dir() {
             let _ = tokio::fs::remove_dir_all(&p).await;
         } else {
@@ -199,10 +196,7 @@ pub async fn clear_trash(
     for row in rows {
         let id: i64 = row.get("id");
         let trash_uuid: String = row.get("trash_uuid");
-        let physical_path = std::path::Path::new("uploads")
-            .join("tmp")
-            .join("trash")
-            .join(&trash_uuid);
+        let physical_path = std::path::Path::new(crate::constants::TRASH_DIR).join(&trash_uuid);
 
         if physical_path.is_dir() {
             let _ = tokio::fs::remove_dir_all(&physical_path).await;
@@ -239,10 +233,7 @@ pub async fn clean_expired_trash(pool: &sqlx::SqlitePool, days: u32) -> Result<(
     for row in rows {
         let id: i64 = row.get("id");
         let trash_uuid: String = row.get("trash_uuid");
-        let physical_path = std::path::Path::new("uploads")
-            .join("tmp")
-            .join("trash")
-            .join(&trash_uuid);
+        let physical_path = std::path::Path::new(crate::constants::TRASH_DIR).join(&trash_uuid);
 
         if physical_path.is_dir() {
             let _ = tokio::fs::remove_dir_all(&physical_path).await;

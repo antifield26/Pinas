@@ -121,7 +121,7 @@ pub async fn upload_chunk(
     if let Err(e) = validate_identifier(&params.identifier) { return e.into_response(); }
 
     // 确保临时目录存在
-    let tmp_dir = format!("uploads/tmp/{}", params.identifier);
+    let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, params.identifier);
     let _ = tokio::fs::create_dir_all(&tmp_dir).await;
     let chunk_path = format!("{}/{}", tmp_dir, params.chunk_index);
 
@@ -207,7 +207,7 @@ pub async fn merge_chunks(
     .await
     .unwrap_or(None);
 
-    let tmp_dir = format!("uploads/tmp/{}", payload.identifier);
+    let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, payload.identifier);
     // 读取目录下所有分片文件
     let mut chunks = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
