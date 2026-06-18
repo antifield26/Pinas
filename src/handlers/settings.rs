@@ -1,13 +1,13 @@
 // ====== AI Agent 用户设置 ======
 use axum::{
     extract::Extension,
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    response::Json,
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
 use pinas_core::UserSession;
+use crate::error::{AppError, AppResult};
 
 // ====== DTOs ======
 
@@ -24,38 +24,33 @@ pub struct SaveAgentSettingsRequest {
 pub async fn get_agent_settings(
     Extension(pool): Extension<SqlitePool>,
     Extension(session): Extension<UserSession>,
-) -> impl IntoResponse {
+) -> AppResult<Json<serde_json::Value>> {
     let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
         "SELECT deepseek_api_key, deepseek_api_base, deepseek_model
          FROM user_settings WHERE username = ?"
     )
     .bind(&session.username)
     .fetch_optional(&pool)
-    .await;
+    .await?;
 
     match row {
-        Ok(Some((api_key, api_base, model))) => {
-            // 返回 API key 时做脱敏处理
+        Some((api_key, api_base, model)) => {
             let key_configured = api_key.as_ref().map_or(false, |k| !k.is_empty());
             let masked_key = api_key.map(|k| mask_api_key(&k));
-            Json(serde_json::json!({
+            Ok(Json(serde_json::json!({
                 "deepseek_api_key": masked_key,
                 "deepseek_api_key_configured": key_configured,
                 "deepseek_api_base": api_base,
                 "deepseek_model": model,
-            })).into_response()
+            })))
         }
-        Ok(None) => {
-            Json(serde_json::json!({
+        None => {
+            Ok(Json(serde_json::json!({
                 "deepseek_api_key": null,
                 "deepseek_api_key_configured": false,
                 "deepseek_api_base": null,
                 "deepseek_model": null,
-            })).into_response()
-        }
-        Err(e) => {
-            tracing::error!("[Settings] 查询用户设置失败: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "查询设置失败").into_response()
+            })))
         }
     }
 }
@@ -65,15 +60,15 @@ pub async fn save_agent_settings(
     Extension(pool): Extension<SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<SaveAgentSettingsRequest>,
-) -> impl IntoResponse {
+) -> AppResult<Json<serde_json::Value>> {
     // 基本校验
     if let Some(ref base) = payload.deepseek_api_base {
         if !base.is_empty() && !base.starts_with("http") {
-            return (StatusCode::BAD_REQUEST, "API 基础地址必须以 http:// 或 https:// 开头").into_response();
+            return Err(AppError::bad_request("API 基础地址必须以 http:// 或 https:// 开头"));
         }
     }
 
-    let result = sqlx::query(
+    sqlx::query(
         "INSERT INTO user_settings (username, deepseek_api_key, deepseek_api_base, deepseek_model)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(username) DO UPDATE SET
@@ -95,18 +90,10 @@ pub async fn save_agent_settings(
     .bind(&payload.deepseek_api_base)
     .bind(&payload.deepseek_model)
     .execute(&pool)
-    .await;
+    .await?;
 
-    match result {
-        Ok(_) => {
-            tracing::info!("[Settings] 用户 {} 已更新 AI Agent 设置", session.username);
-            Json(serde_json::json!({ "ok": true })).into_response()
-        }
-        Err(e) => {
-            tracing::error!("[Settings] 保存用户设置失败: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "保存设置失败").into_response()
-        }
-    }
+    tracing::info!("[Settings] 用户 {} 已更新 AI Agent 设置", session.username);
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// 对 API key 进行脱敏：保留前6位和后4位

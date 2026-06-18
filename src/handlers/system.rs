@@ -1,13 +1,13 @@
 use axum::{
     extract::Extension,
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    response::Json,
 };
 use pinas_core::UserSession;
+use crate::error::{AppError, AppResult};
 
 pub async fn health_check(
     Extension(pool): Extension<sqlx::SqlitePool>,
-) -> impl IntoResponse {
+) -> AppResult<Json<serde_json::Value>> {
     match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&pool).await {
         Ok(1) => {
             let body = serde_json::json!({
@@ -15,21 +15,21 @@ pub async fn health_check(
                 "database": "connected",
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
-            (StatusCode::OK, Json(body)).into_response()
+            Ok(Json(body))
         }
-        Ok(_) => (StatusCode::SERVICE_UNAVAILABLE, "数据库异常").into_response(),
+        Ok(_) => Err(AppError::service_unavailable("数据库异常")),
         Err(e) => {
             tracing::error!("健康检查数据库连接失败: {}", e);
-            (StatusCode::SERVICE_UNAVAILABLE, "数据库连接失败").into_response()
+            Err(AppError::service_unavailable("数据库连接失败"))
         }
     }
 }
 
 pub async fn get_system_status(
     Extension(session): Extension<UserSession>,
-) -> impl IntoResponse {
+) -> AppResult<Json<serde_json::Value>> {
     if session.role != crate::constants::ROLE_ADMIN {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "管理员权限不足" }))).into_response();
+        return Err(AppError::forbidden("管理员权限不足"));
     }
 
     // CPU 温度
@@ -92,10 +92,10 @@ pub async fn get_system_status(
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "cpu_usage": cpu_usage,
         "cpu_temp": cpu_temp,
         "memory_used_mb": memory_used_mb,
         "memory_total_mb": mem_total_mb,
-    }))).into_response()
+    })))
 }

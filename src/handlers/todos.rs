@@ -1,12 +1,13 @@
 use axum::{
     extract::{Extension, Path, Query},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::Json,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 use pinas_core::UserSession;
+use crate::error::{AppError, AppResult};
 
 // ====== DTOs ======
 
@@ -140,7 +141,7 @@ pub async fn get_todos(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Query(params): Query<TodoQuery>,
-) -> impl IntoResponse {
+) -> AppResult<Json<Vec<TodoItem>>> {
     let mut sql = String::from(
         "SELECT id, username, title, description, due_date, is_all_day, start_time, end_time, priority, status, category, created_at, updated_at FROM todos WHERE username = ?"
     );
@@ -148,28 +149,28 @@ pub async fn get_todos(
     let mut binds: Vec<String> = vec![session.username.clone()];
 
     if let Some(ref cat) = params.category {
-        conditions.push(format!("category = ?"));
+        conditions.push("category = ?".to_string());
         binds.push(cat.clone());
     }
     // 注意：status 过滤不放在 SQL 中，因为日程的 status 由自动计算决定，
     // 而数据库中始终存储为 "pending"。SQL 预过滤会导致日程被错误排除。
     // 正确的做法是：先查询 → apply_auto_status → 在内存中过滤状态。
     if let Some(ref pr) = params.priority {
-        conditions.push(format!("priority = ?"));
+        conditions.push("priority = ?".to_string());
         binds.push(pr.clone());
     }
     if let Some(ref s) = params.search {
-        conditions.push(format!("(title LIKE ? OR description LIKE ?)"));
+        conditions.push("(title LIKE ? OR description LIKE ?)".to_string());
         let like = format!("%{}%", s);
         binds.push(like.clone());
         binds.push(like);
     }
     if let Some(ref df) = params.date_from {
-        conditions.push(format!("due_date >= ?"));
+        conditions.push("due_date >= ?".to_string());
         binds.push(df.clone());
     }
     if let Some(ref dt) = params.date_to {
-        conditions.push(format!("due_date <= ?"));
+        conditions.push("due_date <= ?".to_string());
         binds.push(dt.clone());
     }
 
@@ -184,21 +185,17 @@ pub async fn get_todos(
         query = query.bind(bind);
     }
 
-    match query.fetch_all(&pool).await {
-        Ok(mut todos) => {
-            // 日程自动计算状态
-            apply_auto_status(&mut todos);
+    let mut todos = query.fetch_all(&pool).await?;
+    // 日程自动计算状态
+    apply_auto_status(&mut todos);
 
-            // 如果请求了 status 过滤且过滤的是时间敏感状态，
-            // 需要二次过滤（因为日程的 auto-status 可能与存储不同）
-            if let Some(ref req_status) = params.status {
-                todos.retain(|t| t.status == *req_status);
-            }
-
-            Json(todos).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("查询待办失败: {}", e)).into_response(),
+    // 如果请求了 status 过滤且过滤的是时间敏感状态，
+    // 需要二次过滤（因为日程的 auto-status 可能与存储不同）
+    if let Some(ref req_status) = params.status {
+        todos.retain(|t| t.status == *req_status);
     }
+
+    Ok(Json(todos))
 }
 
 /// POST /api/todos — 创建新待办/日程
@@ -206,25 +203,25 @@ pub async fn create_todo(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<CreateTodoRequest>,
-) -> impl IntoResponse {
+) -> AppResult<(StatusCode, Json<TodoItem>)> {
     if payload.title.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "标题不能为空").into_response();
+        return Err(AppError::bad_request("标题不能为空"));
     }
     if !["low", "medium", "high"].contains(&payload.priority.as_str()) {
-        return (StatusCode::BAD_REQUEST, "优先级必须为 low/medium/high").into_response();
+        return Err(AppError::bad_request("优先级必须为 low/medium/high"));
     }
     if !["pending", "in_progress", "completed", "expired"].contains(&payload.status.as_str()) {
-        return (StatusCode::BAD_REQUEST, "状态必须为 pending/in_progress/completed/expired").into_response();
+        return Err(AppError::bad_request("状态必须为 pending/in_progress/completed/expired"));
     }
     if !["todo", "schedule"].contains(&payload.category.as_str()) {
-        return (StatusCode::BAD_REQUEST, "类别必须为 todo/schedule").into_response();
+        return Err(AppError::bad_request("类别必须为 todo/schedule"));
     }
 
     // 日程必须提供截止日期
     let effective_due_date = if payload.category == "schedule" {
         match &payload.due_date {
             Some(d) if !d.trim().is_empty() => Some(d.clone()),
-            _ => return (StatusCode::BAD_REQUEST, "日程必须设置日期").into_response(),
+            _ => return Err(AppError::bad_request("日程必须设置日期")),
         }
     } else {
         payload.due_date.clone()
@@ -251,30 +248,21 @@ pub async fn create_todo(
     .bind(&effective_status)
     .bind(&payload.category)
     .execute(&pool)
-    .await;
+    .await?;
 
-    match result {
-        Ok(r) => {
-            let id = r.last_insert_rowid();
-            let item = sqlx::query_as::<_, TodoItem>(
-                &format!("SELECT {} FROM todos WHERE id = ?", TODO_COLS)
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await;
-            match item {
-                Ok(mut todo) => {
-                    // 日程自动计算状态
-                    if todo.category == "schedule" {
-                        todo.status = compute_effective_status(&todo);
-                    }
-                    (StatusCode::CREATED, Json(todo)).into_response()
-                }
-                Err(e) => (StatusCode::CREATED, format!("已创建但查询失败: {}", e)).into_response(),
-            }
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("创建失败: {}", e)).into_response(),
+    let id = result.last_insert_rowid();
+    let item = sqlx::query_as::<_, TodoItem>(
+        &format!("SELECT {} FROM todos WHERE id = ?", TODO_COLS)
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+
+    let mut todo = item;
+    if todo.category == "schedule" {
+        todo.status = compute_effective_status(&todo);
     }
+    Ok((StatusCode::CREATED, Json(todo)))
 }
 
 /// PUT /api/todos/:id — 更新待办/日程
@@ -283,21 +271,21 @@ pub async fn update_todo(
     Extension(session): Extension<UserSession>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTodoRequest>,
-) -> impl IntoResponse {
+) -> AppResult<Json<TodoItem>> {
     // 校验优先级（若提供）
     if let Some(ref p) = payload.priority {
         if !["low", "medium", "high"].contains(&p.as_str()) {
-            return (StatusCode::BAD_REQUEST, "优先级必须为 low/medium/high").into_response();
+            return Err(AppError::bad_request("优先级必须为 low/medium/high"));
         }
     }
     if let Some(ref s) = payload.status {
         if !["pending", "in_progress", "completed", "expired"].contains(&s.as_str()) {
-            return (StatusCode::BAD_REQUEST, "状态必须为 pending/in_progress/completed/expired").into_response();
+            return Err(AppError::bad_request("状态必须为 pending/in_progress/completed/expired"));
         }
     }
     if let Some(ref c) = payload.category {
         if !["todo", "schedule"].contains(&c.as_str()) {
-            return (StatusCode::BAD_REQUEST, "类别必须为 todo/schedule").into_response();
+            return Err(AppError::bad_request("类别必须为 todo/schedule"));
         }
     }
 
@@ -308,23 +296,18 @@ pub async fn update_todo(
     .bind(id)
     .bind(&session.username)
     .fetch_optional(&pool)
-    .await;
-
-    let existing = match existing {
-        Ok(Some(item)) => item,
-        Ok(None) => return (StatusCode::NOT_FOUND, "记录不存在或无权操作").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("查询记录失败: {}", e)).into_response(),
-    };
+    .await?
+    .ok_or_else(|| AppError::not_found("记录不存在或无权操作"))?;
 
     let is_schedule = existing.category == "schedule"
         || payload.category.as_deref() == Some("schedule");
 
     // 日程不允许手动修改状态
     if is_schedule && payload.status.is_some() {
-        return (StatusCode::BAD_REQUEST, "日程状态由系统自动管理，不可手动修改").into_response();
+        return Err(AppError::bad_request("日程状态由系统自动管理，不可手动修改"));
     }
 
-    let result = sqlx::query(
+    sqlx::query(
         "UPDATE todos SET title = COALESCE(?, title), description = COALESCE(?, description), due_date = COALESCE(?, due_date), is_all_day = COALESCE(?, is_all_day), start_time = COALESCE(?, start_time), end_time = COALESCE(?, end_time), priority = COALESCE(?, priority), status = COALESCE(?, status), category = COALESCE(?, category), updated_at = datetime('now') WHERE id = ? AND username = ?"
     )
     .bind(&payload.title)
@@ -339,30 +322,21 @@ pub async fn update_todo(
     .bind(id)
     .bind(&session.username)
     .execute(&pool)
-    .await;
+    .await?;
 
-    match result {
-        Ok(_) => {
-            let updated = sqlx::query_as::<_, TodoItem>(
-                &format!("SELECT {} FROM todos WHERE id = ?", TODO_COLS)
-            )
-            .bind(id)
-            .fetch_optional(&pool)
-            .await;
-            match updated {
-                Ok(Some(mut todo)) => {
-                    // 日程自动计算状态
-                    if todo.category == "schedule" {
-                        todo.status = compute_effective_status(&todo);
-                    }
-                    Json(todo).into_response()
-                }
-                Ok(None) => (StatusCode::NOT_FOUND, "记录不存在").into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("查询更新结果失败: {}", e)).into_response(),
-            }
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("更新失败: {}", e)).into_response(),
+    let updated = sqlx::query_as::<_, TodoItem>(
+        &format!("SELECT {} FROM todos WHERE id = ?", TODO_COLS)
+    )
+    .bind(id)
+    .fetch_optional(&pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("记录不存在"))?;
+
+    let mut todo = updated;
+    if todo.category == "schedule" {
+        todo.status = compute_effective_status(&todo);
     }
+    Ok(Json(todo))
 }
 
 /// DELETE /api/todos/:id — 删除待办/日程
@@ -370,21 +344,16 @@ pub async fn delete_todo(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
+) -> AppResult<(StatusCode, &'static str)> {
     let result = sqlx::query("DELETE FROM todos WHERE id = ? AND username = ?")
         .bind(id)
         .bind(&session.username)
         .execute(&pool)
-        .await;
+        .await?;
 
-    match result {
-        Ok(r) => {
-            if r.rows_affected() > 0 {
-                (StatusCode::OK, "已删除").into_response()
-            } else {
-                (StatusCode::NOT_FOUND, "记录不存在或无权操作").into_response()
-            }
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败: {}", e)).into_response(),
+    if result.rows_affected() > 0 {
+        Ok((StatusCode::OK, "已删除"))
+    } else {
+        Err(AppError::not_found("记录不存在或无权操作"))
     }
 }
