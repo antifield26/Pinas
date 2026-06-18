@@ -35,7 +35,7 @@ pub async fn get_agent_settings(
 
     match row {
         Some((api_key, api_base, model)) => {
-            let key_configured = api_key.as_ref().map_or(false, |k| !k.is_empty());
+            let key_configured = api_key.as_ref().is_some_and(|k| !k.is_empty());
             let masked_key = api_key.map(|k| mask_api_key(&k));
             Ok(Json(serde_json::json!({
                 "deepseek_api_key": masked_key,

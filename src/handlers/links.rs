@@ -91,7 +91,7 @@ pub async fn update_link(
             return Err(AppError::bad_request("标题不能为空"));
         }
     }
-    if payload.title.as_ref().map_or(true, |t| t.trim().is_empty())
+    if payload.title.as_ref().is_none_or(|t| t.trim().is_empty())
         && payload.url.is_none()
         && payload.icon.is_none()
         && payload.sort_order.is_none()

@@ -131,7 +131,7 @@ pub async fn media_proxy(
         Ok(f) => f,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if let Err(_) = file.seek(std::io::SeekFrom::Start(start)).await {
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 

@@ -224,8 +224,8 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
         }
     };
 
-    let admin_must_change = if config.admin_password.as_deref().map_or(true, |p| p.is_empty()) { 1 } else { 0 };
-    let guest_must_change = if config.guest_password.as_deref().map_or(true, |p| p.is_empty()) { 1 } else { 0 };
+    let admin_must_change = if config.admin_password.as_deref().is_none_or(|p| p.is_empty()) { 1 } else { 0 };
+    let guest_must_change = if config.guest_password.as_deref().is_none_or(|p| p.is_empty()) { 1 } else { 0 };
 
     let admin_hash = hash_password(&admin_pwd)?;
     let guest_hash = hash_password(&guest_pwd)?;

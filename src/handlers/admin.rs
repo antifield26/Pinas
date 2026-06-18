@@ -126,7 +126,7 @@ pub async fn reset_user_password(
     let hashed = tokio::task::spawn_blocking(move || hash_password(&pwd))
         .await
         .map_err(|_| AppError::internal("服务内部错误"))?
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     // 事务内执行：先清除会话（强制重新登录），再更新密码
     let mut tx = pool.begin().await?;
 

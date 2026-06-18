@@ -113,9 +113,9 @@ fn compute_effective_status(item: &TodoItem) -> String {
     let start = item.start_time.as_deref().unwrap_or("00:00");
     let end = item.end_time.as_deref().unwrap_or("23:59");
 
-    if current_time < start.to_string() {
+    if current_time.as_str() < start {
         "pending".to_string()
-    } else if current_time <= end.to_string() {
+    } else if current_time.as_str() <= end {
         "in_progress".to_string()
     } else {
         "expired".to_string()
@@ -123,7 +123,7 @@ fn compute_effective_status(item: &TodoItem) -> String {
 }
 
 /// 对日程列表应用自动状态（原地修改 status 字段）
-fn apply_auto_status(todos: &mut Vec<TodoItem>) {
+fn apply_auto_status(todos: &mut [TodoItem]) {
     for item in todos.iter_mut() {
         if item.category == "schedule" {
             item.status = compute_effective_status(item);

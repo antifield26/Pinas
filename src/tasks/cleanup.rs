@@ -120,7 +120,7 @@ async fn clean_old_logs(retention_days: u64) -> Result<(), std::io::Error> {
     let mut entries = tokio::fs::read_dir(log_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "log") {
+        if path.extension().is_some_and(|e| e == "log") {
             if let Ok(metadata) = entry.metadata().await {
                 if let Ok(modified) = metadata.modified() {
                     if modified < cutoff {
