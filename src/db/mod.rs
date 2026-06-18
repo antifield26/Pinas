@@ -253,3 +253,11 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
 
     Ok(())
 }
+
+/// 测试专用：在内存数据库中创建所有表（不含默认用户，不创建文件系统目录）
+pub async fn init_test_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await?;
+    init_tables(pool).await?;
+    migrations::run(pool).await;
+    Ok(())
+}

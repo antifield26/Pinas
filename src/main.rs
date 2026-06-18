@@ -2,17 +2,11 @@
 // 自托管 NAS 网盘 + AI 助手
 // 入口点：配置加载、日志初始化、数据库启动、路由注册、后台任务
 
-mod config;
-mod constants;
-mod db;
-mod error;
-mod handlers;
-mod middleware;
-mod router;
-mod tasks;
-
-use crate::constants::*;
-use crate::config::Config;
+use pi_nas::config::Config;
+use pi_nas::constants::*;
+use pi_nas::db;
+use pi_nas::router;
+use pi_nas::tasks;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
