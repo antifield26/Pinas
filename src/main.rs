@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(fmt::Layer::new().with_writer(std::io::stdout).with_ansi(true))
         .with(fmt::Layer::new().with_writer(non_blocking).with_ansi(false))
-        .with(EnvFilter::from_default_env())
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     // 3. 工作目录切换

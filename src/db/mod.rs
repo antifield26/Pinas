@@ -251,6 +251,13 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
 
     info!("✅ 已初始化默认账号（管理员+访客），可通过 PINAS_ADMIN_PASSWORD / PINAS_GUEST_PASSWORD 环境变量修改密码");
 
+    // 如果是自动生成的密码，写入文件作为备份（控制台输出可能被过滤）
+    if config.admin_password.as_deref().is_none_or(|p| p.is_empty()) {
+        let creds = format!("管理员: admin / {}\n访客: guest / {}\n", admin_pwd, guest_pwd);
+        let _ = tokio::fs::write("credentials.txt", &creds).await;
+        info!("自动生成的密码已保存到 credentials.txt（请修改密码后删除此文件）");
+    }
+
     Ok(())
 }
 

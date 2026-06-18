@@ -17,6 +17,9 @@ logs/
 # 环境变量（含密码）
 .env
 
+# 自动生成的初始密码
+credentials.txt
+
 # IDE
 .vs/
 .vscode/

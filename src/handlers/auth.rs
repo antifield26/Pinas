@@ -87,7 +87,10 @@ pub async fn login(
                 Ok(parsed_hash) => Argon2::default()
                     .verify_password(password.as_bytes(), &parsed_hash)
                     .is_ok(),
-                Err(_) => false,
+                Err(e) => {
+                    tracing::error!("[Login] 密码哈希解析失败: {}", e);
+                    false
+                }
             }
         }).await.unwrap_or(false);
 
@@ -121,6 +124,9 @@ pub async fn login(
                 must_change_pwd: must_change != 0,
             })).into_response();
         }
+        tracing::warn!("[Login] 用户 '{}' 密码验证失败", payload.username);
+    } else {
+        tracing::warn!("[Login] 用户 '{}' 不存在", payload.username);
     }
     (StatusCode::UNAUTHORIZED, "账号或访问密码校验失败").into_response()
 }
