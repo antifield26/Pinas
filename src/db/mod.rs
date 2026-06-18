@@ -196,63 +196,92 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(pool).await.unwrap_or(0);
 
-    if user_count > 0 {
-        return Ok(());
+    let is_first_run = user_count == 0;
+
+    // --- 管理员密码 ---
+    let admin_pwd = match config.admin_password.as_deref() {
+        Some(p) if !p.is_empty() => {
+            let pwd = p.to_string();
+            // 环境变量明确设置了密码 → 始终更新数据库中的 admin 密码
+            let hash = hash_password(&pwd)?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT username FROM users WHERE username = ?"
+            ).bind(ROLE_ADMIN).fetch_optional(pool).await?;
+            if existing.is_some() {
+                sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
+                    .bind(&hash).bind(ROLE_ADMIN).execute(pool).await?;
+                info!("[Init] PINAS_ADMIN_PASSWORD 已设置，admin 密码已同步更新");
+            } else {
+                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 0)")
+                    .bind(ROLE_ADMIN).bind(&hash).bind(ROLE_ADMIN).bind(config.default_quota_mb)
+                    .execute(pool).await?;
+            }
+            pwd
+        }
+        _ => {
+            if is_first_run {
+                let pwd = generate_random_password();
+                tracing::warn!("══════════════════════════════════════════════════");
+                tracing::warn!("  未设置 PINAS_ADMIN_PASSWORD 环境变量");
+                tracing::warn!("  已自动生成管理员随机密码: {}", pwd);
+                tracing::warn!("  请立即登录并修改密码！");
+                tracing::warn!("══════════════════════════════════════════════════");
+                let hash = hash_password(&pwd)?;
+                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 1)")
+                    .bind(ROLE_ADMIN).bind(&hash).bind(ROLE_ADMIN).bind(config.default_quota_mb)
+                    .execute(pool).await?;
+                pwd
+            } else {
+                String::new() // 非首次运行且未设置环境变量 → 不修改
+            }
+        }
+    };
+
+    // --- 访客密码 ---
+    let guest_pwd = match config.guest_password.as_deref() {
+        Some(p) if !p.is_empty() => {
+            let pwd = p.to_string();
+            let hash = hash_password(&pwd)?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT username FROM users WHERE username = 'guest'"
+            ).fetch_optional(pool).await?;
+            if existing.is_some() {
+                sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = 'guest'")
+                    .bind(&hash).execute(pool).await?;
+                info!("[Init] PINAS_GUEST_PASSWORD 已设置，guest 密码已同步更新");
+            } else {
+                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES ('guest', ?, ?, ?, 0)")
+                    .bind(&hash).bind(ROLE_USER).bind(config.default_quota_mb)
+                    .execute(pool).await?;
+            }
+            pwd
+        }
+        _ => {
+            if is_first_run {
+                let pwd = generate_random_password();
+                tracing::warn!("  未设置 PINAS_GUEST_PASSWORD 环境变量");
+                tracing::warn!("  已自动生成访客随机密码: {}", pwd);
+                tracing::warn!("══════════════════════════════════════════════════");
+                let hash = hash_password(&pwd)?;
+                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES ('guest', ?, ?, ?, 1)")
+                    .bind(&hash).bind(ROLE_USER).bind(config.default_quota_mb)
+                    .execute(pool).await?;
+                pwd
+            } else {
+                String::new()
+            }
+        }
+    };
+
+    if is_first_run {
+        tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "admin")).await?;
+        tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "guest")).await?;
+        info!("✅ 已初始化默认账号（管理员+访客），可通过 PINAS_ADMIN_PASSWORD / PINAS_GUEST_PASSWORD 环境变量修改密码");
     }
 
-    // 管理员/访客密码：优先从环境变量读取，未设置则自动生成随机密码
-    let admin_pwd = match config.admin_password.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            let pwd = generate_random_password();
-            tracing::warn!("══════════════════════════════════════════════════");
-            tracing::warn!("  未设置 PINAS_ADMIN_PASSWORD 环境变量");
-            tracing::warn!("  已自动生成管理员随机密码: {}", pwd);
-            tracing::warn!("  请立即登录并修改密码！");
-            tracing::warn!("══════════════════════════════════════════════════");
-            pwd
-        }
-    };
-    let guest_pwd = match config.guest_password.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            let pwd = generate_random_password();
-            tracing::warn!("  未设置 PINAS_GUEST_PASSWORD 环境变量");
-            tracing::warn!("  已自动生成访客随机密码: {}", pwd);
-            tracing::warn!("══════════════════════════════════════════════════");
-            pwd
-        }
-    };
-
-    let admin_must_change = if config.admin_password.as_deref().is_none_or(|p| p.is_empty()) { 1 } else { 0 };
-    let guest_must_change = if config.guest_password.as_deref().is_none_or(|p| p.is_empty()) { 1 } else { 0 };
-
-    let admin_hash = hash_password(&admin_pwd)?;
-    let guest_hash = hash_password(&guest_pwd)?;
-
-    sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, ?)")
-        .bind(ROLE_ADMIN)
-        .bind(&admin_hash)
-        .bind(ROLE_ADMIN)
-        .bind(config.default_quota_mb)
-        .bind(admin_must_change)
-        .execute(pool).await?;
-
-    sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, ?)")
-        .bind("guest")
-        .bind(&guest_hash)
-        .bind(ROLE_USER)
-        .bind(config.default_quota_mb)
-        .bind(guest_must_change)
-        .execute(pool).await?;
-
-    tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "admin")).await?;
-    tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "guest")).await?;
-
-    info!("✅ 已初始化默认账号（管理员+访客），可通过 PINAS_ADMIN_PASSWORD / PINAS_GUEST_PASSWORD 环境变量修改密码");
-
-    // 如果是自动生成的密码，写入文件作为备份（控制台输出可能被过滤）
-    if config.admin_password.as_deref().is_none_or(|p| p.is_empty()) {
+    // 如果是自动生成的密码，写入文件作为备份
+    let admin_is_auto = config.admin_password.as_deref().is_none_or(|p| p.is_empty());
+    if admin_is_auto && is_first_run && !admin_pwd.is_empty() {
         let creds = format!("管理员: admin / {}\n访客: guest / {}\n", admin_pwd, guest_pwd);
         let _ = tokio::fs::write("credentials.txt", &creds).await;
         info!("自动生成的密码已保存到 credentials.txt（请修改密码后删除此文件）");
