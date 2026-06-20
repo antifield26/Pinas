@@ -20,7 +20,7 @@ use crate::middleware::csp::csp_middleware;
 pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
     // --- 公开路由（无需认证）---
     // Service Worker（必须从根路径服务）
-    let sw_service = tower_http::services::ServeFile::new("static/sw.js");
+    let sw_service = tower_http::services::ServeFile::new(format!("{}/sw.js", STATIC_DIR));
 
     let public_routes = Router::new()
         .route_service("/sw.js", sw_service)
@@ -88,7 +88,7 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .merge(public_routes)
         .merge(protected_routes)
         .nest_service("/assets", assets_service)
-        .fallback_service(tower_http::services::ServeFile::new("static/index.html"))
+        .fallback_service(tower_http::services::ServeFile::new(format!("{}/index.html", STATIC_DIR)))
         .layer(CompressionLayer::new().gzip(true))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE_BYTES))
         .layer(Extension(pool))

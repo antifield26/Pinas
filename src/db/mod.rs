@@ -208,116 +208,74 @@ async fn init_indexes(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// 为用户存储或更新密码哈希（env 设置→UPDATE，首次运行→INSERT，否则跳过）
+async fn sync_user_password(
+    pool: &sqlx::SqlitePool, username: &str, role: &str,
+    env_pwd: Option<&str>, is_first_run: bool, quota_mb: i64,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match env_pwd.filter(|p| !p.is_empty()) {
+        Some(pwd) => {
+            let hash = hash_password(pwd)?;
+            let exists = sqlx::query("SELECT 1 FROM users WHERE username = ?")
+                .bind(username).fetch_optional(pool).await?.is_some();
+            if exists {
+                sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
+                    .bind(&hash).bind(username).execute(pool).await?;
+                info!("[Init] {} 密码已从环境变量同步更新", username);
+            } else {
+                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 0)")
+                    .bind(username).bind(&hash).bind(role).bind(quota_mb).execute(pool).await?;
+            }
+            Ok(Some(pwd.to_string()))
+        }
+        None if is_first_run => {
+            let pwd = generate_random_password();
+            let label = if username == ROLE_ADMIN { "管理员" } else { "访客" };
+            tracing::warn!("══════════════════════════════════════════════════");
+            tracing::warn!("  未设置 PINAS_{}_PASSWORD 环境变量", username.to_uppercase());
+            tracing::warn!("  已自动生成{}随机密码: {}", label, pwd);
+            tracing::warn!("  请立即登录并修改密码！");
+            tracing::warn!("══════════════════════════════════════════════════");
+            let hash = hash_password(&pwd)?;
+            sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 1)")
+                .bind(username).bind(&hash).bind(role).bind(quota_mb).execute(pool).await?;
+            Ok(Some(pwd))
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(pool).await.unwrap_or(0);
-
     let is_first_run = user_count == 0;
 
-    // --- 管理员密码 ---
-    let admin_pwd = match config.admin_password.as_deref() {
-        Some(p) if !p.is_empty() => {
-            let pwd = p.to_string();
-            // 环境变量明确设置了密码 → 始终更新数据库中的 admin 密码
-            let hash = hash_password(&pwd)?;
-            let existing: Option<String> = sqlx::query_scalar(
-                "SELECT username FROM users WHERE username = ?"
-            ).bind(ROLE_ADMIN).fetch_optional(pool).await?;
-            if existing.is_some() {
-                sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
-                    .bind(&hash).bind(ROLE_ADMIN).execute(pool).await?;
-                info!("[Init] PINAS_ADMIN_PASSWORD 已设置，admin 密码已同步更新");
-            } else {
-                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 0)")
-                    .bind(ROLE_ADMIN).bind(&hash).bind(ROLE_ADMIN).bind(config.default_quota_mb)
-                    .execute(pool).await?;
-            }
+    let admin_pwd = sync_user_password(
+        pool, ROLE_ADMIN, ROLE_ADMIN,
+        config.admin_password.as_deref(), is_first_run, config.default_quota_mb,
+    ).await?;
 
-            // 自检：立即从数据库读回哈希并验证密码
-            let stored_hash: String = sqlx::query_scalar(
-                "SELECT password FROM users WHERE username = ?"
-            ).bind(ROLE_ADMIN).fetch_one(pool).await.map_err(|e| {
-                format!("无法读取 admin 密码哈希用于自检: {}", e)
-            })?;
-            if crate::handlers::verify_password(&stored_hash, &pwd) {
-                info!("[Init] ✅ admin 密码自检通过");
-            } else {
-                let msg = format!(
-                    "[Init] ❌ admin 密码自检失败！hash={}..., pwd_len={}",
-                    &stored_hash[..stored_hash.len().min(40)], pwd.len()
-                );
-                tracing::error!("{}", msg);
-                eprintln!("{}", msg);
-            }
-            pwd
-        }
-        _ => {
-            if is_first_run {
-                let pwd = generate_random_password();
-                tracing::warn!("══════════════════════════════════════════════════");
-                tracing::warn!("  未设置 PINAS_ADMIN_PASSWORD 环境变量");
-                tracing::warn!("  已自动生成管理员随机密码: {}", pwd);
-                tracing::warn!("  请立即登录并修改密码！");
-                tracing::warn!("══════════════════════════════════════════════════");
-                let hash = hash_password(&pwd)?;
-                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 1)")
-                    .bind(ROLE_ADMIN).bind(&hash).bind(ROLE_ADMIN).bind(config.default_quota_mb)
-                    .execute(pool).await?;
-                pwd
-            } else {
-                String::new() // 非首次运行且未设置环境变量 → 不修改
-            }
-        }
-    };
-
-    // --- 访客密码 ---
-    let guest_pwd = match config.guest_password.as_deref() {
-        Some(p) if !p.is_empty() => {
-            let pwd = p.to_string();
-            let hash = hash_password(&pwd)?;
-            let existing: Option<String> = sqlx::query_scalar(
-                "SELECT username FROM users WHERE username = 'guest'"
-            ).fetch_optional(pool).await?;
-            if existing.is_some() {
-                sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = 'guest'")
-                    .bind(&hash).execute(pool).await?;
-                info!("[Init] PINAS_GUEST_PASSWORD 已设置，guest 密码已同步更新");
-            } else {
-                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES ('guest', ?, ?, ?, 0)")
-                    .bind(&hash).bind(ROLE_USER).bind(config.default_quota_mb)
-                    .execute(pool).await?;
-            }
-            pwd
-        }
-        _ => {
-            if is_first_run {
-                let pwd = generate_random_password();
-                tracing::warn!("  未设置 PINAS_GUEST_PASSWORD 环境变量");
-                tracing::warn!("  已自动生成访客随机密码: {}", pwd);
-                tracing::warn!("══════════════════════════════════════════════════");
-                let hash = hash_password(&pwd)?;
-                sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES ('guest', ?, ?, ?, 1)")
-                    .bind(&hash).bind(ROLE_USER).bind(config.default_quota_mb)
-                    .execute(pool).await?;
-                pwd
-            } else {
-                String::new()
-            }
-        }
-    };
+    let guest_pwd = sync_user_password(
+        pool, "guest", ROLE_USER,
+        config.guest_password.as_deref(), is_first_run, config.default_quota_mb,
+    ).await?;
 
     if is_first_run {
-        tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "admin")).await?;
+        tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, ROLE_ADMIN)).await?;
         tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "guest")).await?;
-        info!("✅ 已初始化默认账号（管理员+访客），可通过 PINAS_ADMIN_PASSWORD / PINAS_GUEST_PASSWORD 环境变量修改密码");
-    }
+        info!("✅ 已初始化默认账号");
 
-    // 如果是自动生成的密码，写入文件作为备份
-    let admin_is_auto = config.admin_password.as_deref().is_none_or(|p| p.is_empty());
-    if admin_is_auto && is_first_run && !admin_pwd.is_empty() {
-        let creds = format!("管理员: admin / {}\n访客: guest / {}\n", admin_pwd, guest_pwd);
-        let _ = tokio::fs::write("credentials.txt", &creds).await;
-        info!("自动生成的密码已保存到 credentials.txt（请修改密码后删除此文件）");
+        // 自动生成的密码写 credentials.txt 兜底
+        let admin_is_auto = config.admin_password.as_deref().is_none_or(|p| p.is_empty());
+        if admin_is_auto {
+            if let (Some(ap), Some(gp)) = (&admin_pwd, &guest_pwd) {
+                let _ = tokio::fs::write(
+                    "credentials.txt",
+                    format!("管理员: admin / {}\n访客: guest / {}\n", ap, gp),
+                ).await;
+                info!("自动生成的密码已保存到 credentials.txt");
+            }
+        }
     }
 
     Ok(())

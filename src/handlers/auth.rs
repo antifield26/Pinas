@@ -81,11 +81,6 @@ pub async fn login(
         let must_change: i64 = r.get("must_change_pwd");
         let password = payload.password.clone();
 
-        // 诊断：记录哈希前缀以便与自检输出对比
-        let hash_prefix: String = db_hash.chars().take(40).collect();
-        tracing::info!("[Login] 用户 '{}' 尝试验证, hash={}..., pwd_len={}", payload.username, hash_prefix, password.len());
-
-        // Argon2 验证放入 spawn_blocking 避免阻塞 async 线程
         let is_valid = tokio::task::spawn_blocking(move || {
             match PasswordHash::new(&db_hash) {
                 Ok(parsed_hash) => Argon2::default()
@@ -97,8 +92,6 @@ pub async fn login(
                 }
             }
         }).await.unwrap_or(false);
-
-        tracing::info!("[Login] 用户 '{}' 验证结果: {}", payload.username, if is_valid { "通过" } else { "失败" });
 
         if is_valid {
             let token = Uuid::new_v4().to_string();
