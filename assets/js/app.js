@@ -16,6 +16,7 @@ import * as AgentView from './views/agent.js';
 import * as UploadView from './views/upload.js';
 import * as PlayerView from './views/player.js';
 import * as EditorView from './views/editor.js';
+import * as TerminalView from './views/terminal.js';
 
 // ====== 全局事件委托 ======
 function setupGlobalDelegation() {
@@ -422,6 +423,11 @@ window.App = {
   admin: {
     setQuotaPrompt: (u, q) => AdminView.setQuotaPrompt(u, q),
     resetPasswordPrompt: (u) => AdminView.resetPasswordPrompt(u),
+  },
+  // SSH 终端
+  ssh: {
+    openTerminal: () => TerminalView.openTerminal(),
+    disconnect: () => TerminalView.disconnect(),
   },
 };
 console.log('[App] window.App 已挂载，共 ' + Object.keys(window.App).length + ' 个顶层 API');

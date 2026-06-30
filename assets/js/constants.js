@@ -33,6 +33,7 @@ export const API = {
   AGENT_BRIEFING: '/api/agent/briefing',
   AGENT_MODELS: '/api/agent/models',
   AGENT_SETTINGS: '/api/agent/settings',
+  SSH_WS: '/api/ssh/ws',
 };
 
 export const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB

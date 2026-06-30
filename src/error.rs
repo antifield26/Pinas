@@ -1,6 +1,4 @@
 // ====== 统一错误类型 ======
-// 提供标准化的 HTTP 错误响应，支持 ? 操作符传播
-#![allow(dead_code)]
 
 use axum::{
     http::StatusCode,
@@ -11,16 +9,16 @@ use axum::{
 #[derive(Debug)]
 pub enum AppError {
     BadRequest(String),
-    Unauthorized(String),
     Forbidden(String),
     NotFound(String),
-    Conflict(String),
-    Gone(String),
-    TooManyRequests(String),
     Internal(String),
     PayloadTooLarge(String),
-    BadGateway(String),
     ServiceUnavailable(String),
+    #[allow(dead_code)] Unauthorized(String),
+    #[allow(dead_code)] Conflict(String),
+    #[allow(dead_code)] Gone(String),
+    #[allow(dead_code)] TooManyRequests(String),
+    #[allow(dead_code)] BadGateway(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -91,33 +89,20 @@ impl AppError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         AppError::BadRequest(msg.into())
     }
-    pub fn unauthorized(msg: impl Into<String>) -> Self {
-        AppError::Unauthorized(msg.into())
-    }
-    pub fn forbidden(msg: impl Into<String>) -> Self {
-        AppError::Forbidden(msg.into())
-    }
-    pub fn not_found(msg: impl Into<String>) -> Self {
-        AppError::NotFound(msg.into())
-    }
-    pub fn conflict(msg: impl Into<String>) -> Self {
-        AppError::Conflict(msg.into())
-    }
-    pub fn gone(msg: impl Into<String>) -> Self {
-        AppError::Gone(msg.into())
-    }
-    pub fn too_many_requests(msg: impl Into<String>) -> Self {
-        AppError::TooManyRequests(msg.into())
-    }
-    pub fn internal(msg: impl Into<String>) -> Self {
-        AppError::Internal(msg.into())
-    }
-    pub fn payload_too_large(msg: impl Into<String>) -> Self {
-        AppError::PayloadTooLarge(msg.into())
-    }
-    pub fn bad_gateway(msg: impl Into<String>) -> Self {
-        AppError::BadGateway(msg.into())
-    }
+    #[allow(dead_code)]
+    pub fn unauthorized(msg: impl Into<String>) -> Self { AppError::Unauthorized(msg.into()) }
+    pub fn forbidden(msg: impl Into<String>) -> Self { AppError::Forbidden(msg.into()) }
+    pub fn not_found(msg: impl Into<String>) -> Self { AppError::NotFound(msg.into()) }
+    #[allow(dead_code)]
+    pub fn conflict(msg: impl Into<String>) -> Self { AppError::Conflict(msg.into()) }
+    #[allow(dead_code)]
+    pub fn gone(msg: impl Into<String>) -> Self { AppError::Gone(msg.into()) }
+    #[allow(dead_code)]
+    pub fn too_many_requests(msg: impl Into<String>) -> Self { AppError::TooManyRequests(msg.into()) }
+    pub fn internal(msg: impl Into<String>) -> Self { AppError::Internal(msg.into()) }
+    pub fn payload_too_large(msg: impl Into<String>) -> Self { AppError::PayloadTooLarge(msg.into()) }
+    #[allow(dead_code)]
+    pub fn bad_gateway(msg: impl Into<String>) -> Self { AppError::BadGateway(msg.into()) }
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
         AppError::ServiceUnavailable(msg.into())
     }

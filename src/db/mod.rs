@@ -2,6 +2,7 @@
 // 连接池创建、建表、索引、默认用户
 
 mod migrations;
+pub mod queries;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous, SqlitePoolOptions};
 use std::time::Duration;

@@ -73,6 +73,7 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/api/agent/briefing", post(handlers::generate_briefing))
         .route("/api/agent/settings", get(handlers::get_agent_settings))
         .route("/api/agent/settings", put(handlers::save_agent_settings))
+        .route("/api/ssh/ws", get(handlers::ssh_ws_handler))
         .layer(middleware::from_fn(pinas_core::auth::auth_middleware));
 
     // --- 静态文件服务（24h 缓存） ---

@@ -10,6 +10,7 @@ use sqlx::{FromRow, Row};
 use uuid::Uuid;
 use tokio_util::io::ReaderStream;
 
+use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, safe_join_sandbox, verify_password, log_audit};
 use pinas_core::UserSession;
 
@@ -43,24 +44,16 @@ pub async fn create_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<CreateShareRequest>,
-) -> impl IntoResponse {
-    let username = &session.username;
+) -> AppResult<Json<serde_json::Value>> {
     let share_code = Uuid::new_v4().to_string();
     let is_dir_val = if payload.is_dir { 1 } else { 0 };
-    
-    // 处理密码：如果提供了密码，则计算 Argon2 哈希（spawn_blocking）；否则存储 NULL
+
     let password_hash = match &payload.password {
         Some(pwd) if !pwd.is_empty() => {
             let pwd = pwd.clone();
-            match tokio::task::spawn_blocking(move || hash_password(&pwd)).await {
-                Ok(Ok(hash)) => Some(hash),
-                Ok(Err(e)) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-                }
-                Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
-                }
-            }
+            Some(tokio::task::spawn_blocking(move || hash_password(&pwd)).await
+                .map_err(|_| AppError::internal("服务内部错误"))?
+                .map_err(AppError::internal)?)
         }
         _ => None,
     };
@@ -72,43 +65,25 @@ pub async fn create_share(
             .format("%Y-%m-%d %H:%M:%S").to_string()
     });
 
-    let result = sqlx::query(
+    sqlx::query(
         "INSERT INTO shares (code, file_path, is_dir, username, expires_at, password, has_password) VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
-        .bind(&share_code)
-        .bind(&payload.file_path)
-        .bind(is_dir_val)
-        .bind(username)
-        .bind(&expires_at)
-        .bind(&password_hash)
-        .bind(has_pwd)
-        .execute(&pool)
-        .await;
+    .bind(&share_code).bind(&payload.file_path).bind(is_dir_val).bind(&session.username)
+    .bind(&expires_at).bind(&password_hash).bind(has_pwd).execute(&pool).await?;
 
-    match result {
-        Ok(_) => {
-            // 审计日志：创建分享
-            let details = format!("code={}, expire={:?}, has_password={}", share_code, expires_at, has_pwd);
-            let _ = log_audit(&pool, username, "create_share", Some(&payload.file_path), Some(&details), None, None).await;
-            (StatusCode::OK, Json(serde_json::json!({ "code": share_code }))).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("提取外链发生冲突: {}", e)).into_response(),
-    }
+    let _ = log_audit(&pool, &session.username, "create_share", Some(&payload.file_path), None, None, None).await;
+    Ok(Json(serde_json::json!({ "code": share_code })))
 }
 
 // --- 13. 列出当前用户的全量分享 ---
 pub async fn list_shares(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
-) -> impl IntoResponse {
+) -> AppResult<Json<Vec<ShareItem>>> {
     let rows = sqlx::query_as::<_, ShareItem>(
         "SELECT code, file_path, is_dir, username, expires_at, has_password, download_count FROM shares WHERE username = ?"
-    )
-    .bind(&session.username)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-    Json(rows)
+    ).bind(&session.username).fetch_all(&pool).await?;
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -121,31 +96,22 @@ pub async fn delete_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<DeleteShareRequest>,
-) -> impl IntoResponse {
-    let code = &payload.code;
-    let _ = sqlx::query("DELETE FROM shares WHERE code = ? AND username = ?")
-        .bind(code)
-        .bind(&session.username)
-        .execute(&pool)
-        .await;
-
-    // 审计日志：删除分享
-    let _ = log_audit(&pool, &session.username, "delete_share", Some(code), None, None, None).await;
-    (StatusCode::OK, "分享链条已切断").into_response()
+) -> AppResult<(StatusCode, &'static str)> {
+    sqlx::query("DELETE FROM shares WHERE code = ? AND username = ?")
+        .bind(&payload.code).bind(&session.username).execute(&pool).await?;
+    let _ = log_audit(&pool, &session.username, "delete_share", Some(&payload.code), None, None, None).await;
+    Ok((StatusCode::OK, "分享链条已切断"))
 }
 
 // --- 19. 外链匿名提取与子目录探索（简单响应）---
 pub async fn access_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Path(code): Path<String>,
-) -> impl IntoResponse {
-    let share_meta = sqlx::query("SELECT file_path, username FROM shares WHERE code = ? AND (expires_at IS NULL OR expires_at > datetime('now'))")
-        .bind(&code).fetch_optional(&pool).await.unwrap_or(None);
-
-    if share_meta.is_some() {
-        return (StatusCode::OK, "分享链接有效").into_response();
-    }
-    (StatusCode::GONE, "外链已失效或过期").into_response()
+) -> AppResult<(StatusCode, &'static str)> {
+    let exists = sqlx::query("SELECT 1 FROM shares WHERE code = ? AND (expires_at IS NULL OR expires_at > datetime('now'))")
+        .bind(&code).fetch_optional(&pool).await?.is_some();
+    if exists { Ok((StatusCode::OK, "分享链接有效")) }
+    else { Err(AppError::gone("外链已失效或过期")) }
 }
 
 // --- 分享页面入口（从磁盘读取，避免嵌入二进制） ---
@@ -220,14 +186,14 @@ pub async fn share_subfile(
         return (StatusCode::OK, Json(items)).into_response();
     }
 
-    // 增加下载计数（异步，不阻塞响应）
+    // 增加下载计数 + 审计（异步，不阻塞响应）
     let share_code = share_id.clone();
     let pool_clone = pool.clone();
+    let file = file_path.clone();
     tokio::spawn(async move {
         let _ = sqlx::query("UPDATE shares SET download_count = download_count + 1 WHERE code = ?")
-            .bind(&share_code)
-            .execute(&pool_clone)
-            .await;
+            .bind(&share_code).execute(&pool_clone).await;
+        let _ = crate::handlers::log_audit(&pool_clone, &username, "share_download", Some(&file), None, None, None).await;
     });
 
     // 5. 如果是文件，流式返回

@@ -8,9 +8,6 @@ pub struct Config {
     pub server_port: u16,
     #[serde(default = "default_database_url")]
     pub database_url: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub upload_limit_mb: u64,
     #[serde(default = "default_session_days")]
     pub session_days: i64,
     #[serde(default = "default_temp_cleanup_hours")]
@@ -51,7 +48,6 @@ impl Default for Config {
             server_host: default_server_host(),
             server_port: default_server_port(),
             database_url: default_database_url(),
-            upload_limit_mb: 5 * 1024,
             session_days: default_session_days(),
             temp_cleanup_hours: default_temp_cleanup_hours(),
             trash_cleanup_days: default_trash_cleanup_days(),

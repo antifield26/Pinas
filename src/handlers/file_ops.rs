@@ -6,6 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{safe_join_sandbox, user_dir_path, update_user_used_mb, log_audit};
 use pinas_core::UserSession;
 
@@ -172,41 +173,23 @@ pub async fn create_folder(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<CreateFolderRequest>,
-) -> impl IntoResponse {
-    let username = &session.username;
+) -> AppResult<(StatusCode, &'static str)> {
     let folder_name = payload.name.trim();
-    if folder_name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "名称不能为空").into_response();
-    }
+    if folder_name.is_empty() { return Err(AppError::bad_request("名称不能为空")); }
 
     let parent_path = user_dir_path(payload.current_path);
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let user_dir = safe_join_sandbox(base_path, &format!("{}/{}", username, parent_path));
-    let target_dir = user_dir.join(folder_name);
+    let target_dir = safe_join_sandbox(base_path, &format!("{}/{}", &session.username, parent_path)).join(folder_name);
 
-    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("物理目录创建失败: {}", e)).into_response();
-    }
+    tokio::fs::create_dir_all(&target_dir).await
+        .map_err(|e| AppError::internal(format!("物理目录创建失败: {}", e)))?;
 
-    let result = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 1, '-')")
-        .bind(username)
-        .bind(folder_name)
-        .bind(&parent_path)
-        .execute(&pool)
-        .await;
+    sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 1, '-')")
+        .bind(&session.username).bind(folder_name).bind(&parent_path).execute(&pool).await?;
 
-    match result {
-        Ok(_) => {
-            let target = if parent_path.is_empty() {
-                folder_name.to_string()
-            } else {
-                format!("{}/{}", parent_path, folder_name)
-            };
-            let _ = log_audit(&pool, username, "create_folder", Some(&target), None, None, None).await;
-            (StatusCode::OK, "文件夹创建成功").into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("数据库录入失败: {}", e)).into_response(),
-    }
+    let target = if parent_path.is_empty() { folder_name.to_string() } else { format!("{}/{}", parent_path, folder_name) };
+    let _ = log_audit(&pool, &session.username, "create_folder", Some(&target), None, None, None).await;
+    Ok((StatusCode::OK, "文件夹创建成功"))
 }
 
 // 3. 重命名（包括目录子树）
@@ -267,35 +250,7 @@ pub async fn rename_item(
     (StatusCode::OK, "重命名成功").into_response()
 }
 
-/// 更新目录子树中所有子记录的 parent_path（事务内调用）
-async fn update_child_parent_paths(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    username: &str,
-    old_prefix: &str,
-    new_prefix: &str,
-) -> Result<(), sqlx::Error> {
-    // 更新直接子节点：parent_path = old_prefix
-    sqlx::query("UPDATE files SET parent_path = ? WHERE username = ? AND parent_path = ?")
-        .bind(new_prefix)
-        .bind(username)
-        .bind(old_prefix)
-        .execute(&mut **tx)
-        .await?;
-
-    // 更新深层子节点：parent_path LIKE old_prefix/%
-    let like_pattern = format!("{}/%", old_prefix);
-    sqlx::query(
-        "UPDATE files SET parent_path = ? || SUBSTR(parent_path, ? + 1) WHERE username = ? AND parent_path LIKE ?"
-    )
-    .bind(new_prefix)
-    .bind(old_prefix.len() as i64)
-    .bind(username)
-    .bind(&like_pattern)
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
+use crate::db::queries::update_child_paths as update_child_parent_paths;
 
 /// 文件系统回滚：将已移动的文件移回原位
 fn rollback_moved_files(moved: &[(String, std::path::PathBuf, std::path::PathBuf)]) {
@@ -432,45 +387,34 @@ pub async fn move_batch(
     (StatusCode::OK, "批量移动成功").into_response()
 }
 
-// 6. 删除项目（移至回收站）
 pub async fn delete_item(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     Json(payload): Json<DeleteRequest>,
-) -> impl IntoResponse {
+) -> AppResult<(StatusCode, &'static str)> {
     use uuid::Uuid;
-    let username = &session.username;
     let parent_path = user_dir_path(payload.current_path);
     let full_logical_path = if parent_path.is_empty() { payload.name.clone() } else { format!("{}/{}", parent_path, payload.name) };
 
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let physical_src = safe_join_sandbox(base_path, &format!("{}/{}", username, full_logical_path));
-    if !physical_src.exists() { return (StatusCode::NOT_FOUND, "目标实体不存在").into_response(); }
+    let physical_src = safe_join_sandbox(base_path, &format!("{}/{}", &session.username, full_logical_path));
+    if !physical_src.exists() { return Err(AppError::not_found("目标实体不存在")); }
 
     let trash_uuid = Uuid::new_v4().to_string();
     let trash_dir = std::path::Path::new(crate::constants::TRASH_DIR);
     let _ = tokio::fs::create_dir_all(&trash_dir).await;
-    let physical_dst = trash_dir.join(&trash_uuid);
-
-    if let Err(e) = tokio::fs::rename(&physical_src, &physical_dst).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("移动到物理回收站失败: {}", e)).into_response();
-    }
+    tokio::fs::rename(&physical_src, trash_dir.join(&trash_uuid)).await
+        .map_err(|e| AppError::internal(format!("移动到物理回收站失败: {}", e)))?;
 
     let _ = sqlx::query("INSERT INTO trash (username, original_path, trash_uuid) VALUES (?, ?, ?)")
-        .bind(username).bind(&full_logical_path).bind(&trash_uuid).execute(&pool).await;
-    // 删除被删除条目本身
+        .bind(&session.username).bind(&full_logical_path).bind(&trash_uuid).execute(&pool).await;
     let _ = sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
-        .bind(username).bind(&payload.name).bind(&parent_path).execute(&pool).await;
-    // 如果是目录，级联删除子文件/子目录记录
-    let child_prefix = if parent_path.is_empty() {
-        format!("{}/%", payload.name)
-    } else {
-        format!("{}/{}/%", parent_path, payload.name)
-    };
+        .bind(&session.username).bind(&payload.name).bind(&parent_path).execute(&pool).await;
+    let child_prefix = if parent_path.is_empty() { format!("{}/%", payload.name) } else { format!("{}/{}/%", parent_path, payload.name) };
     let _ = sqlx::query("DELETE FROM files WHERE username = ? AND parent_path LIKE ?")
-        .bind(username).bind(&child_prefix).execute(&pool).await;
+        .bind(&session.username).bind(&child_prefix).execute(&pool).await;
 
-    let _ = update_user_used_mb(&pool, username).await;
-    let _ = log_audit(&pool, username, "delete", Some(&full_logical_path), None, None, None).await;
-    (StatusCode::OK, "已成功移至回收站").into_response()
+    let _ = update_user_used_mb(&pool, &session.username).await;
+    let _ = log_audit(&pool, &session.username, "delete", Some(&full_logical_path), None, None, None).await;
+    Ok((StatusCode::OK, "已成功移至回收站"))
 }

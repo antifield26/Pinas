@@ -250,6 +250,11 @@
           <h3 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-1">用户管理</h3>
           <p class="text-xs text-gray-400 dark:text-gray-400">管理配额、重置密码</p>
         </div>
+        <div onclick="App.ssh.openTerminal()" class="card p-6 sm:p-8 hover:border-emerald-500 dark:hover:border-emerald-400 hover:shadow-md transition cursor-pointer text-center group">
+          <div class="text-4xl mb-3 group-hover:scale-110 transition">🖥️</div>
+          <h3 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-1">SSH 终端</h3>
+          <p class="text-xs text-gray-400 dark:text-gray-400">通过浏览器 SSH 连接树莓派或其他服务器</p>
+        </div>
       </div>
     </div>
 
@@ -591,6 +596,19 @@
         <textarea id="editor-textarea" class="flex-1 border border-gray-200 dark:border-gray-600 rounded-xl p-3 sm:p-4 font-mono text-sm focus:outline-none focus:border-indigo-500 dark:focus:border-indigo-400 resize-none h-full bg-gray-50 dark:bg-gray-900 dark:text-gray-200 focus:bg-white dark:focus:bg-gray-800 transition"></textarea>
         <div id="editor-preview" class="flex-1 border border-gray-200 dark:border-gray-600 rounded-xl p-3 sm:p-4 overflow-y-auto h-full bg-gray-50 dark:bg-gray-900 hidden prose dark:prose-invert max-w-none"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- ====== SSH 终端模态框 ====== -->
+  <div id="ssh-modal" class="fixed inset-0 bg-black/80 hidden flex items-center justify-center z-50 p-2">
+    <div class="bg-gray-900 rounded-xl w-full max-w-5xl h-[85vh] flex flex-col overflow-hidden shadow-2xl">
+      <div class="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-800">
+        <span id="ssh-title" class="text-sm font-medium text-gray-200">SSH 终端</span>
+        <div class="flex gap-2">
+          <button onclick="App.ssh.disconnect()" class="text-xs bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-lg font-medium transition">断开</button>
+        </div>
+      </div>
+      <div id="ssh-terminal-container" class="flex-1 p-1 overflow-hidden"></div>
     </div>
   </div>
 

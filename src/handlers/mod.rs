@@ -13,6 +13,7 @@ pub mod rate_limit;
 mod todos;
 mod agent;
 mod settings;
+mod ssh;
 
 // 公共导出
 pub use utils::*;
@@ -28,6 +29,7 @@ pub use links::*;
 pub use todos::*;
 pub use agent::*;
 pub use settings::*;
+pub use ssh::*;
 
 // 公共 DTO
 use serde::Deserialize;
