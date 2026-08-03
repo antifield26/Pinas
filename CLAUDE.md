@@ -86,7 +86,7 @@ Browser                      Axum Server
 │   ├── components/          # 可复用 HTMX 片段 (21 个)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v7
+├── static/sw.js             # PWA Service Worker v8
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -204,7 +204,8 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v7 预缓存 CDN 依赖（marked/purify 带版本串对齐），离线可用
+- PWA：SW v8 预缓存 CDN 依赖（marked/purify 带版本串对齐），离线可用
+- 版本对齐：Cargo.toml（双 crate）→ `/health` version；CSS `?v=`（4 处）与 sw.js 预缓存 URL 严格一致
 
 ### UI 规范（v1.5 起）
 - **暗色层级**：页面底 `gray-950` → 卡片/导航/模态 `gray-900` → 输入/井面 `gray-800`；hover 恒比基底高一档；边框 `gray-700/800`
@@ -213,6 +214,8 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
   - 片段替换：容器 `fade-me`（swap 淡出 0.2s）+ 新内容 `animate-fade-in`（中央映射挂载）
   - 模态框：`animate-modal-in`（scale 0.96→1，0.15s）；Toast：`animate-toast-in/out`
   - 列表交错：行/卡片 `loop.index0 × 30ms`（封顶 240ms）；聊天消息 `animate-slide-up`
+  - 页面导航（hx-boost）：`animate-page-leave`（浅淡 0.12s，不白屏）+ `animate-page-enter`（淡入上移 0.2s）；
+    JS classList 动态挂载（普通 CSS 类，非 @utility——按需生成会遗漏）；失败/401 即恢复；前进后退同样淡入
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试

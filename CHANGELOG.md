@@ -9,6 +9,8 @@
 - Toast 系统修复：Alpine x-for 渲染模板 + 三色（此前 store 无渲染，toast 不可见）
 - 导航 Askama 循环化：`nav_items()` 单一来源，admin 按权限过滤
 - 独立页（登录/改密/分享）暗色切换按钮 + 共用 `partials/theme_head.html`
+- 页面导航过渡（hx-boost）：离场浅淡 0.12s（不白屏）+ 进场淡入上移 0.2s，失败即恢复，
+  前进/后退同淡入；动画类为普通 CSS 类（JS classList 动态挂载）
 
 ### Fixed
 - **注册用户 quota_mb 为 NULL 被当 0 处理 → 无法上传**（register 显式写入默认配额）
@@ -21,6 +23,10 @@
   空状态三种 padding、file_table 复选框列宽不一致
 - sw.js 预缓存 key 与 base.html 版本号不匹配（marked/purify 缓存 miss）→ 对齐
 - credentials.txt 写入后 chmod 600 + 删除提示
+- `/health` version 返回 1.4.2（Cargo.toml 未同步）→ 1.5.0
+- sw.js 预缓存 CSS 版本用 `?v=v7` 插值，与 HTML `?v=15` 不匹配（预缓存 miss）→ 统一固定版本号
+- clippy 44 处既有警告清零（if-let 合并/事务回滚同步化/类型别名等）+ rustfmt 全库统一
+- 部署路径 `~/pi/cloud_drive` → `~/pinas`（systemd unit 同步，开发机即部署机）
 
 ### Security
 - 限速兜底：无代理直连（无 IP 头）时按 username 限速（login/register）
