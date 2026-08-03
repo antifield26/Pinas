@@ -221,7 +221,7 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 
 ## 构建与部署
 
-**部署路径**: `~/pi/cloud_drive/`（生产环境），开发路径 `~/projects/pinas/`
+**部署路径**: `~/pinas/`（生产环境），开发路径 `~/projects/pinas/`
 
 ```bash
 # 构建
@@ -234,10 +234,10 @@ npm run css:build          # 产物 assets/css/tailwind.min.css
 
 # 部署
 sudo systemctl stop antifield-cloud.service
-cp target/release/pi_nas ~/pi/cloud_drive/pi_nas
-cp static/sw.js ~/pi/cloud_drive/static/sw.js          # PWA 更新时
-cp assets/css/tailwind.min.css ~/pi/cloud_drive/assets/css/  # CSS 更新时
-cp assets/manifest.json ~/pi/cloud_drive/assets/manifest.json  # manifest 更新时
+cp target/release/pi_nas ~/pinas/pi_nas
+cp static/sw.js ~/pinas/static/sw.js          # PWA 更新时
+cp assets/css/tailwind.min.css ~/pinas/assets/css/  # CSS 更新时
+cp assets/manifest.json ~/pinas/assets/manifest.json  # manifest 更新时
 sudo systemctl start antifield-cloud.service
 
 # 验证
@@ -246,7 +246,7 @@ curl -s http://localhost:3000/health
 
 **部署目录结构**:
 ```
-~/pi/cloud_drive/
+~/pinas/
 ├── pi_nas                  # 二进制
 ├── pi_nas.bak.*            # 自动备份
 ├── .env                    # 环境变量
