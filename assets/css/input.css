@@ -49,6 +49,14 @@
   from { opacity: 0; transform: scale(0.96); }
   to { opacity: 1; transform: scale(1); }
 }
+/* 页面整页导航（hx-boost）：离场浅淡（不白屏）+ 进场淡入上移 */
+@keyframes page-leave {
+  to { opacity: 0.6; }
+}
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
@@ -62,6 +70,9 @@
 @utility animate-toast-in { animation: toast-in 0.2s ease-out both; }
 @utility animate-toast-out { animation: toast-out 0.25s ease-in forwards; }
 @utility animate-modal-in { animation: modal-in 0.15s ease-out both; }
+/* 页面导航动画类：仅 JS 动态添加（classList），无模板字面类，故用普通类而非 @utility（按需生成会遗漏） */
+.animate-page-leave { animation: page-leave 0.12s ease-in forwards; }
+.animate-page-enter { animation: page-in 0.2s ease-out both; }
 
 /* 自定义滚动条 */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
