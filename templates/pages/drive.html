@@ -26,7 +26,7 @@
   
 
   <!-- 配额 -->
-  <div id="quota-bar" hx-get="/drive/quota" hx-trigger="load, quotaRefresh from:body" class="card p-4">
+  <div id="quota-bar" hx-get="/drive/quota" hx-trigger="load, quotaRefresh from:body" class="card p-4 fade-me">
     <div class="animate-pulse text-sm text-gray-400">加载配额...</div>
   </div>
 
@@ -39,7 +39,7 @@
               onmousedown="var v=document.getElementById('drive-current-path').value;if(v!=='/'){var p=v.substring(0,v.lastIndexOf('/'))||'/';this.setAttribute('hx-vals','{&quot;path&quot;:&quot;'+p+'&quot;}')}"
               title="上级目录"
               class="shrink-0 text-xs font-medium px-2 py-1 rounded-md border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">↑ 上级</button>
-      <div id="drive-breadcrumbs" hx-get="/drive/breadcrumbs" hx-trigger="load" class="flex items-center gap-1 text-sm overflow-x-auto">
+      <div id="drive-breadcrumbs" hx-get="/drive/breadcrumbs" hx-trigger="load" class="fade-me flex items-center gap-1 text-sm overflow-x-auto">
         <span class="text-gray-400">/</span>
       </div>
       <div class="flex-1"></div>
@@ -51,7 +51,7 @@
     </div>
 
     <!-- 文件列表 -->
-    <div id="drive-file-list" hx-get="/drive/list" hx-trigger="load" hx-include="[name='path']" class="overflow-x-auto">
+    <div id="drive-file-list" hx-get="/drive/list" hx-trigger="load" hx-include="[name='path']" class="fade-me overflow-x-auto">
       <div class="p-8 text-center text-gray-400">加载中...</div>
     </div>
   </div>

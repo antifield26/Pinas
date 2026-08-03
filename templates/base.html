@@ -33,11 +33,10 @@
     .htmx-indicator { display: none; }
     .htmx-request .htmx-indicator { display: inline-block; }
     .htmx-request.htmx-indicator { display: inline-block; }
+    /* 片段替换淡出：HTMX 检测到 swapping 态过渡时长后延迟交换 */
     .fade-me.htmx-swapping { opacity: 0; transition: opacity 0.2s ease-out; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
     .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-    .toast-enter { animation: slideIn 0.3s ease-out; }
     .skip-link { position: absolute; top: -100px; left: 8px; z-index: 100; }
     .skip-link:focus { top: 8px; }
     *:focus-visible { outline: 2px solid #6366f1; outline-offset: 2px; border-radius: 4px; }
@@ -47,8 +46,17 @@
 
   <a href="#main-content" class="skip-link bg-indigo-600 text-white px-3 py-2 rounded text-sm font-medium">跳到主内容</a>
 
-  <!-- Toast 容器 -->
-  <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col gap-3 pointer-events-none" role="status" aria-live="polite" x-data="toasts()" @show-toast.window="add($event.detail)"></div>
+  <!-- Toast 容器（Alpine x-for 渲染，滑入/滑出动画） -->
+  <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col gap-3 pointer-events-none" role="status" aria-live="polite" x-data="toasts()" @show-toast.window="add($event.detail)">
+    <template x-for="t in items" :key="t.id">
+      <div class="pointer-events-auto flex items-start gap-2.5 max-w-sm w-full rounded-xl shadow-lg px-4 py-3 text-sm font-medium animate-toast-in"
+           :class="t.type === 'success' ? 'bg-emerald-600 text-white' : (t.type === 'error' ? 'bg-red-600 text-white' : 'bg-indigo-600 text-white')"
+           x-transition:leave="animate-toast-out">
+        <span class="shrink-0 mt-0.5" x-text="t.type === 'success' ? '✓' : (t.type === 'error' ? '✕' : 'ℹ')"></span>
+        <span class="min-w-0" x-text="t.message"></span>
+      </div>
+    </template>
+  </div>
 
   <!-- Modal 容器 -->
   <div id="modal-container" role="dialog" aria-modal="true" onclick="if(event.target===this)App.closeModal()" class="fixed inset-0 bg-black/50 backdrop-blur-sm hidden items-center justify-center z-50 p-4"></div>
@@ -179,15 +187,47 @@
       }});
     });
 
+    // 片段过渡动画映射：目标容器 → 新内容动画类
+    // （htmx-added 标记本次 swap 新增的元素，避免 beforeend 追加时旧元素重复触发）
+    var FRAGMENT_ANIMATIONS = {
+      'drive-breadcrumbs': 'animate-fade-in',
+      'quota-bar': 'animate-fade-in',
+      'links-container': 'animate-fade-in',
+      'trash-content': 'animate-fade-in',
+      'admin-content': 'animate-fade-in',
+      'conv-list': 'animate-fade-in',
+      'agent-chat-messages': 'animate-slide-up',
+      'home-chat-messages': 'animate-slide-up',
+      'briefing-result': 'animate-slide-up'
+    };
+
     // Modal: show when content loaded, hide when emptied
     // 注：模态框内容来自服务端 Askama 模板（自动转义），无需 DOMPurify 二次消毒
     // DOMPurify 保留用于 AI 聊天 markdown 渲染（chat_message.html 内联调用）
     document.body.addEventListener('htmx:afterSwap', function(e) {
+      var target = e.detail.target;
+      if (!target) return;
+
+      // 模态框：注入内容缩放淡入（离场为同步清空，不做动画）
       var modal = document.getElementById('modal-container');
-      if (e.detail.target !== modal) return;
-      var hasContent = !!modal.innerHTML.trim();
-      modal.classList.toggle('hidden', !hasContent);
-      modal.classList.toggle('flex', hasContent);
+      if (target === modal) {
+        var hasContent = !!modal.innerHTML.trim();
+        modal.classList.toggle('hidden', !hasContent);
+        modal.classList.toggle('flex', hasContent);
+        if (hasContent) {
+          var content = modal.firstElementChild;
+          if (content) content.classList.add('animate-modal-in');
+        }
+        return;
+      }
+
+      // 片段过渡：给本次 swap 新增的内容挂动画类（drive-file-list/todos 由模板内交错入场处理）
+      var anim = FRAGMENT_ANIMATIONS[target.id];
+      if (anim) {
+        Array.from(target.children).forEach(function(child) {
+          if (child.classList.contains('htmx-added')) child.classList.add(anim);
+        });
+      }
     });
     // 模态框内表单提交成功后自动关闭
     document.body.addEventListener('htmx:afterRequest', function(e) {

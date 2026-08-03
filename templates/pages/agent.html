@@ -27,7 +27,7 @@
                 hx-on:after-request="htmx.ajax('GET','/agent/conversations',{target:'#conv-list',swap:'innerHTML'})"
                 class="text-indigo-600 hover:text-indigo-800 text-lg leading-none" aria-label="新建对话" title="新建对话">+</button>
       </div>
-      <div id="conv-list" hx-get="/agent/conversations" hx-trigger="load" class="flex-1 overflow-y-auto space-y-0.5">
+      <div id="conv-list" hx-get="/agent/conversations" hx-trigger="load" class="fade-me flex-1 overflow-y-auto space-y-0.5">
         <div class="text-xs text-gray-400 text-center py-4">加载中...</div>
       </div>
     </div>
