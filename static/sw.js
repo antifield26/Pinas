@@ -1,14 +1,14 @@
-// ====== Antifield Cloud Service Worker v6 ======
-const CACHE_NAME = 'antifield-v6';
-const RUNTIME_CACHE = 'antifield-runtime-v6';
+// ====== Antifield Cloud Service Worker v7 ======
+const CACHE_NAME = 'antifield-v7';
+const RUNTIME_CACHE = 'antifield-runtime-v7';
 
 // CDN 资源也纳入预缓存（支持离线使用）
-const ASSETS_VERSION = 'v6';
+const ASSETS_VERSION = 'v7';
 const PRE_CACHE_URLS = [
   '/',
   `/assets/css/tailwind.min.css?v=${ASSETS_VERSION}`,
-  '/assets/marked.min.js',
-  '/assets/purify.min.js',
+  '/assets/marked.min.js?v=8',
+  '/assets/purify.min.js?v=9',
   // HTMX + Alpine CDN — 预缓存以支持离线
   'https://unpkg.com/htmx.org@2.0.4',
   'https://unpkg.com/alpinejs@3.14.9',

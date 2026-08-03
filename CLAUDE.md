@@ -71,6 +71,7 @@ Browser                      Axum Server
 │       ├── links.rs         # 链接收藏 CRUD
 │       ├── todos.rs         # 待办/日程 CRUD
 │       ├── agent.rs         # AI 对话 (DeepSeek)
+│       ├── conversations.rs # 对话管理 (CRUD + HTMX 片段)
 │       ├── settings.rs      # Agent 用户设置
 │       ├── minecraft.rs     # MC 服务器状态
 │       ├── rate_limit.rs    # 异步速率限制器
@@ -81,10 +82,11 @@ Browser                      Axum Server
 │   └── crypto.rs            # hash_token/password/verify/generate
 ├── templates/
 │   ├── base.html            # 根布局 (nav/toast/modal/PWA/JS namespace)
-│   ├── pages/               # 9 页面模板
-│   └── components/          # 可复用 HTMX 片段 (21 个)
+│   ├── pages/               # 10 页面模板 (7 个 page_struct! + 3 独立页)
+│   ├── components/          # 可复用 HTMX 片段 (21 个)
+│   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v6
+├── static/sw.js             # PWA Service Worker v7
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -152,7 +154,7 @@ Browser                      Axum Server
 
 ## 数据库
 
-11 表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `schema_version`
+13 表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `schema_version`
 
 - **WAL 模式** (`Normal` synchronous)，连接池 16
 - **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
@@ -197,15 +199,25 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 - 变量 `snake_case`，循环 `{% for %} {% endfor %}`，条件用 Rust 风格 (`&&`, `!=`)
 
 ### 前端
-- JS 命名空间 `window.App = { showToast, closeModal, handleUploadForm }`
+- JS 命名空间 `window.App = { showToast, closeModal, navigateTo, goParent, handleUploadForm }`
 - 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
-- 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage
-- PWA：SW v6 预缓存 CDN 依赖，离线可用
+- 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
+- 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
+- PWA：SW v7 预缓存 CDN 依赖（marked/purify 带版本串对齐），离线可用
+
+### UI 规范（v1.5 起）
+- **暗色层级**：页面底 `gray-950` → 卡片/导航/模态 `gray-900` → 输入/井面 `gray-800`；hover 恒比基底高一档；边框 `gray-700/800`
+- **品牌**：indigo→violet 渐变仅用于主按钮与品牌字（`bg-clip-text`），其余克制
+- **动画**（全部尊重 `prefers-reduced-motion`）：
+  - 片段替换：容器 `fade-me`（swap 淡出 0.2s）+ 新内容 `animate-fade-in`（中央映射挂载）
+  - 模态框：`animate-modal-in`（scale 0.96→1，0.15s）；Toast：`animate-toast-in/out`
+  - 列表交错：行/卡片 `loop.index0 × 30ms`（封顶 240ms）；聊天消息 `animate-slide-up`
+  - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 9 个集成测试 + 8 个单元测试
-- 覆盖：auth 流程、文件 CRUD、上传分片、分享密码、回收站、链接 CRUD、待办 CRUD、健康检查
+- 12 个集成测试 + 8 个单元测试
+- 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署
 
@@ -215,10 +227,16 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 # 构建
 cargo build --release
 
+# CSS 构建（改模板类名后需要；产物提交进 git，部署时连带复制）
+# 首次需 npm ci 安装依赖（含 aarch64 watcher prebuild，若缺：npm install @parcel/watcher-linux-arm64-glibc）
+npm run css:build          # 产物 assets/css/tailwind.min.css
+# 改 CSS 后记得同步：base.html 等 4 处 ?v= 版本号 与 sw.js 缓存 key
+
 # 部署
 sudo systemctl stop antifield-cloud.service
 cp target/release/pi_nas ~/pi/cloud_drive/pi_nas
 cp static/sw.js ~/pi/cloud_drive/static/sw.js          # PWA 更新时
+cp assets/css/tailwind.min.css ~/pi/cloud_drive/assets/css/  # CSS 更新时
 cp assets/manifest.json ~/pi/cloud_drive/assets/manifest.json  # manifest 更新时
 sudo systemctl start antifield-cloud.service
 

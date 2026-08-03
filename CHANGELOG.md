@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.5.0 (2026-08-03)
+
+### Added
+- UI 重设计：暗色层级升级（950/900/800 三级）、indigo→violet 品牌渐变
+- 动画体系接线（此前全部为死代码）：片段替换淡入上移、模态缩放、Toast 滑入滑出、
+  列表交错入场（30ms 封顶 240ms）、聊天消息上移；全局尊重 prefers-reduced-motion
+- Toast 系统修复：Alpine x-for 渲染模板 + 三色（此前 store 无渲染，toast 不可见）
+- 导航 Askama 循环化：`nav_items()` 单一来源，admin 按权限过滤
+- 独立页（登录/改密/分享）暗色切换按钮 + 共用 `partials/theme_head.html`
+
+### Fixed
+- **注册用户 quota_mb 为 NULL 被当 0 处理 → 无法上传**（register 显式写入默认配额）
+- **share_page 路径解析缺 username 组件**（目录分享 is_dir 判定错误，与 share_subfile 对齐）
+- logout 仅认 Authorization 头，Cookie 登录的会话无法服务端清理 → 支持 Cookie 场景
+- change_password 新会话 Cookie 缺 Secure 标志（复用 X-Forwarded-Proto 检测）
+- 错误消息泄露 IO/DB 细节（12 处）→ `AppError::internal_log` 仅入日志
+- 云盘"↑ 上级"双机制 + HTML 实体 hack → `App.goParent()` 统一入口
+- admin.html 权限文案双渲染、认证页输入框三套样式、行内按钮两套风格、
+  空状态三种 padding、file_table 复选框列宽不一致
+- sw.js 预缓存 key 与 base.html 版本号不匹配（marked/purify 缓存 miss）→ 对齐
+- credentials.txt 写入后 chmod 600 + 删除提示
+
+### Security
+- 限速兜底：无代理直连（无 IP 头）时按 username 限速（login/register）
+
+### Tests
+- 12 个集成测试：真实 multipart 3×64KB 分片端到端（字节完整性）、配额 403、
+  分享密码全流程（表单→错误→正确→删除）、logout Cookie 清理、改密 Secure 标志
+
+### Build
+- aarch64 CSS 构建修复：npm ci 恢复 @parcel/watcher prebuild；清理失效 @source
+- .gitignore 补齐 backups/uploads/*.db 通配
+
+---
+
 ## v1.4.1 (2026-07-07)
 
 ### Changed

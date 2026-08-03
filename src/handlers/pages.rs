@@ -12,6 +12,8 @@ macro_rules! page_struct {
         #[template(path = $path)]
         struct $name {
             username: String,
+            // 仅 home.html / admin.html 模板读取；其余页面由 nav_items() 在 Rust 侧过滤 admin 项
+            #[allow(dead_code)]
             is_admin: bool,
             current_page: String,
             nav: Vec<NavItem>,
