@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::constants::*;
-use crate::handlers::{hash_password, generate_random_password};
+use pinas_core::{hash_password, generate_random_password};
 
 /// 创建 SQLite 连接池（WAL 模式，高并发读）
 pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
@@ -51,7 +51,7 @@ pub async fn init(pool: &sqlx::SqlitePool, config: &Config) -> Result<(), Box<dy
     init_indexes(pool).await?;
     init_default_users(pool, config).await?;
     // 清理过期会话
-    sqlx::query("DELETE FROM sessions WHERE expires_at <= datetime('now')").execute(pool).await?;
+    queries::clean_expired_sessions(pool).await?;
     Ok(())
 }
 
@@ -181,6 +181,29 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
         )"
     ).execute(pool).await?;
 
+    // AI 对话管理
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '新对话',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+        )"
+    ).execute(pool).await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )"
+    ).execute(pool).await?;
+
     Ok(())
 }
 
@@ -204,7 +227,7 @@ async fn init_indexes(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     ];
 
     for idx in indexes {
-        sqlx::query(idx).execute(pool).await?;
+        sqlx::query(*idx).execute(pool).await?;
     }
     Ok(())
 }

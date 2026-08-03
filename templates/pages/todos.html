@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Antifield Cloud — 待办/日程{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- 顶部操作栏 -->
+  <div class="flex items-center gap-2 flex-wrap">
+    <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">待办事项 & 日程</h2>
+    <div class="flex-1"></div>
+    <button hx-get="/todos/form" hx-target="#modal-container" hx-swap="innerHTML"
+            class="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1.5 rounded-lg transition">
+      + 新建
+    </button>
+    <button id="view-toggle" hx-get="/todos/calendar" hx-target="#todos-container" hx-swap="innerHTML"
+            class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 transition bg-indigo-50 dark:bg-indigo-900/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 px-3 py-1.5 rounded-lg">
+      日历
+    </button>
+    <button hx-post="/agent/briefing" hx-target="#briefing-result" hx-swap="innerHTML"
+            class="text-xs font-medium text-purple-600 dark:text-purple-400 hover:text-purple-800 transition bg-purple-50 dark:bg-purple-900/30 hover:bg-purple-100 dark:hover:bg-purple-900/50 px-3 py-1.5 rounded-lg hidden sm:inline-flex">
+      AI 简报
+    </button>
+  </div>
+
+  <!-- AI 简报结果 -->
+  <div id="briefing-result"></div>
+
+  <!-- 表单容器（HTMX 在这里插入表单） -->
+  
+
+  <!-- 过滤标签 -->
+  <div class="flex flex-wrap items-center gap-3" x-data="{ activeCategory: 'all', activeStatus: 'all' }">
+    <div class="flex gap-1">
+      <button @click="activeCategory='all'" hx-get="/todos/list?category=all" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeCategory==='all' ? 'bg-indigo-600 text-white' : 'bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-200'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">全部</button>
+      <button @click="activeCategory='todo'" hx-get="/todos/list?category=todo" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeCategory==='todo' ? 'bg-indigo-600 text-white' : 'bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-200'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">待办</button>
+      <button @click="activeCategory='schedule'" hx-get="/todos/list?category=schedule" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeCategory==='schedule' ? 'bg-indigo-600 text-white' : 'bg-gray-200 dark:bg-gray-600 text-gray-700 dark:text-gray-200'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">日程</button>
+    </div>
+    <div class="flex-1"></div>
+    <div class="flex gap-1">
+      <button @click="activeStatus='all'" hx-get="/todos/list?status=all" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeStatus==='all' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">全部</button>
+      <button @click="activeStatus='in_progress'" hx-get="/todos/list?status=in_progress" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeStatus==='in_progress' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">进行中</button>
+      <button @click="activeStatus='completed'" hx-get="/todos/list?status=completed" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeStatus==='completed' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">已完成</button>
+      <button @click="activeStatus='expired'" hx-get="/todos/list?status=expired" hx-target="#todos-container" hx-swap="innerHTML"
+              :class="activeStatus==='expired' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium transition">已过期</button>
+    </div>
+  </div>
+
+  <!-- 待办/日程卡片容器 -->
+  <div class="card overflow-hidden">
+    <div class="p-4 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 flex justify-between items-center">
+      <span class="text-xs text-gray-400 dark:text-gray-400" id="todos-count">加载中...</span>
+    </div>
+    <div id="todos-container" hx-get="/todos/list?status=all" hx-trigger="load" hx-swap="innerHTML" class="p-4">
+      <div class="text-center text-gray-400 py-10">加载中...</div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

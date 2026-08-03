@@ -2,18 +2,25 @@ use axum::{
     extract::Request,
     http::StatusCode,
     middleware::Next,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect, Response},
     Extension,
 };
 use sqlx::Row;
 use crate::UserSession;
-use sha2::{Sha256, Digest};
+use crate::crypto::hash_token;
 use tracing::{warn, error};
 
-pub fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
+fn reject_no_token(uri_path: &str) -> Result<Response, StatusCode> {
+    warn!("[Auth] 未提供有效 Token, path={}", uri_path);
+    if uri_path.starts_with("/api/") || uri_path.starts_with("/s/") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let login_url = if uri_path == "/" || uri_path.is_empty() {
+        "/login".to_string()
+    } else {
+        format!("/login?redirect={}", uri_path)
+    };
+    Ok(Redirect::to(&login_url).into_response())
 }
 
 pub async fn auth_middleware(
@@ -27,46 +34,57 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // 获取 token：media 路径支持 query 参数，其他路径仅支持 Header
-    let target_token = if uri_path.starts_with("/api/media/") {
-        // 从查询参数中获取 token
-        req.uri().query()
-            .and_then(|q| {
-                for pair in q.split('&') {
-                    let mut parts = pair.splitn(2, '=');
-                    if parts.next() == Some("token") {
-                        return parts.next().map(|v| v.to_string());
-                    }
-                }
-                None
+    // 提取 token 的辅助闭包
+    let extract_from_cookie = |req: &Request| -> Option<String> {
+        req.headers()
+            .get("Cookie")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|cookies| {
+                cookies.split(';').find_map(|c| {
+                    let c = c.trim();
+                    c.strip_prefix("auth_token=").map(|t| t.to_string())
+                })
             })
-            .or_else(|| {
-                // 降级：尝试从 Authorization 头获取
-                req.headers()
-                    .get("Authorization")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|h| h.strip_prefix("Bearer "))
-                    .map(|t| t.to_string())
-            })
-    } else {
+    };
+    let extract_from_header = |req: &Request| -> Option<String> {
         req.headers()
             .get("Authorization")
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "))
             .map(|t| t.to_string())
     };
+    let extract_from_query = |req: &Request| -> Option<String> {
+        req.uri().query().and_then(|q| {
+            for pair in q.split('&') {
+                let mut parts = pair.splitn(2, '=');
+                if parts.next() == Some("token") {
+                    return parts.next().map(|v| v.to_string());
+                }
+            }
+            None
+        })
+    };
+
+    // 优先级：Cookie (httpOnly) > Authorization Header > Query param
+    let mut target_token = extract_from_cookie(&req)
+        .or_else(|| extract_from_header(&req));
+
+    // media/ssh 路径额外支持 query 参数
+    if target_token.is_none() && (uri_path.starts_with("/api/media/") || uri_path.starts_with("/api/ssh/")) {
+        target_token = extract_from_query(&req)
+            .or_else(|| extract_from_header(&req));
+    }
 
     let target_token = match target_token {
         Some(token) if !token.is_empty() => token,
-        _ => {
-            warn!("[Auth] 未提供有效 Token, path={}", uri_path);
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+        _ => return reject_no_token(uri_path),
     };
 
     let token_hash = hash_token(&target_token);
     let session_row = sqlx::query(
-        "SELECT username, role FROM sessions WHERE token = ? AND expires_at > datetime('now')"
+        "SELECT s.username, s.role, COALESCE(u.must_change_pwd, 0) as must_change_pwd \
+         FROM sessions s LEFT JOIN users u ON s.username = u.username \
+         WHERE s.token = ? AND s.expires_at > datetime('now')"
     )
     .bind(&token_hash)
     .fetch_optional(&pool)
@@ -76,14 +94,30 @@ pub async fn auth_middleware(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (username, role) = match session_row {
-        Some(row) => (row.get::<String, _>("username"), row.get::<String, _>("role")),
+    let (username, role, must_change_pwd) = match session_row {
+        Some(row) => (
+            row.get::<String, _>("username"),
+            row.get::<String, _>("role"),
+            row.get::<i64, _>("must_change_pwd") != 0,
+        ),
         None => {
             warn!("[Auth] Token 无效或已过期: {}...", &target_token.chars().take(8).collect::<String>());
-            return Err(StatusCode::UNAUTHORIZED);
+            return reject_no_token(uri_path);
         }
     };
 
-    req.extensions_mut().insert(UserSession { username, role });
+    // 强制密码修改：must_change_pwd 时仅允许密码修改相关路由
+    if must_change_pwd {
+        let exempt = ["/change-password", "/api/user/password", "/api/logout", "/api/login"];
+        if !exempt.iter().any(|p| uri_path.starts_with(p)) {
+            warn!("[Auth] 用户 '{}' 需要修改密码，拒绝访问: {}", username, uri_path);
+            if uri_path.starts_with("/api/") {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            return Ok(Redirect::to("/change-password").into_response());
+        }
+    }
+
+    req.extensions_mut().insert(UserSession { username, role, must_change_pwd });
     Ok(next.run(req).await)
 }

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Antifield Cloud — 链接库{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <div class="flex items-center gap-2 flex-wrap">
+    <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">链接库</h2>
+    <div class="flex-1"></div>
+    <button hx-get="/links/form" hx-target="#modal-container" hx-swap="innerHTML"
+            class="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1.5 rounded-lg transition">
+      + 添加链接
+    </button>
+  </div>
+
+  
+
+  <div class="card overflow-hidden">
+    <div class="p-4 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50">
+      <span class="text-xs text-gray-400 dark:text-gray-400">收藏与管理常用链接</span>
+    </div>
+    <div id="links-container" hx-get="/links/list" hx-trigger="load" hx-swap="innerHTML"
+         class="p-4 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+      <div class="text-center text-gray-400 col-span-full py-8">加载中...</div>
+    </div>
+  </div>
+</div>
+{% endblock %}

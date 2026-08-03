@@ -16,6 +16,8 @@ pub struct Config {
     pub trash_cleanup_days: u32,
     #[serde(default = "default_trash_cleanup_interval_hours")]
     pub trash_cleanup_interval_hours: u64,
+    #[serde(default = "default_upload_limit_mb")]
+    pub upload_limit_mb: i64,
     #[serde(default = "default_quota_mb")]
     pub default_quota_mb: i64,
     #[serde(default)]
@@ -38,6 +40,7 @@ fn default_session_days() -> i64 { 7 }
 fn default_temp_cleanup_hours() -> u64 { 24 }
 fn default_trash_cleanup_days() -> u32 { 30 }
 fn default_trash_cleanup_interval_hours() -> u64 { 24 }
+fn default_upload_limit_mb() -> i64 { 100 }
 fn default_quota_mb() -> i64 { 10240 }
 fn default_deepseek_api_base() -> String { "https://api.deepseek.com".into() }
 fn default_deepseek_model() -> String { "deepseek-v4-flash".into() }
@@ -52,6 +55,7 @@ impl Default for Config {
             temp_cleanup_hours: default_temp_cleanup_hours(),
             trash_cleanup_days: default_trash_cleanup_days(),
             trash_cleanup_interval_hours: default_trash_cleanup_interval_hours(),
+            upload_limit_mb: default_upload_limit_mb(),
             default_quota_mb: default_quota_mb(),
             admin_password: None,
             guest_password: None,
@@ -90,7 +94,7 @@ fn load_dotenv_manual() {
         if let Some(eq_pos) = trimmed.find('=') {
             let key = trimmed[..eq_pos].trim();
             let value = trimmed[eq_pos + 1..].trim().trim_matches('"');
-            std::env::set_var(key, value);
+            unsafe { std::env::set_var(key, value); }
             if key == "PINAS_ADMIN_PASSWORD" {
                 let masked = if value.len() > 3 {
                     format!("{}***{}", &value[..3], &value[value.len()-1..])
@@ -106,15 +110,25 @@ impl Config {
         load_dotenv_manual();
 
         let settings = config::Config::builder()
-            .add_source(config::Environment::with_prefix("PINAS"))
+            .add_source(config::Environment::with_prefix("PINAS").try_parsing(true))
             .build()?;
 
-        settings.try_deserialize().or_else(|e| {
-            // 反序列化失败通常是 .env 缺少必填字段 — 现在都有 #[serde(default)] 了不应失败
-            // 保留兜底以便向后兼容
-            eprintln!("[Config] 反序列化失败（使用默认值）: {}", e);
-            Ok(Config::default())
-        })
+        let cfg: Self = settings.try_deserialize()?;
+        cfg.validate();
+        Ok(cfg)
+    }
+
+    /// 启动时校验配置值
+    fn validate(&self) {
+        if self.server_port == 0 {
+            eprintln!("[Config] 警告: server_port=0，将使用随机端口");
+        }
+        if self.upload_limit_mb == 0 {
+            eprintln!("[Config] 警告: upload_limit_mb=0，上传功能将不可用");
+        }
+        if self.session_days < 1 {
+            eprintln!("[Config] 警告: session_days={}，会话将立即过期", self.session_days);
+        }
     }
 }
 
@@ -122,21 +136,21 @@ impl Config {
 mod tests {
     #[test]
     fn test_env_prefix_maps_flat_keys() {
-        std::env::set_var("PINAS_ADMIN_PASSWORD", "antifield");
-        std::env::set_var("PINAS_SERVER_HOST", "0.0.0.0");
-        std::env::set_var("PINAS_SERVER_PORT", "3000");
-        std::env::set_var("PINAS_DATABASE_URL", "sqlite:test.db");
+        unsafe { std::env::set_var("PINAS_ADMIN_PASSWORD", "antifield"); }
+        unsafe { std::env::set_var("PINAS_SERVER_HOST", "0.0.0.0"); }
+        unsafe { std::env::set_var("PINAS_SERVER_PORT", "3000"); }
+        unsafe { std::env::set_var("PINAS_DATABASE_URL", "sqlite:test.db"); }
 
         let settings = config::Config::builder()
-            .add_source(config::Environment::with_prefix("PINAS"))
+            .add_source(config::Environment::with_prefix("PINAS").try_parsing(true))
             .build()
             .unwrap();
 
         assert_eq!(settings.get::<String>("admin_password").unwrap(), "antifield");
 
-        std::env::remove_var("PINAS_ADMIN_PASSWORD");
-        std::env::remove_var("PINAS_SERVER_HOST");
-        std::env::remove_var("PINAS_SERVER_PORT");
-        std::env::remove_var("PINAS_DATABASE_URL");
+        unsafe { std::env::remove_var("PINAS_ADMIN_PASSWORD"); }
+        unsafe { std::env::remove_var("PINAS_SERVER_HOST"); }
+        unsafe { std::env::remove_var("PINAS_SERVER_PORT"); }
+        unsafe { std::env::remove_var("PINAS_DATABASE_URL"); }
     }
 }

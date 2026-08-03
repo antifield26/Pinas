@@ -1,0 +1,76 @@
+{# Todo list fragment — rendered by HTMX GET /todos/list #}
+{% if todos.is_empty() %}
+<div class="text-center text-gray-400 dark:text-gray-400 py-10">
+  <p class="text-lg font-medium mb-2">暂无内容</p>
+  <p class="text-sm">暂无待办/日程</p>
+  <p class="text-xs mt-1 text-gray-300 dark:text-gray-500">点击"新建"创建</p>
+</div>
+{% else %}
+<div class="grid gap-3 sm:grid-cols-2">
+  {% for t in todos %}
+  <div class="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl p-4 hover:shadow-md transition group {% if t.status == "completed" %}opacity-60{% endif %}"
+       id="todo-{{ t.id }}">
+    <div class="flex items-start justify-between gap-3">
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 flex-wrap mb-1">
+          {% if t.status == "completed" %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">已完成</span>
+          {% else if t.status == "expired" %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">已过期</span>
+          {% else if t.status == "in_progress" %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">进行中</span>
+          {% else %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400">待办</span>
+          {% endif %}
+
+          {% if t.priority == "high" %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">高</span>
+          {% else if t.priority == "low" %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">低</span>
+          {% else %}
+          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">中</span>
+          {% endif %}
+
+          <span class="text-xs text-gray-400 dark:text-gray-500">{% if t.category == "schedule" %}日程{% else %}待办{% endif %}</span>
+        </div>
+
+        <h3 class="font-medium text-gray-800 dark:text-gray-200 {% if t.status == "completed" %}line-through{% endif %}">{{ t.title }}</h3>
+
+        {% if t.description.is_some() && !t.description.as_ref().unwrap().is_empty() %}
+        <p class="text-xs text-gray-500 dark:text-gray-300 mt-1 line-clamp-2">{{ t.description.as_ref().unwrap() }}</p>
+        {% endif %}
+
+        {% if t.due_date.is_some() %}
+        <div class="mt-1.5">
+          <span class="text-xs {% if t.category == "schedule" %}text-indigo-500 dark:text-indigo-400 font-medium{% else if t.status == "expired" %}text-red-500 font-medium{% else %}text-gray-400{% endif %}">
+            {{ t.due_date.as_ref().unwrap() }}
+            {% if t.category == "schedule" %}
+              {% if t.is_all_day == 1 %} 全天
+              {% else if t.start_time.is_some() %} {{ t.start_time.as_ref().unwrap() }}–{{ t.end_time.as_ref().unwrap() }}
+              {% endif %}
+            {% endif %}
+          </span>
+        </div>
+        {% endif %}
+      </div>
+
+      <div class="flex items-center gap-0.5 shrink-0">
+        {% if t.category != "schedule" && t.status != "completed" %}
+        <button hx-put="/todos/{{ t.id }}" hx-vals='{"status":"completed"}' hx-target="#todos-container" hx-swap="innerHTML"
+                class="w-8 h-8 flex items-center justify-center rounded-lg text-green-600 bg-gray-100 dark:bg-gray-700 hover:bg-green-50 dark:hover:bg-green-900/40 transition" title="完成">✓</button>
+        <button hx-put="/todos/{{ t.id }}" hx-vals='{"status":"in_progress"}' hx-target="#todos-container" hx-swap="innerHTML"
+                class="w-8 h-8 flex items-center justify-center rounded-lg text-blue-600 bg-gray-100 dark:bg-gray-700 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition" title="开始">▶</button>
+        {% endif %}
+        <button hx-get="/todos/form/{{ t.id }}" hx-target="#modal-container" hx-swap="innerHTML"
+                class="w-8 h-8 flex items-center justify-center rounded-lg text-amber-600 bg-gray-100 dark:bg-gray-700 hover:bg-amber-50 dark:hover:bg-amber-900/40 transition" title="编辑">✎</button>
+        <button hx-delete="/todos/{{ t.id }}" hx-target="#todos-container" hx-swap="innerHTML"
+                hx-confirm="确定删除？"
+                class="w-8 h-8 flex items-center justify-center rounded-lg text-red-600 bg-gray-100 dark:bg-gray-700 hover:bg-red-50 dark:hover:bg-red-900/40 transition" title="删除">✕</button>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<span id="todos-count" hx-swap-oob="true" class="text-xs text-gray-400 dark:text-gray-400">共 {{ todos.len() }} 项</span>

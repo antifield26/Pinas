@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Antifield Cloud — 用户管理{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">用户管理</h2>
+  <p class="text-xs text-gray-400 dark:text-gray-400">管理用户配额和密码（仅管理员）</p>
+
+  {% if is_admin %}
+  <div class="card overflow-hidden">
+    <div id="admin-content" hx-get="/admin/users" hx-trigger="load" class="overflow-x-auto">
+      <div class="p-8 text-center text-gray-400">加载中...</div>
+    </div>
+  </div>
+  {% else %}
+  <div class="card p-8 text-center text-gray-400">
+    <p class="text-lg font-medium mb-2">需要管理员权限</p>
+    <p>需要管理员权限</p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

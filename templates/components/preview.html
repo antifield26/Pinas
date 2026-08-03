@@ -1,0 +1,75 @@
+<div class="bg-white dark:bg-gray-800 rounded-2xl w-full max-w-4xl shadow-2xl mx-auto max-h-[90vh] flex flex-col" onclick="event.stopPropagation()">
+  <div class="flex justify-between items-center p-5 border-b border-gray-100 dark:border-gray-700 shrink-0">
+    <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100 flex items-center gap-2">
+      <span>{{ file_name }}</span>
+      <span class="text-xs font-normal text-gray-400">({{ file_size }})</span>
+    </h3>
+    <button onclick="App.closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none">&times;</button>
+  </div>
+  <div class="p-5 overflow-auto flex-1">
+    {% if is_image %}
+    <div class="flex items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-900 rounded-lg p-4">
+      <img src="/api/media/{{ file_path }}" alt="{{ file_name }}"
+           class="max-w-full max-h-[70vh] object-contain rounded shadow-lg"
+           onerror="this.parentElement.innerHTML='<div class=\'text-red-500 text-sm\'>✕ 图片加载失败</div>'">
+    </div>
+    {% else if is_video %}
+    <div class="flex items-center justify-center bg-black rounded-lg overflow-hidden">
+      <video controls autoplay muted playsinline class="max-w-full max-h-[70vh] rounded-lg" preload="metadata"
+             onerror="this.parentElement.innerHTML='<div class=\'flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-900 rounded-lg p-8 gap-3\'><span class=\'text-5xl\'>🎬</span><p class=\'text-gray-600 dark:text-gray-400 text-sm\'>视频无法播放</p><p class=\'text-xs text-gray-400 mt-1\'>可能是编码格式不兼容，请下载后使用本地播放器</p><a href=\'/api/media/{{ file_path }}\' download=\'{{ file_name }}\' class=\'bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3\'>↓ 下载文件</a></div>'">
+        <source src="/api/media/{{ file_path }}" type="{{ mime_type }}">
+        <p class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-900 rounded-lg p-8 gap-3">
+          <span class="text-5xl">🎬</span>
+          <span class="text-gray-600 dark:text-gray-400 text-sm">您的浏览器不支持此视频格式</span>
+          <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+             class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3">↓ 下载文件</a>
+        </p>
+      </video>
+    </div>
+    {% else if is_audio %}
+    <div class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-900 rounded-lg p-8 gap-4">
+      <span class="text-6xl">♪</span>
+      <span class="text-lg font-medium text-gray-700 dark:text-gray-300">{{ file_name }}</span>
+      <audio controls preload="metadata" class="w-full max-w-md">
+        <source src="/api/media/{{ file_path }}" type="{{ mime_type }}">
+        您的浏览器不支持此音频格式
+      </audio>
+    </div>
+    {% else if is_pdf %}
+    <embed src="/api/media/{{ file_path }}#toolbar=1&navpanes=1"
+           type="application/pdf" class="w-full rounded-lg"
+           style="min-height: 75vh;">
+    {% else if is_text %}
+    <div class="relative">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs text-gray-400 font-mono">{{ mime_type }}</span>
+        <button onclick="navigator.clipboard.writeText(this.closest('.relative').querySelector('pre').textContent);App.showToast('已复制到剪贴板','info')"
+                class="text-xs bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 px-2 py-1 rounded transition">
+          复制
+        </button>
+      </div>
+      <pre class="bg-gray-100 dark:bg-gray-900 rounded-lg p-4 text-sm font-mono text-gray-800 dark:text-gray-200 overflow-auto max-h-[65vh] whitespace-pre-wrap break-all"><code>{{ content }}</code></pre>
+    </div>
+    {% else %}
+    <div class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-900 rounded-lg p-8 gap-3">
+      <span class="text-5xl">📄</span>
+      <p class="text-gray-600 dark:text-gray-400 text-sm">此文件类型不支持在线预览</p>
+      <p class="text-xs text-gray-400 font-mono">{{ mime_type }}</p>
+      <div class="flex gap-2 mt-2">
+        <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+           class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm">↓ 下载文件</a>
+        <button onclick="App.closeModal()"
+                class="bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 font-medium py-2 px-4 rounded-lg transition text-sm">关闭</button>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  {% if is_image || is_video || is_audio || is_pdf || is_text %}
+  <div class="px-5 py-3 border-t border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 flex items-center gap-2 shrink-0">
+    <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+       class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-3 py-1.5 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">↓ 下载</a>
+    <span class="flex-1"></span>
+    <span class="text-xs text-gray-400">{{ file_size }}</span>
+  </div>
+  {% endif %}
+</div>

@@ -1,36 +1,37 @@
-﻿[package]
+[package]
 name = "pi_nas"
-version = "0.1.0"
-edition = "2021"
+version = "1.4.2"
+edition = "2024"
 
 [workspace]
 members = ["pinas-core"]
 
 [dependencies]
 pinas-core = { path = "./pinas-core" }
-axum = { version = "0.7", features = ["multipart", "ws"] }
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["fs", "limit", "compression-gzip", "set-header"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-zip = "0.6"
-sqlx = { version = "0.7", features = [ "runtime-tokio", "sqlite", "macros" ] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["fs", "limit", "compression-gzip", "set-header"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = "8.6.0"
+sqlx = { version = "0.9", features = [ "runtime-tokio", "sqlite" ] }
 tokio-util = { version = "0.7", features = ["io"] }
-argon2 = "0.5"
-password-hash = "0.5"
-rand_core = { version = "0.6", features = ["getrandom"] }
+argon2 = "0.6.0-rc.8"
+password-hash = { version = "0.6.1", features = ["getrandom"] }
+rand_core = "0.10.1"
+getrandom = "0.4"
 uuid = { version = "1", features = ["v4"] }
-infer = "0.15"
+infer = "0.19.0"
 chrono = "0.4"
-mime_guess = "2.0"
-sha2 = "0.10"
-ssh2 = "0.9"
+mime_guess = "2"
+sha2 = "0.11.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-config = "0.14"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+config = { version = "0.15.25", default-features = false, features = ["convert-case"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+askama = "0.16"
 
 [dev-dependencies]
 tempfile = "3.8"

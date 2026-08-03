@@ -1,171 +1,246 @@
 # Antifield Cloud (Pi-NAS)
 
-自托管 NAS 网盘应用，面向 Raspberry Pi 5 (8GB RAM, Debian13)，提供文件管理、待办日程、AI 助手、链接收藏等功能。
+自托管 NAS 网盘应用，面向 Raspberry Pi 5 (8GB RAM, Debian 13, ARM64 cortex-a76)。
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|------|
-| 后端 | Rust 2021, Axum 0.7, Tokio, SQLx 0.7 (SQLite WAL), tower-http |
-| 数据库 | SQLite (WAL 模式, `cloud_disk.db`) |
-| 前端 | 原生 JavaScript ES Modules, Tailwind CSS v4, marked + DOMPurify |
-| 目标平台 | `aarch64-unknown-linux-gnu` / `aarch64-unknown-linux-musl`, `cortex-a76` |
-| 部署 | Dockerfile (多阶段构建), 默认端口 3000 |
+| 后端 | Rust 2024, Axum 0.8, Tokio, SQLx 0.9 (SQLite WAL), tower-http |
+| 模板 | Askama 0.16 (编译时 Jinja2 语法) |
+| 前端 | HTMX 2.0.4 + Alpine.js 3.14.9 |
+| CSS | Tailwind CSS v4 (预编译 `tailwind.min.css`) |
+| Markdown | marked.js + DOMPurify (AI 聊天渲染) |
+| 数据库 | SQLite WAL 模式 (`cloud_disk.db`) |
+| 目标平台 | `aarch64-unknown-linux-gnu`, `cortex-a76` |
+| 部署 | Docker (多阶段构建) + systemd |
+
+## 架构
+
+```
+Browser                      Axum Server
+┌──────────────┐  HTML       ┌─────────────────────┐
+│ HTMX         │◄──────────→│ Askama Templates     │
+│ Alpine.js    │  fragments  │  ├ base.html         │
+│ Tailwind     │             │  ├ pages/*.html (9)  │
+└──────────────┘  JSON       │  └ components/*.html │
+                  ◄──────────→│                     │
+                              │ JSON API            │
+                              │  ├ /api/files/*     │
+                              │  ├ /api/todos/*     │
+                              │  ├ /api/agent/*     │
+                              │  └ ...              │
+                              └─────────────────────┘
+```
+
+### 核心原则
+
+- **HATEOAS**：响应包含自身的链接/操作，无客户端路由
+- **服务端唯一真相源**：Alpine.js 仅用于 UI 临时状态（主题、模态框）
+- **文件即真相**：文件列表以磁盘实际文件为准，DB 记录自动同步清理
+- **渐进增强**：核心流程无需 JS，HTMX 增强交互
 
 ## 项目结构
 
 ```
 ├── src/
-│   ├── main.rs              # 入口点 (~60 行，加载配置/日志/DB/路由/任务)
-│   ├── config.rs            # Config 结构体 (PINAS_* 环境变量)
-│   ├── constants.rs         # 全局常量 (路径/角色/限制/间隔)
-│   ├── error.rs             # AppError 统一错误类型 + AppResult<T>
-│   ├── router.rs            # build_router() — 所有路由注册
+│   ├── main.rs              # 入口 (配置/日志/DB/路由/CancellationToken/优雅关闭)
+│   ├── config.rs            # Config 结构体 (PINAS_* 环境变量 + validate())
+│   ├── constants.rs         # 全局常量
+│   ├── error.rs             # AppError + AppResult<T>
+│   ├── router.rs            # build_router() — ~95 条路由
+│   ├── templates.rs         # AppTemplate<T> — Askama → IntoResponse
 │   ├── db/
-│   │   ├── mod.rs           # create_pool(), init_tables(), init_indexes(), init_default_users()
-│   │   └── migrations.rs    # ALTER TABLE 兼容性迁移
+│   │   ├── mod.rs           # create_pool(), init_tables()
+│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表)
+│   │   └── queries.rs       # 共享查询辅助
 │   ├── middleware/
-│   │   ├── mod.rs
-│   │   └── csp.rs           # Content-Security-Policy 中间件
+│   │   └── csp.rs           # Content-Security-Policy
 │   ├── tasks/
-│   │   ├── mod.rs
-│   │   └── cleanup.rs       # 后台清理任务 (临时分片/日志/回收站/速率限制)
+│   │   └── cleanup.rs       # 后台任务 (支持 CancellationToken)
 │   └── handlers/
-│       ├── mod.rs           # 模块声明 + BatchDownloadRequest DTO
-│       ├── auth.rs          # login, register, logout (Argon2 + Token)
-│       ├── utils.rs         # hash_password, generate_random_password, safe_join_sandbox, MIME 检查
-│       ├── rate_limit.rs    # 内存速率限制器 (HashMap + Mutex, 容量上限 10k)
-│       ├── file_ops.rs      # list_files, create_folder, rename_item, move_item, move_batch, delete_item
-│       ├── upload.rs        # check_chunk, upload_chunk, merge_chunks (分片/秒传)
-│       ├── media.rs         # media_proxy (Range 支持), download_zip, editor read/save
-│       ├── share.rs         # create_share, list_shares, delete_share, access_share, share_page, share_subfile
-│       ├── trash.rs         # list_trash, restore_trash, delete_trash_permanent, clear_trash, clean_expired_trash
-│       ├── admin.rs         # get_user_quota, set_user_quota, list_users, reset_user_password, audit_logs
-│       ├── system.rs        # health_check (DB SELECT 1), get_system_status (CPU/内存/温度)
-│       ├── links.rs         # CRUD 链接收藏 (AppResult 模式)
-│       ├── todos.rs         # CRUD 待办/日程 (自动状态计算: pending/in_progress/expired)
-│       ├── agent.rs         # AI 对话代理 (DeepSeek API), generate_briefing, get_models
-│       └── settings.rs      # GET/PUT AI Agent 用户设置 (API key/base/model)
-├── pinas-core/
-│   └── src/
-│       ├── lib.rs           # UserSession 结构体
-│       └── auth.rs          # hash_token (SHA-256) + auth_middleware
-├── assets/
-│   ├── css/  (input.css, tailwind.min.css)
-│   ├── js/   (app.js, api.js, state.js, constants.js, utils.js, components/toast+modal+file-table.js, views/home+drive+trash+admin+share+links+todos+agent.js)
-│   ├── marked.min.js, purify.min.js
-│   └── manifest.json        # PWA Web App Manifest
-├── static/
-│   ├── index.html           # SPA 入口
-│   └── sw.js                # PWA Service Worker
-├── uploads/                 # 运行时文件存储
-├── logs/                    # 运行时日志 (每日轮转)
-├── .env                     # 环境变量配置
-├── Dockerfile               # ARM64 多阶段构建
-└── .dockerignore
+│       ├── pages.rs         # 页面路由 (page_handler! 宏)
+│       ├── auth.rs          # 认证 (Argon2 + Secure Cookie)
+│       ├── file_ops.rs      # 文件 CRUD + HTMX 片段 (~630行)
+│       ├── upload.rs        # 分片上传 (10MB/片 + 并发3 + 重试3)
+│       ├── media.rs         # 媒体代理 (流式播放 + Range)
+│       ├── share.rs         # 分享管理 + 分享页面
+│       ├── trash.rs         # 回收站
+│       ├── admin.rs         # 用户管理
+│       ├── system.rs        # 健康检查 + 系统监控
+│       ├── links.rs         # 链接收藏 CRUD
+│       ├── todos.rs         # 待办/日程 CRUD
+│       ├── agent.rs         # AI 对话 (DeepSeek)
+│       ├── settings.rs      # Agent 用户设置
+│       ├── minecraft.rs     # MC 服务器状态
+│       ├── rate_limit.rs    # 异步速率限制器
+│       └── utils.rs         # 路径沙箱/MIME/审计/配额
+├── pinas-core/src/
+│   ├── lib.rs               # UserSession
+│   ├── auth.rs              # auth_middleware
+│   └── crypto.rs            # hash_token/password/verify/generate
+├── templates/
+│   ├── base.html            # 根布局 (nav/toast/modal/PWA/JS namespace)
+│   ├── pages/               # 9 页面模板
+│   └── components/          # 可复用 HTMX 片段 (21 个)
+├── assets/                  # 静态资源 (CSS/JS/manifest)
+├── static/sw.js             # PWA Service Worker v6
+└── uploads/                 # 运行时文件存储
 ```
 
-## 数据库模式 (10 表)
+## 路由
 
-| 表 | 用途 |
-|----|------|
-| `users` | 用户 (Argon2 哈希, quota_mb, used_mb, must_change_pwd) |
-| `sessions` | Bearer token (SHA-256 哈希, expires_at) |
-| `files` | 文件索引 (username, name, parent_path, is_dir, size_mb, identifier) |
-| `upload_chunks` | 分片上传跟踪 (identifier, total_chunks) |
-| `shares` | 分享链接 (code, file_path, password, expires_at, download_count) |
-| `trash` | 回收站 (original_path, trash_uuid, deleted_at) |
-| `audit_logs` | 审计日志 (username, action, target, ip_address, user_agent) |
-| `links` | 链接收藏 (title, url, icon, sort_order) |
-| `todos` | 待办/日程 (due_date, is_all_day, start_time, end_time, priority, status, category) |
-| `user_settings` | AI Agent 设置 (deepseek_api_key/base/model) |
+### 页面路由 (完整 HTML)
 
-## API 路由
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/` | 仪表盘 |
+| `GET` | `/drive` | 文件浏览器 |
+| `GET` | `/todos` | 待办/日程 |
+| `GET` | `/agent` | AI 助手 |
+| `GET` | `/links` | 链接收藏 |
+| `GET` | `/trash` | 回收站 |
+| `GET` | `/admin` | 用户管理 |
+| `GET` | `/login` | 登录 (公开) |
+| `GET` | `/s/{share_id}` | 分享页面 (公开) |
 
-### 公开 (无需认证)
-- `POST /api/login` / `POST /api/register` / `POST /api/logout`
-- `GET /api/share/access/:code`
-- `GET /s/:share_id` / `GET /s/:share_id/*file_path`
-- `GET /api/agent/models`
-- `GET /health` (DB 连接检查 → JSON)
-- `GET /sw.js` (PWA Service Worker)
+### 片段路由 (HTMX HTML 局部)
 
-### 受保护 (Bearer Token 认证)
-- `/api/files/*` — 文件 CRUD + 分片上传/合并/打包下载
-- `/api/edit/*` — 文本编辑器读写
-- `/api/media/*path` — 多媒体流代理 (支持 Range)
-- `/api/share/*` — 分享管理
-- `/api/trash/*` — 回收站
-- `/api/admin/*` — 用户管理/配额/密码重置/审计日志
-- `/api/links` / `/api/links/:id` — 链接 CRUD
-- `/api/todos` / `/api/todos/:id` — 待办/日程 CRUD
-- `/api/agent/chat` / `/api/agent/briefing` / `/api/agent/settings` — AI Agent
-- `/api/system/status` — 系统监控 (仅管理员)
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| `GET` | `/drive/list?path=&search=` | 文件列表 |
+| `GET` | `/drive/breadcrumbs?path=` | 面包屑 |
+| `GET` | `/drive/quota` | 配额条 |
+| `POST` | `/drive/create-folder` | 创建文件夹 |
+| `POST` | `/drive/delete` | 删除文件 |
+| `GET/POST` | `/drive/upload-form`, `/drive/rename-form`, `/drive/move-form` | 操作表单 |
+| `POST` | `/drive/rename`, `/drive/move` | 执行操作 |
+| `GET` | `/drive/preview` | 文件预览 |
+| `GET` | `/todos/list`, `/todos/calendar` | 待办列表/日历 |
+| `GET/POST` | `/todos/form`, `/todos` | 表单/创建 |
+| `PUT/DELETE` | `/todos/:id` | 更新/删除 |
+| `GET/POST` | `/links/list`, `/links` | 链接列表/创建 |
+| `PUT/DELETE` | `/links/:id` | 更新/删除 |
+| `POST` | `/agent/chat`, `/agent/briefing` | AI 对话/简报 |
+| `GET` | `/agent/settings-form` | 设置表单 |
+| `GET` | `/trash/list` | 回收站列表 |
+| `POST` | `/trash/clear` | 清空回收站 |
+| `GET` | `/home/system-monitor` | 系统监控 |
+| `GET` | `/home/minecraft-status` | MC 状态 |
 
-## 关键设计决策
+### JSON API
 
-### 安全
-- **密码**: Argon2 哈希, 首次启动无环境变量时自动生成 24 位随机密码 + `must_change_pwd` 强制修改
-- **路径穿越**: `safe_join_sandbox` 拒绝 `..` / 绝对路径 / Windows 盘符, 跨平台 `ParentDir`/`CurDir` 处理
-- **上传**: MIME 首 512 字节 + 完整文件两阶段安全检测, identifier 白名单校验 (字母数字+连字符)
-- **速率限制**: 登录 10/min, 注册 3/hour, 容量上限 10k 条目 + LRU 淘汰
-- **CSP 头**: 严格 `default-src 'self'`, 禁止 `object-src`
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| `POST` | `/api/login`, `/api/register`, `/api/logout` | 认证 |
+| `GET` | `/api/files/list`, `/api/files/check` | 文件列表/分片检查 |
+| `POST` | `/api/files/create_folder`, `/api/files/upload_chunk`, `/api/files/merge` | 文件操作 |
+| `POST` | `/api/files/delete`, `/api/files/delete_batch`, `/api/files/rename`, `/api/files/move` | 批操作 |
+| `POST` | `/api/move_batch`, `/api/files/download_zip` | 批移动/下载 |
+| `GET/HEAD` | `/api/media/{*path}` | 媒体流代理 |
+| `GET/POST` | `/api/edit/get`, `/api/edit/save` | 文本编辑器 |
+| `GET/POST` | `/api/share/*` | 分享管理 |
+| `GET/POST` | `/api/trash/*` | 回收站 |
+| `GET/POST` | `/api/admin/*` | 用户管理 |
+| `GET/POST/PUT/DELETE` | `/api/links`, `/api/links/:id` | 链接 CRUD |
+| `GET/POST/PUT/DELETE` | `/api/todos`, `/api/todos/:id` | 待办 CRUD |
+| `POST` | `/api/agent/chat`, `/api/agent/briefing` | AI 对话 |
+| `GET/PUT` | `/api/agent/settings` | Agent 设置 |
+| `GET` | `/api/system/status` | 系统状态 (admin) |
+| `GET` | `/api/minecraft/status` | MC 状态 |
+| `GET` | `/health` | 健康检查 |
 
-### 性能
-- SQLite WAL 模式 (`Normal` synchronous), 连接池 16, busy_timeout 10s
-- 15 个显式索引覆盖高频查询 (username, parent_path, identifier, code, expires_at 等)
-- 大文件分块上传 (100 MB/块, 最多 10,000 块, 秒传去重)
-- ZIP 打包下载 `spawn_blocking` 不阻塞异步运行时
-- 后台任务: 临时分片清理/日志轮转(7天)/回收站过期(30天)/速率过期清理
+## 数据库
 
-### PWA
-- 可安装到主屏幕 (standalone 模式), iOS/Android 适配
-- Service Worker: Cache First (静态资源) / Network First (API)
-- 离线降级: API 返回 `{"error":"..."}` JSON, HTML 回退到缓存
-- beforeinstallprompt 自定义安装按钮 + updatefound 更新通知
+11 表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `schema_version`
 
-## 环境变量 (`PINAS_*` 前缀)
+- **WAL 模式** (`Normal` synchronous)，连接池 16
+- **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
+- **15 个显式索引**
+- **版本化迁移**：`schema_version` 表 + `PRAGMA table_info` 幂等检查
+
+## 环境变量
 
 ```
-PINAS_SERVER_HOST=0.0.0.0
-PINAS_SERVER_PORT=3000
+PINAS_SERVER_HOST=0.0.0.0          PINAS_SERVER_PORT=3000
 PINAS_DATABASE_URL=sqlite:cloud_disk.db
-PINAS_UPLOAD_LIMIT_MB=10240
-PINAS_DEFAULT_QUOTA_MB=10240
-PINAS_SESSION_DAYS=7
-PINAS_TEMP_CLEANUP_HOURS=24
-PINAS_TRASH_CLEANUP_DAYS=30
-PINAS_TRASH_CLEANUP_INTERVAL_HOURS=24
-PINAS_ADMIN_PASSWORD=           # 留空则自动生成随机密码
-PINAS_GUEST_PASSWORD=           # 留空则自动生成随机密码
-PINAS_DEEPSEEK_API_KEY=         # AI Agent (可选)
-PINAS_DEEPSEEK_API_BASE=https://api.deepseek.com
+PINAS_UPLOAD_LIMIT_MB=100          PINAS_DEFAULT_QUOTA_MB=10240
+PINAS_SESSION_DAYS=7               PINAS_DATA_DIR=
+PINAS_TEMP_CLEANUP_HOURS=24        PINAS_TRASH_CLEANUP_DAYS=30
+PINAS_ADMIN_PASSWORD=              PINAS_GUEST_PASSWORD=
+PINAS_DEEPSEEK_API_KEY=            PINAS_DEEPSEEK_API_BASE=https://api.deepseek.com
 PINAS_DEEPSEEK_MODEL=deepseek-v4-flash
-PINAS_DATA_DIR=                 # 工作目录 (可选)
-```
-
-## 构建与运行
-
-```bash
-# 开发
-cargo run
-
-# 生产构建 (ARM64, LTO+strip)
-cargo build --release --target aarch64-unknown-linux-gnu
-
-# Docker
-docker build -t antifield-cloud .
-docker run -p 3000:3000 -v ./data:/app/data -v ./uploads:/app/uploads antifield-cloud
-
-# CSS 编译
-npm run css:build
+MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 ```
 
 ## 代码约定
 
-- **错误处理**: `AppError` 枚举 (11 种 HTTP 状态码映射) + `AppResult<T>` 类型别名, 支持 `?` 传播
-- **路由 Handler 返回**: `links.rs` 使用 `AppResult<T>` 模式, 其他 handler 使用 `impl IntoResponse`
-- **数据库**: 查询用 `sqlx::query` (不用 ORM), 事务用 `pool.begin().await`, 兼容性迁移用 `ALTER TABLE ... IF NOT EXISTS` 模式 (忽略重复列错误)
-- **路径**: 所有文件系统路径通过 `safe_join_sandbox` 校验, 目录常量来自 `constants.rs`
-- **日志**: `tracing` crate, 双输出 (控制台+文件), `#[tracing::instrument]` 用于关键 handler
-- **前端**: ES Modules 无打包, Tailwind 预编译为 `tailwind.min.css`, 全局事件委托 + 懒加载视图
+### 错误处理
+- `AppError` 枚举（11 种 HTTP 状态） + `AppResult<T>` = `Result<T, AppError>`
+- JSON API → `AppResult<Json<T>>`；HTMX 片段 → `impl IntoResponse` + `AppTemplate<T>`
+- 文件操作共享核心逻辑：`rename_core()` / `move_core()` / `delete_to_trash()`
+
+### Handler 模式
+- **页面** → `page_handler!` 宏（`pages.rs`）
+- **片段** → Askama 模板结构体 + async fn → `AppTemplate<T>.into_response()`
+- **JSON API** → `AppResult<Json<T>>` + `?` 传播
+- **错误恢复** → `fallback_file_list()` 重新渲染文件列表 + `HX-Trigger: quotaRefresh`
+
+### 数据库
+- 查询用 `sqlx::query` / `sqlx::query_as`，事务用 `pool.begin().await`
+- 日程 `status` 仅存储 `pending`，由 `compute_effective_status()` 动态计算
+- 密码学函数从 `pinas_core` 导入（`hash_password`, `verify_password`, `hash_token`）
+
+### 模板
+- `extends "base.html"` 页面需要 `username`, `is_admin`, `current_page` 三字段
+- 组件独立，通过 HTMX 加载
+- 变量 `snake_case`，循环 `{% for %} {% endfor %}`，条件用 Rust 风格 (`&&`, `!=`)
+
+### 前端
+- JS 命名空间 `window.App = { showToast, closeModal, handleUploadForm }`
+- 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传
+- 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
+- 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage
+- PWA：SW v6 预缓存 CDN 依赖，离线可用
+
+### 测试
+- 9 个集成测试 + 8 个单元测试
+- 覆盖：auth 流程、文件 CRUD、上传分片、分享密码、回收站、链接 CRUD、待办 CRUD、健康检查
+
+## 构建与部署
+
+**部署路径**: `~/pi/cloud_drive/`（生产环境），开发路径 `~/projects/pinas/`
+
+```bash
+# 构建
+cargo build --release
+
+# 部署
+sudo systemctl stop antifield-cloud.service
+cp target/release/pi_nas ~/pi/cloud_drive/pi_nas
+cp static/sw.js ~/pi/cloud_drive/static/sw.js          # PWA 更新时
+cp assets/manifest.json ~/pi/cloud_drive/assets/manifest.json  # manifest 更新时
+sudo systemctl start antifield-cloud.service
+
+# 验证
+curl -s http://localhost:3000/health
+```
+
+**部署目录结构**:
+```
+~/pi/cloud_drive/
+├── pi_nas                  # 二进制
+├── pi_nas.bak.*            # 自动备份
+├── .env                    # 环境变量
+├── cloud_disk.db           # SQLite 数据库
+├── antifield-cloud.service # systemd unit → /etc/systemd/system/
+├── uploads/                # 用户文件
+├── logs/                   # 运行日志
+├── backups/                # 数据库备份
+├── assets/                 # 静态资源 (CSS/JS/manifest)
+└── static/                 # PWA Service Worker
+```
+
+**systemd 服务**: `antifield-cloud.service`，已启用自动启动。
+
+反向代理需设置 `X-Forwarded-Proto` 头以启用 Cookie `Secure` 标志。

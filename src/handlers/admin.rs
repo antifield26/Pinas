@@ -1,12 +1,14 @@
 use axum::{
     extract::{Extension, Query},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
 use pinas_core::UserSession;
+use sqlx::Connection;
+use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, log_audit};
 
@@ -38,6 +40,7 @@ pub struct UserInfo {
 }
 
 // 获取用户配额（管理员可查看他人，普通用户只能查看自己的）—— 只读，不记录审计日志
+#[tracing::instrument(skip_all)]
 pub async fn get_user_quota(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -62,6 +65,7 @@ pub async fn get_user_quota(
 }
 
 // 设置用户配额（仅管理员）
+#[tracing::instrument(skip_all)]
 pub async fn set_user_quota(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -89,6 +93,7 @@ pub async fn set_user_quota(
 }
 
 // 列出所有用户（仅管理员）—— 只读，不记录审计日志
+#[tracing::instrument(skip_all)]
 pub async fn list_users(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -107,7 +112,38 @@ pub async fn list_users(
     Ok(Json(list))
 }
 
+// ====== HTMX Fragment ======
+use askama::Template;
+use crate::templates::AppTemplate;
+
+#[derive(Template)]
+#[template(path = "components/admin_users.html")]
+struct AdminUsersFragment {
+    users: Vec<UserInfo>,
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn admin_users_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+) -> impl axum::response::IntoResponse {
+    if session.role != crate::constants::ROLE_ADMIN {
+        return AppTemplate(AdminUsersFragment { users: vec![] }).into_response();
+    }
+    let users = sqlx::query_as::<_, (String, String, i64, i64)>(
+        "SELECT username, role, used_mb, quota_mb FROM users ORDER BY username"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(username, role, used_mb, quota_mb)| UserInfo { username, role, used_mb, quota_mb })
+    .collect();
+    AppTemplate(AdminUsersFragment { users }).into_response()
+}
+
 // 重置用户密码（仅管理员）
+#[tracing::instrument(skip_all)]
 pub async fn reset_user_password(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -183,4 +219,103 @@ pub async fn get_audit_logs(
     .fetch_all(&pool)
     .await?;
     Ok(Json(logs))
+}
+
+// ====== 数据库备份 ======
+
+const BACKUPS_DIR: &str = "backups";
+
+/// POST /api/admin/backup — 创建数据库备份（仅管理员）
+#[tracing::instrument(skip_all)]
+pub async fn create_backup(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(config): Extension<Config>,
+    Extension(session): Extension<UserSession>,
+) -> AppResult<Json<serde_json::Value>> {
+    if session.role != crate::constants::ROLE_ADMIN {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+
+    let _ = tokio::fs::create_dir_all(BACKUPS_DIR).await;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("cloud_disk_backup_{}.db", timestamp);
+    let backup_path = format!("{}/{}", BACKUPS_DIR, filename);
+
+    // VACUUM INTO 需要独立连接
+    let db_path = config.database_url.strip_prefix("sqlite:").unwrap_or("cloud_disk.db");
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(false);
+    let mut conn = sqlx::SqliteConnection::connect_with(&opts).await?;
+
+    let sql = format!("VACUUM INTO '{}'", backup_path);
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .execute(&mut conn).await?;
+
+    let _ = conn.close().await;
+    let _ = log_audit(&pool, &session.username, "backup_create", Some(&filename), None, None, None).await;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "filename": filename,
+        "size": std::fs::metadata(&backup_path).map(|m| m.len()).unwrap_or(0)
+    })))
+}
+
+/// GET /api/admin/backup/list — 列出已有备份（仅管理员）
+pub async fn list_backups(
+    Extension(session): Extension<UserSession>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    if session.role != crate::constants::ROLE_ADMIN {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+
+    let mut backups = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(BACKUPS_DIR).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                backups.push(serde_json::json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "size": meta.len(),
+                    "modified": meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+                }));
+            }
+        }
+    }
+    backups.sort_by(|a, b| b["modified"].as_u64().cmp(&a["modified"].as_u64()));
+    Ok(Json(backups))
+}
+
+/// GET /api/admin/backup/download?file= — 下载备份文件（仅管理员）
+pub async fn download_backup(
+    Extension(session): Extension<UserSession>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if session.role != crate::constants::ROLE_ADMIN {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+
+    let filename = params.get("file").ok_or_else(|| AppError::bad_request("缺少 file 参数"))?;
+    // 防止路径穿越
+    if filename.contains('/') || filename.contains("..") {
+        return Err(AppError::bad_request("非法文件名"));
+    }
+    let path = format!("{}/{}", BACKUPS_DIR, filename);
+    if !std::path::Path::new(&path).exists() {
+        return Err(AppError::not_found("备份文件不存在"));
+    }
+
+    let file = tokio::fs::File::open(&path).await.map_err(|_| AppError::internal("无法读取备份文件"))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+
+    use axum::http::header;
+    let mut resp = axum::response::Response::new(body);
+    resp.headers_mut().insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{}\"", filename).parse().unwrap(),
+    );
+
+    Ok(resp)
 }

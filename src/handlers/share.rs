@@ -1,8 +1,8 @@
 ﻿use axum::{
     body::Body,
     extract::{Extension, Path, Query},
-    http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Json},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Json},
 };
 use chrono::{Utc, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,7 @@ pub struct ShareItem {
 }
 
 // --- 12. 创建分享 ---
+#[tracing::instrument(skip_all)]
 pub async fn create_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -76,6 +77,7 @@ pub async fn create_share(
 }
 
 // --- 13. 列出当前用户的全量分享 ---
+#[tracing::instrument(skip_all)]
 pub async fn list_shares(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -92,6 +94,7 @@ pub struct DeleteShareRequest {
 }
 
 // --- 14. 删除分享外链 ---
+#[tracing::instrument(skip_all)]
 pub async fn delete_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -114,12 +117,108 @@ pub async fn access_share(
     else { Err(AppError::gone("外链已失效或过期")) }
 }
 
-// --- 分享页面入口（从磁盘读取，避免嵌入二进制） ---
-pub async fn share_page() -> Result<Html<String>, (StatusCode, &'static str)> {
-    match tokio::fs::read_to_string("static/index.html").await {
-        Ok(html) => Ok(Html(html)),
-        Err(_) => Err((StatusCode::NOT_FOUND, "页面文件缺失")),
+// --- 分享页面入口 ---
+use askama::Template;
+use crate::templates::AppTemplate;
+
+#[derive(Template)]
+#[template(path = "pages/share.html")]
+struct SharePage {
+    share_id: String,
+    file_path: String,
+    file_size: String,
+    file_count: usize,
+    is_dir: bool,
+    password_required: bool,
+    password: String,
+}
+
+pub async fn share_page(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Path(share_id): Path<String>,
+    Query(params): Query<AccessShareRequest>,
+) -> impl IntoResponse {
+    let code = &share_id;
+    // Look up share info
+    let share = sqlx::query(
+        "SELECT file_path, password, expires_at FROM shares WHERE code = ?"
+    )
+    .bind(code)
+    .fetch_optional(&pool)
+    .await
+    .unwrap_or(None);
+
+    let (file_path_str, stored_password, expires_at): (String, Option<String>, Option<String>) = match share {
+        Some(row) => (
+            row.get::<String, _>(0),
+            row.get::<Option<String>, _>(1),
+            row.get::<Option<String>, _>(2),
+        ),
+        None => return (StatusCode::NOT_FOUND, "分享链接不存在或已失效").into_response(),
+    };
+
+    // Check expiry
+    if let Some(exp) = &expires_at {
+        if let Ok(exp_dt) = chrono::NaiveDateTime::parse_from_str(exp, "%Y-%m-%d %H:%M:%S") {
+            if exp_dt < Utc::now().naive_utc() {
+                return (StatusCode::GONE, "分享链接已过期").into_response();
+            }
+        }
     }
+
+    let stored_pwd = stored_password.clone().unwrap_or_default();
+    let password_required = !stored_pwd.is_empty();
+    let submitted_password = params.password.clone().unwrap_or_default();
+
+    // If password protected and wrong/missing password, show password form
+    // Use spawn_blocking for Argon2 verification to avoid blocking async runtime
+    let pwd_ok = if password_required {
+        let hash = stored_pwd.clone();
+        let input = submitted_password.clone();
+        tokio::task::spawn_blocking(move || pinas_core::verify_password(&hash, &input))
+            .await
+            .unwrap_or(false)
+    } else { true };
+    if password_required && !pwd_ok {
+        return AppTemplate(SharePage {
+            share_id: share_id.clone(),
+            file_path: file_path_str,
+            file_size: String::new(),
+            file_count: 0,
+            is_dir: false,
+            password_required: true,
+            password: String::new(),
+        }).into_response();
+    }
+
+    // Check if it's a directory
+    let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
+    let full_path = crate::handlers::utils::safe_join_sandbox(base, &file_path_str);
+    let is_dir = full_path.is_dir();
+    let file_size;
+    let file_count;
+
+    if is_dir {
+        file_count = std::fs::read_dir(&full_path).map(|d| d.count()).unwrap_or(0);
+        file_size = format!("{} 个项目", file_count);
+    } else {
+        let meta = full_path.metadata();
+        let len = meta.map(|m| m.len()).unwrap_or(0);
+        file_size = if len < 1024 { format!("{} B", len) }
+            else if len < 1024 * 1024 { format!("{:.1} KB", len as f64 / 1024.0) }
+            else { format!("{:.1} MB", len as f64 / 1024.0 / 1024.0) };
+        file_count = 0;
+    }
+
+    AppTemplate(SharePage {
+        share_id: share_id.clone(),
+        file_path: file_path_str,
+        file_size,
+        file_count,
+        is_dir,
+        password_required: false,
+        password: submitted_password,
+    }).into_response()
 }
 
 // --- 访问分享下的具体文件或子目录 ---
@@ -173,11 +272,19 @@ pub async fn share_subfile(
     let share_base = safe_join_sandbox(&user_root, &share_root_path);
     let target_path = safe_join_sandbox(&share_base, &file_path);
 
+    // 路径前缀检查（组件级，阻止 ../ 穿越）
     if !target_path.starts_with(&share_base) {
         return (StatusCode::FORBIDDEN, "访问越界").into_response();
     }
     if !target_path.exists() {
         return (StatusCode::NOT_FOUND, "文件或目录不存在").into_response();
+    }
+    // 符号链接兜底：文件存在后，规范化路径再次检查
+    if let (Ok(canon_target), Ok(canon_base)) = (target_path.canonicalize(), share_base.canonicalize()) {
+        if !canon_target.starts_with(&canon_base) {
+            tracing::error!("[Share] 符号链接越界: target={:?}, base={:?}", canon_target, canon_base);
+            return (StatusCode::FORBIDDEN, "访问越界").into_response();
+        }
     }
 
     // 4. 如果是目录，返回目录内容 JSON
@@ -203,11 +310,11 @@ pub async fn share_subfile(
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,
-                mime.to_string().parse().unwrap(),
+                mime.to_string().parse().unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
             );
             headers.insert(
                 header::ACCEPT_RANGES,
-                "bytes".parse().unwrap(),
+                HeaderValue::from_static("bytes"),
             );
             let body = Body::from_stream(ReaderStream::new(file));
             (StatusCode::OK, headers, body).into_response()

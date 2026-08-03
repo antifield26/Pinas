@@ -37,6 +37,7 @@ pub struct LinkItem {
 }
 
 /// GET /api/links — 获取当前用户的所有链接
+#[tracing::instrument(skip_all)]
 pub async fn get_links(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -51,6 +52,7 @@ pub async fn get_links(
 }
 
 /// POST /api/links — 添加新链接
+#[tracing::instrument(skip_all)]
 pub async fn create_link(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -74,6 +76,7 @@ pub async fn create_link(
 }
 
 /// PUT /api/links/:id — 更新链接（使用 COALESCE 避免动态 SQL 拼接）
+#[tracing::instrument(skip_all)]
 pub async fn update_link(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -120,6 +123,7 @@ pub async fn update_link(
 }
 
 /// DELETE /api/links/:id — 删除链接
+#[tracing::instrument(skip_all)]
 pub async fn delete_link(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -137,4 +141,140 @@ pub async fn delete_link(
 
     let _ = log_audit(&pool, &session.username, "delete_link", Some(&id.to_string()), None, None, None).await;
     Ok((StatusCode::OK, "链接删除成功"))
+}
+
+// ====== HTMX Fragment 处理器 ======
+use askama::Template;
+use axum::response::IntoResponse;
+use crate::templates::AppTemplate;
+
+#[derive(Template)]
+#[template(path = "components/link_list.html")]
+struct LinkListFragment {
+    links: Vec<LinkItem>,
+}
+
+#[derive(Template)]
+#[template(path = "components/link_form.html")]
+struct LinkFormFragment {
+    is_edit: bool,
+    id: i64,
+    title: String,
+    url: String,
+    icon: String,
+}
+
+fn empty_link_form() -> LinkFormFragment {
+    LinkFormFragment { is_edit: false, id: 0, title: String::new(), url: String::new(), icon: String::new() }
+}
+
+fn edit_link_form(item: &LinkItem) -> LinkFormFragment {
+    LinkFormFragment {
+        is_edit: true, id: item.id,
+        title: item.title.clone(), url: item.url.clone(),
+        icon: item.icon.clone().unwrap_or_default(),
+    }
+}
+
+async fn get_user_links(pool: &sqlx::SqlitePool, username: &str) -> Vec<LinkItem> {
+    sqlx::query_as::<_, LinkItem>(
+        "SELECT id, title, url, icon, sort_order, created_at FROM links WHERE username = ? ORDER BY sort_order, id"
+    )
+    .bind(username)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn links_list_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+) -> impl IntoResponse {
+    let links = get_user_links(&pool, &session.username).await;
+    AppTemplate(LinkListFragment { links })
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn links_create_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let title = form.get("title").cloned().unwrap_or_default();
+    let url = form.get("url").cloned().unwrap_or_default();
+    if title.trim().is_empty() || url.trim().is_empty() {
+        return AppTemplate(empty_link_form()).into_response();
+    }
+    let icon = form.get("icon").cloned().filter(|s| !s.is_empty());
+
+    let _ = sqlx::query("INSERT INTO links (username, title, url, icon) VALUES (?, ?, ?, ?)")
+        .bind(&session.username).bind(&title).bind(&url).bind(&icon)
+        .execute(&pool).await;
+
+    let _ = log_audit(&pool, &session.username, "link_create", Some(&title), None, None, None).await;
+
+    let links = get_user_links(&pool, &session.username).await;
+    AppTemplate(LinkListFragment { links }).into_response()
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn links_update_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+    Path(id): Path<i64>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let title = form.get("title").cloned();
+    let url = form.get("url").cloned();
+    let icon = form.get("icon").cloned().filter(|s| !s.is_empty());
+
+    let _ = sqlx::query(
+        "UPDATE links SET title = COALESCE(?, title), url = COALESCE(?, url), icon = COALESCE(?, icon) WHERE id = ? AND username = ?"
+    )
+    .bind(&title).bind(&url).bind(&icon).bind(id).bind(&session.username)
+    .execute(&pool).await;
+
+    let _ = log_audit(&pool, &session.username, "link_update", Some(&id.to_string()), None, None, None).await;
+
+    let links = get_user_links(&pool, &session.username).await;
+    AppTemplate(LinkListFragment { links })
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn links_delete_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let _ = sqlx::query("DELETE FROM links WHERE id = ? AND username = ?")
+        .bind(id).bind(&session.username).execute(&pool).await;
+
+    let _ = log_audit(&pool, &session.username, "link_delete", Some(&id.to_string()), None, None, None).await;
+
+    let links = get_user_links(&pool, &session.username).await;
+    AppTemplate(LinkListFragment { links })
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn links_empty_form() -> impl IntoResponse {
+    AppTemplate(empty_link_form())
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn links_edit_form(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let item = sqlx::query_as::<_, LinkItem>(
+        "SELECT id, title, url, icon, sort_order, created_at FROM links WHERE id = ? AND username = ?"
+    )
+    .bind(id).bind(&session.username)
+    .fetch_optional(&pool).await;
+
+    match item {
+        Ok(Some(link)) => AppTemplate(edit_link_form(&link)),
+        _ => AppTemplate(empty_link_form()),
+    }
 }

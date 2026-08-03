@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
 use crate::error::{AppError, AppResult};
-use crate::handlers::utils::{safe_join_sandbox, update_user_used_mb, log_audit, bytes_to_mb_string};
+use crate::handlers::utils::{safe_join_sandbox, update_user_used_mb, log_audit};
 use pinas_core::UserSession;
 
 #[derive(Serialize, FromRow)]
@@ -23,6 +23,7 @@ pub struct TrashActionRequest {
 }
 
 // 列出回收站（只读，不记录审计日志）
+#[tracing::instrument(skip_all)]
 pub async fn list_trash(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -33,6 +34,7 @@ pub async fn list_trash(
 }
 
 // 从回收站还原
+#[tracing::instrument(skip_all)]
 pub async fn restore_trash(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -49,7 +51,8 @@ pub async fn restore_trash(
     let trash_uuid: String = row.get("trash_uuid");
 
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let src = base_path.join("tmp").join("trash").join(&trash_uuid);
+    let trash_dir = std::path::Path::new(crate::constants::TRASH_DIR);
+    let src = trash_dir.join(&trash_uuid);
     let dst = safe_join_sandbox(base_path, &format!("{}/{}", username, orig_path));
 
     if dst.exists() {
@@ -69,8 +72,9 @@ pub async fn restore_trash(
         let _ = restore_dir_recursive(&pool, username, &dst, &parent_cleaned).await;
     } else {
         let meta = dst.metadata().map(|m| m.len()).unwrap_or(0);
+        let size_mb = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
         let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)")
-            .bind(username).bind(&name).bind(&parent_cleaned).bind(bytes_to_mb_string(meta)).execute(&pool).await;
+            .bind(username).bind(&name).bind(&parent_cleaned).bind(size_mb).execute(&pool).await;
     }
 
     let _ = sqlx::query("DELETE FROM trash WHERE id = ?").bind(id).execute(&pool).await;
@@ -86,8 +90,12 @@ async fn restore_dir_recursive(
     dir_path: &std::path::Path,
     parent_path: &str,
 ) -> Result<(), String> {
-    let dir_name = dir_path.file_name().unwrap().to_string_lossy().into_owned();
-    let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 1, '-')")
+    let dir_name = dir_path
+        .file_name()
+        .ok_or_else(|| format!("无法获取目录名: {:?}", dir_path))?
+        .to_string_lossy()
+        .into_owned();
+    let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
         .bind(username)
         .bind(&dir_name)
         .bind(parent_path)
@@ -107,12 +115,12 @@ async fn restore_dir_recursive(
                 Box::pin(restore_dir_recursive(pool, username, &p, &new_parent)).await?;
             } else {
                 let m = p.metadata().map(|m| m.len()).unwrap_or(0);
-                let size_mb = bytes_to_mb_string(m);
+                let size_mb = m as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
                 let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)")
                     .bind(username)
                     .bind(&n)
                     .bind(&new_parent)
-                    .bind(&size_mb)
+                    .bind(size_mb)
                     .execute(pool)
                     .await;
             }
@@ -122,6 +130,7 @@ async fn restore_dir_recursive(
 }
 
 // 永久删除回收站中的单个项目
+#[tracing::instrument(skip_all)]
 pub async fn delete_trash_permanent(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -144,6 +153,7 @@ pub async fn delete_trash_permanent(
 }
 
 // 清空回收站（当前用户所有项目）
+#[tracing::instrument(skip_all)]
 pub async fn clear_trash(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
@@ -194,4 +204,52 @@ pub async fn clean_expired_trash(pool: &sqlx::SqlitePool, days: u32) -> Result<(
     }
 
     Ok(())
+}
+
+// ====== HTMX Fragment 处理器 ======
+use askama::Template;
+use crate::templates::AppTemplate;
+
+#[derive(Template)]
+#[template(path = "components/trash_list.html")]
+struct TrashListFragment {
+    items: Vec<TrashRowData>,
+}
+
+struct TrashRowData {
+    id: i64,
+    original_path: String,
+    deleted_at: String,
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn trash_list_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+) -> impl axum::response::IntoResponse {
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, original_path, deleted_at FROM trash WHERE username = ? ORDER BY deleted_at DESC"
+    )
+    .bind(&session.username)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, original_path, deleted_at)| TrashRowData { id, original_path, deleted_at })
+    .collect::<Vec<_>>();
+
+    AppTemplate(TrashListFragment { items: rows })
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn trash_clear_fragment(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+) -> impl axum::response::IntoResponse {
+    let _ = sqlx::query("DELETE FROM trash WHERE username = ?")
+        .bind(&session.username).execute(&pool).await;
+
+    let _ = log_audit(&pool, &session.username, "trash_clear", None, None, None, None).await;
+
+    AppTemplate(TrashListFragment { items: vec![] })
 }

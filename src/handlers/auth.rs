@@ -1,6 +1,6 @@
 use axum::{
     extract::Extension,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
 };
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
@@ -11,8 +11,28 @@ use uuid::Uuid;
 use crate::handlers::utils::{log_audit};
 use crate::config::Config;
 use crate::handlers::rate_limit;
+use crate::db::queries;
 use crate::constants::*;
 use pinas_core::hash_token;
+
+/// 校验用户名格式：2-32 字符，仅允许字母/数字/下划线/连字符
+fn validate_username(username: &str) -> Result<(), &'static str> {
+    if username.len() < 2 || username.len() > 32 {
+        return Err("用户名长度必须为 2-32 个字符");
+    }
+    if !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err("用户名仅允许字母、数字、下划线和连字符");
+    }
+    Ok(())
+}
+
+/// 校验密码格式：6-128 字符
+fn validate_password(password: &str) -> Result<(), &'static str> {
+    if password.len() < 6 || password.len() > 128 {
+        return Err("密码长度必须为 6-128 个字符");
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -34,18 +54,22 @@ pub struct LoginResponse {
     pub must_change_pwd: bool,
 }
 
-/// 从 HTTP 请求头提取客户端 IP（优先 X-Forwarded-For）
+/// 从 HTTP 请求头提取客户端 IP
+/// 优先级：X-Real-IP（反向代理设置） > X-Forwarded-For 最左侧（原始客户端） > 无
+/// 注意：X-Forwarded-For 可被伪造，仅在可信反向代理环境下安全
 fn extract_ip(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-        })
+    // X-Real-IP 由反向代理直接设置，更难伪造
+    if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let ip = ip.trim();
+        if !ip.is_empty() { return Some(ip); }
+    }
+    // X-Forwarded-For：取最左侧 IP（原始客户端），取第一个非空值
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(ip) = xff.split(',').map(|s| s.trim()).find(|s| !s.is_empty()) {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 /// 从 HTTP 请求头提取 User-Agent
@@ -62,23 +86,23 @@ pub async fn login(
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    // 仅校验用户名格式（密码校验仅在注册/修改密码时执行，登录不校验以兼容旧密码）
+    if let Err(msg) = validate_username(&payload.username) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
     // 速率限制：每个 IP 每分钟最多 N 次登录尝试
     if let Some(ip) = extract_ip(&headers) {
-        if !rate_limit::check_rate_limit(ip, LOGIN_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS)) {
+        if !rate_limit::check_rate_limit(ip, LOGIN_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS)).await {
             return (StatusCode::TOO_MANY_REQUESTS, "登录尝试过于频繁，请稍后再试").into_response();
         }
     }
 
-    let row = sqlx::query("SELECT password, role, must_change_pwd FROM users WHERE username = ?")
-        .bind(&payload.username)
-        .fetch_optional(&pool)
+    let row = queries::get_user_auth(&pool, &payload.username)
         .await
         .unwrap_or(None);
 
-    if let Some(r) = row {
-        let db_hash: String = r.get("password");
-        let role: String = r.get("role");
-        let must_change: i64 = r.get("must_change_pwd");
+    if let Some((db_hash, role, must_change)) = row {
         let password = payload.password.clone();
 
         let is_valid = tokio::task::spawn_blocking(move || {
@@ -102,13 +126,7 @@ pub async fn login(
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
 
-            if let Err(e) = sqlx::query("INSERT INTO sessions (token, username, role, expires_at) VALUES (?, ?, ?, ?)")
-                .bind(&token_hash)
-                .bind(&payload.username)
-                .bind(&role)
-                .bind(&expires)
-                .execute(&pool)
-                .await
+            if let Err(e) = queries::create_session(&pool, &token_hash, &payload.username, &role, &expires).await
             {
                 tracing::error!("创建会话失败: {}", e);
                 return (StatusCode::INTERNAL_SERVER_ERROR, "创建会话失败，请稍后重试").into_response();
@@ -116,12 +134,30 @@ pub async fn login(
 
             let _ = log_audit(&pool, &payload.username, "login", None, None, extract_ip(&headers), extract_ua(&headers)).await;
 
-            return (StatusCode::OK, Json(LoginResponse {
-                token,
+            // 构建 httpOnly Cookie（服务器端设置，JS 不可访问）
+            // Secure 标志确保 Cookie 仅通过 HTTPS 传输（反向代理场景必需）
+            let max_age = config.session_days * 86400;
+            let is_https = headers.get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "https")
+                .unwrap_or(false);
+            let secure_flag = if is_https { "; Secure" } else { "" };
+            let cookie = format!(
+                "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+                token, max_age, secure_flag
+            );
+
+            let mut resp = (StatusCode::OK, Json(LoginResponse {
+                token: token.clone(),
                 username: payload.username,
                 role,
-                must_change_pwd: must_change != 0,
+                must_change_pwd: must_change,
             })).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::SET_COOKIE,
+                cookie.parse().unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+            return resp;
         }
         tracing::warn!("[Login] 用户 '{}' 密码验证失败", payload.username);
     } else {
@@ -138,21 +174,22 @@ pub async fn register(
 ) -> impl IntoResponse {
     use crate::handlers::utils::hash_password;
 
+    // 输入校验
+    if let Err(msg) = validate_username(&payload.username) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    if let Err(msg) = validate_password(&payload.password) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
     // 速率限制：每个 IP 每小时最多 N 次注册
     if let Some(ip) = extract_ip(&headers) {
-        if !rate_limit::check_rate_limit(ip, REGISTER_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(REGISTER_RATE_LIMIT_WINDOW_SECS)) {
+        if !rate_limit::check_rate_limit(ip, REGISTER_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(REGISTER_RATE_LIMIT_WINDOW_SECS)).await {
             return (StatusCode::TOO_MANY_REQUESTS, "注册过于频繁，请稍后再试").into_response();
         }
     }
 
-    let user_exists = sqlx::query("SELECT username FROM users WHERE username = ?")
-        .bind(&payload.username)
-        .fetch_optional(&pool)
-        .await
-        .unwrap_or(None)
-        .is_some();
-
-    if user_exists {
+    if queries::user_exists(&pool, &payload.username).await.unwrap_or(false) {
         return (StatusCode::BAD_REQUEST, "用户已被注册").into_response();
     }
 
@@ -163,10 +200,7 @@ pub async fn register(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response(),
     };
 
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
+    let count = queries::count_users(&pool).await.unwrap_or(0);
     let role = if count == 0 { ROLE_ADMIN } else { ROLE_USER };
 
     // 直接 INSERT，依赖 UNIQUE 约束防止 TOCTOU 竞态
@@ -192,6 +226,159 @@ pub async fn register(
     let _ = log_audit(&pool, &payload.username, "register", None, None, extract_ip(&headers), extract_ua(&headers)).await;
 
     (StatusCode::OK, "用户初始化注册成功").into_response()
+}
+
+/// POST /api/user/password — 修改自己的密码（需已登录）
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[tracing::instrument(skip(pool, headers, payload))]
+pub async fn change_password(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(config): Extension<Config>,
+    headers: HeaderMap,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    use crate::handlers::utils::hash_password;
+
+    // 输入校验
+    if let Err(msg) = validate_password(&payload.new_password) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    // 从 Cookie 或 Header 提取当前用户
+    let current_token = headers
+        .get("Cookie")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|c| {
+                let c = c.trim();
+                c.strip_prefix("auth_token=").map(|t| t.to_string())
+            })
+        })
+        .or_else(|| {
+            headers.get("Authorization")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.strip_prefix("Bearer "))
+                .map(|t| t.to_string())
+        });
+
+    let current_token = match current_token {
+        Some(t) if !t.is_empty() => t,
+        _ => return (StatusCode::UNAUTHORIZED, "未登录").into_response(),
+    };
+
+    // 从 session 获取 username
+    let token_hash = hash_token(&current_token);
+    let username: Option<String> = sqlx::query_scalar(
+        "SELECT username FROM sessions WHERE token = ? AND expires_at > datetime('now')"
+    )
+    .bind(&token_hash)
+    .fetch_optional(&pool)
+    .await
+    .unwrap_or(None);
+
+    let username = match username {
+        Some(u) => u,
+        None => return (StatusCode::UNAUTHORIZED, "会话已过期，请重新登录").into_response(),
+    };
+
+    // 验证当前密码
+    let row = queries::get_user_auth(&pool, &username).await.unwrap_or(None);
+    let db_hash = match row {
+        Some((hash, _, _)) => hash,
+        None => return (StatusCode::NOT_FOUND, "用户不存在").into_response(),
+    };
+
+    let current_pwd = payload.current_password.clone();
+    let is_valid = tokio::task::spawn_blocking(move || {
+        match PasswordHash::new(&db_hash) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(current_pwd.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
+    }).await.unwrap_or(false);
+
+    if !is_valid {
+        return (StatusCode::BAD_REQUEST, "当前密码错误").into_response();
+    }
+
+    // 哈希新密码
+    let new_pwd = payload.new_password.clone();
+    let hashed = match tokio::task::spawn_blocking(move || hash_password(&new_pwd)).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response(),
+    };
+
+    // 事务：更新密码 + 清除 must_change_pwd + 清除所有旧会话
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("开启事务失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
+        }
+    };
+
+    if let Err(e) = sqlx::query("DELETE FROM sessions WHERE username = ?")
+        .bind(&username).execute(&mut *tx).await
+    {
+        tracing::error!("清除会话失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
+    }
+
+    if let Err(e) = sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
+        .bind(&hashed).bind(&username).execute(&mut *tx).await
+    {
+        tracing::error!("更新密码失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("提交事务失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
+    }
+
+    // 创建新会话并设置 cookie
+    let new_token = Uuid::new_v4().to_string();
+    let new_token_hash = hash_token(&new_token);
+    let expires = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(config.session_days))
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(7))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    let role = sqlx::query("SELECT role FROM users WHERE username = ?")
+        .bind(&username)
+        .fetch_optional(&pool)
+        .await
+        .ok().flatten()
+        .map(|r| r.get::<String, _>("role"))
+        .unwrap_or_else(|| "user".to_string());
+
+    if let Err(e) = queries::create_session(&pool, &new_token_hash, &username, &role, &expires).await {
+        tracing::error!("创建新会话失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
+    }
+
+    let _ = log_audit(&pool, &username, "change_password", None, None, extract_ip(&headers), extract_ua(&headers)).await;
+
+    let max_age = config.session_days * 86400;
+    let cookie = format!(
+        "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        new_token, max_age
+    );
+
+    let mut resp = (StatusCode::OK, "密码修改成功").into_response();
+    resp.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cookie.parse().unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    resp
 }
 
 pub async fn logout(
@@ -227,16 +414,29 @@ pub async fn logout(
     };
 
     if let Some(token) = token_opt {
-        let token_hash = hash_token(&token);
-        let _ = sqlx::query("DELETE FROM sessions WHERE token = ?")
-            .bind(token_hash)
-            .execute(&pool)
-            .await;
+        let _ = queries::delete_session(&pool, &hash_token(&token)).await;
     }
 
     if let Some(name) = username {
         let _ = log_audit(&pool, &name, "logout", None, None, extract_ip(headers), extract_ua(headers)).await;
     }
 
-    (StatusCode::OK, "已退出登录").into_response()
+    let is_https = headers.get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "https")
+        .unwrap_or(false);
+    let secure_flag = if is_https { "; Secure" } else { "" };
+    let mut resp = (StatusCode::OK, "已退出登录").into_response();
+    resp.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        format!("auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}", secure_flag)
+            .parse()
+            .unwrap(),
+    );
+    // 通知 HTMX 整页跳转到登录页
+    resp.headers_mut().insert(
+        "HX-Redirect",
+        "/login".parse().unwrap(),
+    );
+    resp
 }

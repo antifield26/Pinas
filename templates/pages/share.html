@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Antifield Cloud — 分享文件</title>
+  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=14">
+</head>
+<body class="bg-gray-50 dark:bg-gray-900 min-h-screen flex items-center justify-center p-4">
+  <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl max-w-lg w-full p-8 text-center space-y-6">
+    <span class="text-6xl">📁</span>
+    <h1 class="text-xl font-bold text-gray-800 dark:text-gray-100">Antifield Cloud</h1>
+    <p class="text-gray-500 dark:text-gray-400 text-sm">此分享链接指向: <span class="font-mono text-indigo-600 dark:text-indigo-400">{{ file_path }}</span></p>
+
+    {% if password_required %}
+    <form method="get" class="space-y-3">
+      <input type="password" name="password" placeholder="请输入提取码"
+             class="w-full px-4 py-2 border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+      <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm">验证提取码</button>
+    </form>
+    {% else if is_dir %}
+    <p class="text-gray-500 dark:text-gray-400 text-sm">此分享为目录，包含 {{ file_count }} 个文件</p>
+    <a href="/s/{{ share_id }}/{{ file_path }}" class="inline-block bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">浏览目录</a>
+    {% else %}
+    <div class="space-y-3">
+      <p class="text-xs text-gray-400">文件大小: {{ file_size }}</p>
+      <div class="flex gap-3 justify-center">
+        <a href="/api/share/access/{{ share_id }}{% if !password.is_empty() %}?password={{ password }}{% endif %}"
+           class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">↓ 下载文件</a>
+      </div>
+    </div>
+    {% endif %}
+
+    <p class="text-xs text-gray-400">由 <a href="/" class="text-indigo-500 hover:underline">Antifield Cloud</a> 安全分享</p>
+  </div>
+</body>
+</html>

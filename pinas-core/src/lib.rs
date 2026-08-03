@@ -1,5 +1,7 @@
-﻿pub mod auth;
-pub use auth::hash_token;
+pub mod auth;
+pub mod crypto;
+
+pub use crypto::{hash_token, hash_password, verify_password, generate_random_password};
 
 use serde::{Serialize, Deserialize};
 
@@ -8,4 +10,5 @@ use serde::{Serialize, Deserialize};
 pub struct UserSession {
     pub username: String,
     pub role: String,
+    pub must_change_pwd: bool,
 }

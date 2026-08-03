@@ -7,6 +7,7 @@ use pi_nas::constants::*;
 use pi_nas::db;
 use pi_nas::router;
 use pi_nas::tasks;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -14,7 +15,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 加载配置
     let config = Config::from_env().expect("加载配置失败");
-    info!("配置加载完成: {:?}", config);
+    info!("配置加载完成 (host={}, port={})", config.server_host, config.server_port);
 
     // 2. 初始化日志（文件 + 控制台）
     tokio::fs::create_dir_all(LOGS_DIR).await?;
@@ -27,12 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // 3. 工作目录切换
-    if let Ok(data_dir) = std::env::var("PINAS_DATA_DIR") {
-        if !data_dir.trim().is_empty() {
-            if let Err(e) = std::env::set_current_dir(&data_dir) {
-                warn!("切换工作目录到 '{}' 失败: {}", data_dir, e);
-            }
-        }
+    if let Ok(data_dir) = std::env::var("PINAS_DATA_DIR")
+        && !data_dir.trim().is_empty()
+        && let Err(e) = std::env::set_current_dir(&data_dir)
+    {
+        warn!("切换工作目录到 '{}' 失败: {}", data_dir, e);
     }
     tokio::fs::create_dir_all(TRASH_DIR).await?;
 
@@ -40,15 +40,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = db::create_pool(&config.database_url).await?;
     db::init(&pool, &config).await?;
 
-    // 5. 启动后台清理任务
-    tasks::cleanup::spawn_all(&pool, &config);
+    // 5. 创建全局取消令牌，并启动后台清理任务
+    let cancel_token = CancellationToken::new();
+    tasks::cleanup::spawn_all(&pool, &config, cancel_token.clone());
 
-    // 6. 构建路由并启动 HTTP 服务
+    // 6. 构建路由并启动 HTTP 服务（优雅关闭，支持 SIGINT + SIGTERM）
     let addr = format!("{}:{}", config.server_host, config.server_port);
     let app = router::build_router(config, pool);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("网盘核心服务已启动，监听: {}", addr);
-    axum::serve(listener, app).await?;
 
+    let shutdown_token = cancel_token.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let sigint = tokio::signal::ctrl_c();
+            let sigterm = async {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut stream = signal(SignalKind::terminate())
+                        .expect("无法注册 SIGTERM 处理器");
+                    stream.recv().await;
+                    info!("收到 SIGTERM 信号");
+                }
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                _ = sigint => info!("收到 SIGINT (Ctrl-C) 信号"),
+                _ = sigterm => {},
+            }
+            info!("正在优雅关闭...");
+            // 通知后台任务停止
+            shutdown_token.cancel();
+            // 给予后台任务 5 秒完成清理
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        })
+        .await?;
+
+    info!("服务已安全关闭");
     Ok(())
 }

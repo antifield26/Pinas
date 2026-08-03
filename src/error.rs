@@ -14,11 +14,11 @@ pub enum AppError {
     Internal(String),
     PayloadTooLarge(String),
     ServiceUnavailable(String),
-    #[allow(dead_code)] Unauthorized(String),
-    #[allow(dead_code)] Conflict(String),
-    #[allow(dead_code)] Gone(String),
-    #[allow(dead_code)] TooManyRequests(String),
-    #[allow(dead_code)] BadGateway(String),
+    Unauthorized(String),
+    Conflict(String),
+    Gone(String),
+    TooManyRequests(String),
+    BadGateway(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -86,26 +86,14 @@ impl From<Box<dyn std::error::Error>> for AppError {
 // Convenience constructors
 
 impl AppError {
-    pub fn bad_request(msg: impl Into<String>) -> Self {
-        AppError::BadRequest(msg.into())
-    }
-    #[allow(dead_code)]
-    pub fn unauthorized(msg: impl Into<String>) -> Self { AppError::Unauthorized(msg.into()) }
+    pub fn bad_request(msg: impl Into<String>) -> Self { AppError::BadRequest(msg.into()) }
     pub fn forbidden(msg: impl Into<String>) -> Self { AppError::Forbidden(msg.into()) }
     pub fn not_found(msg: impl Into<String>) -> Self { AppError::NotFound(msg.into()) }
-    #[allow(dead_code)]
     pub fn conflict(msg: impl Into<String>) -> Self { AppError::Conflict(msg.into()) }
-    #[allow(dead_code)]
     pub fn gone(msg: impl Into<String>) -> Self { AppError::Gone(msg.into()) }
-    #[allow(dead_code)]
-    pub fn too_many_requests(msg: impl Into<String>) -> Self { AppError::TooManyRequests(msg.into()) }
     pub fn internal(msg: impl Into<String>) -> Self { AppError::Internal(msg.into()) }
     pub fn payload_too_large(msg: impl Into<String>) -> Self { AppError::PayloadTooLarge(msg.into()) }
-    #[allow(dead_code)]
-    pub fn bad_gateway(msg: impl Into<String>) -> Self { AppError::BadGateway(msg.into()) }
-    pub fn service_unavailable(msg: impl Into<String>) -> Self {
-        AppError::ServiceUnavailable(msg.into())
-    }
+    pub fn service_unavailable(msg: impl Into<String>) -> Self { AppError::ServiceUnavailable(msg.into()) }
 }
 
 /// 便捷类型别名

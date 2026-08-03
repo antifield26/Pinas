@@ -9,3 +9,4 @@ pub mod handlers;
 mod middleware;
 pub mod router;
 pub mod tasks;
+pub mod templates;

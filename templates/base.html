@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN" x-data="{ dark: localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches) }" x-init="if (dark) document.documentElement.classList.add('dark'); $watch('dark', v => { document.documentElement.classList.toggle('dark', v); localStorage.setItem('theme', v ? 'dark' : 'light'); })">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <!-- 在 Alpine 加载前同步设置暗色模式，防止页面闪白 -->
+  <script>(function(){var d=localStorage.getItem('theme');if(d==='dark'||(!d&&window.matchMedia('(prefers-color-scheme:dark)').matches)){document.documentElement.classList.add('dark');}})();</script>
+  <title>{% block title %}Antifield Cloud{% endblock %}</title>
+
+  <meta name="description" content="自托管 NAS 网盘 — 文件管理、待办日程、AI Chat">
+  <meta name="theme-color" content="#4f46e5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1e1b4b" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Antifield">
+  <meta name="format-detection" content="telephone=no">
+
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
+  <link rel="manifest" href="/assets/manifest.json">
+  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=14">
+
+  <!-- HTMX -->
+  <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+  <!-- Alpine.js -->
+  <script defer src="https://unpkg.com/alpinejs@3.14.9" crossorigin="anonymous"></script>
+  <!-- Marked + DOMPurify (AI chat markdown) -->
+  <script src="/assets/marked.min.js?v=8"></script>
+  <script src="/assets/purify.min.js?v=9"></script>
+
+  {% block head_extra %}{% endblock %}
+
+  <style>
+    .htmx-indicator { display: none; }
+    .htmx-request .htmx-indicator { display: inline-block; }
+    .htmx-request.htmx-indicator { display: inline-block; }
+    .fade-me.htmx-swapping { opacity: 0; transition: opacity 0.2s ease-out; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    .toast-enter { animation: slideIn 0.3s ease-out; }
+    .skip-link { position: absolute; top: -100px; left: 8px; z-index: 100; }
+    .skip-link:focus { top: 8px; }
+    *:focus-visible { outline: 2px solid #6366f1; outline-offset: 2px; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-gray-50 dark:bg-gray-900 text-gray-800 dark:text-gray-200 font-sans min-h-screen transition-colors duration-200">
+
+  <a href="#main-content" class="skip-link bg-indigo-600 text-white px-3 py-2 rounded text-sm font-medium">跳到主内容</a>
+
+  <!-- Toast 容器 -->
+  <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col gap-3 pointer-events-none" role="status" aria-live="polite" x-data="toasts()" @show-toast.window="add($event.detail)"></div>
+
+  <!-- Modal 容器 -->
+  <div id="modal-container" role="dialog" aria-modal="true" onclick="if(event.target===this)App.closeModal()" class="fixed inset-0 bg-black/50 backdrop-blur-sm hidden items-center justify-center z-50 p-4"></div>
+
+  <!-- 顶部导航栏 -->
+  <nav class="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 sticky top-0 z-40 shadow-sm" aria-label="主导航" x-data="{ open: false }">
+    <div class="max-w-4xl mx-auto px-4">
+      <div class="flex items-center justify-between h-14">
+        <a href="/" class="flex items-center gap-2 shrink-0" hx-boost="true">
+          <span class="text-xl font-bold text-indigo-600 dark:text-indigo-400">Cloud Drive</span>
+        </a>
+
+        <!-- Desktop Nav (hidden on mobile) -->
+        <div class="hidden sm:flex items-center gap-1">
+          <a href="/" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "home" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">首页</a>
+          <a href="/drive" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "drive" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">云盘</a>
+          <a href="/todos" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "todos" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">待办</a>
+          <a href="/agent" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "agent" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">AI</a>
+          <a href="/links" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "links" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">链接</a>
+          <a href="/trash" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "trash" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">回收站</a>
+          {% if is_admin %}
+          <a href="/admin" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "admin" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">管理</a>
+          {% endif %}
+        </div>
+
+        <div class="flex items-center gap-2">
+          <span class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded-md font-mono hidden sm:inline">{{ username }}</span>
+          <button @click="dark = !dark" class="text-xs p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition" aria-label="切换主题" title="切换主题">🌓</button>
+          <button hx-post="/api/logout" hx-target="body" class="text-xs text-gray-400 hover:text-red-600 dark:hover:text-red-400 font-medium transition px-2 py-1" aria-label="退出登录">退出</button>
+          <!-- Mobile menu toggle -->
+          <button @click="open = !open" class="sm:hidden text-sm p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition" aria-label="菜单">
+            <span x-show="!open">菜单</span><span x-show="open">关闭</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Mobile Nav Dropdown -->
+      <div x-show="open" @click.outside="open = false" class="sm:hidden pb-3 space-y-1">
+        <a href="/" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "home" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">首页</a>
+        <a href="/drive" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "drive" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">云盘</a>
+        <a href="/todos" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "todos" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">待办</a>
+        <a href="/agent" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "agent" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">AI</a>
+        <a href="/links" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "links" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">链接</a>
+        <a href="/trash" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "trash" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">回收站</a>
+        {% if is_admin %}
+        <a href="/admin" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "admin" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">管理</a>
+        {% endif %}
+      </div>
+    </div>
+  </nav>
+
+  <main id="main-content" class="max-w-4xl mx-auto px-4 py-6 sm:py-8">
+    {% block content %}{% endblock %}
+  </main>
+
+  <!-- 离线提示 -->
+  <div id="offline-banner" class="hidden fixed bottom-0 sm:bottom-auto left-0 right-0 bg-red-600 text-white text-center text-sm py-2 z-50 font-medium">网络连接已断开</div>
+
+  <script>
+    // ====== Antifield App 命名空间 ======
+    window.App = {
+      showToast: function(msg, type) {
+        type = type || 'info';
+        window.dispatchEvent(new CustomEvent('show-toast', { detail: { message: msg, type: type } }));
+      },
+      closeModal: function() {
+        var modal = document.getElementById('modal-container');
+        modal.innerHTML = '';
+        modal.classList.add('hidden');
+        modal.classList.remove('flex');
+      }
+    };
+    // 向后兼容别名
+    window.showToast = App.showToast;
+    window.closeModal = App.closeModal;
+
+    // PWA Service Worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js?v=6', { scope: '/' }).then(function(r) {
+        console.log('[PWA] SW registered');
+        r.addEventListener('updatefound', function() {
+          var newWorker = r.installing;
+          if (newWorker) {
+            newWorker.addEventListener('statechange', function() {
+              if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                console.log('[PWA] 新版本已就绪，刷新页面后生效');
+              }
+            });
+          }
+        });
+      }).catch(function() { console.warn('[PWA] SW 注册失败'); });
+    }
+    window.addEventListener('online', function() { document.getElementById('offline-banner')?.classList.add('hidden'); });
+    window.addEventListener('offline', function() { document.getElementById('offline-banner')?.classList.remove('hidden'); });
+
+    // HTMX: 401 → redirect to login
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      if (e.detail.xhr && e.detail.xhr.status === 401) {
+        window.location.href = '/login';
+        e.detail.shouldSwap = false;
+      }
+    });
+
+    // Alpine Toast component
+    document.addEventListener('alpine:init', function() {
+      Alpine.data('toasts', function() { return {
+        items: [],
+        add: function(msg) {
+          var id = Date.now();
+          this.items.push({ id: id, message: msg.message, type: msg.type });
+          var self = this;
+          setTimeout(function() { self.items = self.items.filter(function(t) { return t.id !== id; }); }, msg.duration || 4000);
+        }
+      }});
+    });
+
+    // Modal: show when content loaded, hide when emptied
+    // 注：模态框内容来自服务端 Askama 模板（自动转义），无需 DOMPurify 二次消毒
+    // DOMPurify 保留用于 AI 聊天 markdown 渲染（chat_message.html 内联调用）
+    document.body.addEventListener('htmx:afterSwap', function(e) {
+      var modal = document.getElementById('modal-container');
+      if (e.detail.target !== modal) return;
+      var hasContent = !!modal.innerHTML.trim();
+      modal.classList.toggle('hidden', !hasContent);
+      modal.classList.toggle('flex', hasContent);
+    });
+    // 模态框内表单提交成功后自动关闭
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      if (!e.detail.successful) return;
+      var el = e.detail.elt;
+      if (el.closest && el.closest('#modal-container')) App.closeModal();
+    });
+    document.addEventListener('keydown', function(e) { if (e.key === 'Escape') App.closeModal(); });
+
+    // 全局文件上传函数 — 10 MB 分片 + 并发 + 断点续传 + 自动重试
+    window.uploadFile = async function(file, path) {
+      var progress = document.getElementById('upload-progress');
+      var bar = document.getElementById('upload-bar');
+      var pct = document.getElementById('upload-pct');
+      var status = document.getElementById('upload-status');
+      if (progress) progress.classList.remove('hidden');
+      if (bar) bar.style.width = '0%';
+      if (pct) pct.textContent = '0%';
+
+      var CHUNK_MB = 10;
+      var CONCURRENCY = 3;
+      var MAX_RETRIES = 3;
+      var chunkBytes = CHUNK_MB * 1024 * 1024;
+      var totalChunks = Math.max(1, Math.ceil(file.size / chunkBytes));
+      var identifier = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      // normalize path: collapse slashes, ensure leading /
+      var raw = (path || '').replace(/\/+/g, '/');
+      var parent = (raw === '/' || raw === '') ? '' : raw.replace(/\/$/, '');
+      var uploadedCount = 0; // pre-existing + completed-this-session
+
+      function setProgress(pctVal, msg) {
+        if (bar) bar.style.width = pctVal + '%';
+        if (pct) pct.textContent = pctVal + '%';
+        if (status && msg !== undefined) status.textContent = msg;
+      }
+
+      // send a single chunk with exponential-backoff retry (1s / 2s / 4s)
+      function sendChunk(index) {
+        var start = index * chunkBytes;
+        var end = Math.min(start + chunkBytes, file.size);
+        var blob = file.slice(start, end);
+        var url = '/api/files/upload_chunk?identifier=' + identifier
+          + '&chunk_index=' + index + '&total_chunks=' + totalChunks;
+
+        return new Promise(function(resolve, reject) {
+          function attempt(retry) {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', url);
+            xhr.withCredentials = true;
+            xhr.timeout = 120000;
+            xhr.onload = function() {
+              if (xhr.status === 200) { resolve(); return; }
+              if (retry < MAX_RETRIES && xhr.status >= 500) {
+                setTimeout(function() { attempt(retry + 1); }, Math.pow(2, retry) * 1000);
+              } else {
+                reject(new Error('HTTP ' + xhr.status));
+              }
+            };
+            xhr.onerror = function() {
+              if (retry < MAX_RETRIES) {
+                setTimeout(function() { attempt(retry + 1); }, Math.pow(2, retry) * 1000);
+              } else { reject(new Error('Network error')); }
+            };
+            xhr.ontimeout = function() {
+              if (retry < MAX_RETRIES) {
+                setTimeout(function() { attempt(retry + 1); }, Math.pow(2, retry) * 1000);
+              } else { reject(new Error('Timeout')); }
+            };
+            var fd = new FormData();
+            fd.append('file', blob, file.name);
+            xhr.send(fd);
+          }
+          attempt(0);
+        });
+      }
+
+      try {
+        // --- Step 1: check for existing chunks (resume / instant upload) ---
+        setProgress(0, file.name + ' 检查断点...');
+        var pending = [];
+        try {
+          var cr = await fetch('/api/files/check?identifier=' + identifier, { credentials: 'same-origin' });
+          if (cr.ok) {
+            var cd = await cr.json();
+            if (cd.exists) { setProgress(100, '秒传成功'); return; }
+            var have = new Set(cd.uploaded_chunks || []);
+            uploadedCount = have.size;
+            for (var i = 0; i < totalChunks; i++) { if (!have.has(i)) pending.push(i); }
+          }
+        } catch (_) { /* check failed — upload all chunks */ }
+        if (!pending.length) {
+          for (var i = 0; i < totalChunks; i++) pending.push(i);
+          uploadedCount = 0;
+        }
+
+        // --- Step 2: upload pending chunks with concurrency limiter ---
+        if (pending.length > 0) {
+          var totalPending = pending.length;
+          var completedSession = 0;
+          var cursor = 0;
+          var active = 0;
+          var firstError = null;
+
+          await new Promise(function(resolveAll, rejectAll) {
+            function launch() {
+              while (active < CONCURRENCY && cursor < pending.length && !firstError) {
+                var idx = pending[cursor++];
+                active++;
+                setProgress(Math.round((uploadedCount + completedSession) / totalChunks * 90),
+                  file.name + ' ' + (uploadedCount + completedSession) + '/' + totalChunks);
+                sendChunk(idx).then(function() {
+                  completedSession++;
+                  active--;
+                  setProgress(Math.round((uploadedCount + completedSession) / totalChunks * 90),
+                    file.name + ' ' + (uploadedCount + completedSession) + '/' + totalChunks);
+                  if (completedSession >= totalPending) resolveAll(); else launch();
+                }).catch(function(e) {
+                  firstError = e;
+                  rejectAll(e);
+                });
+              }
+            }
+            launch();
+          });
+        }
+
+        // --- Step 3: merge chunks on server ---
+        var t0 = Date.now();
+        setProgress(95, '合并中...');
+        var mr = await fetch('/api/files/merge', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifier: identifier, file_name: file.name, parent_path: parent })
+        });
+        if (mr.ok) {
+          var secs = ((Date.now() - t0) / 1000).toFixed(1);
+          setProgress(100, '完成 (' + secs + 's)');
+        } else {
+          setProgress(0, '合并失败');
+          throw new Error('Merge failed');
+        }
+      } catch (e) {
+        setProgress(0, '上传失败');
+        throw e;
+      }
+    };
+  </script>
+
+  <!-- 拖拽上传覆盖层 -->
+  <div id="drop-overlay" class="fixed inset-0 z-50 hidden items-center justify-center bg-indigo-500/20 backdrop-blur-sm" style="display:none">
+    <div class="bg-white dark:bg-gray-800 rounded-2xl p-10 shadow-2xl border-4 border-dashed border-indigo-400 text-center pointer-events-none">
+      <span class="text-5xl">📁</span>
+      <p class="text-lg font-bold text-indigo-600 dark:text-indigo-400 mt-4">释放文件以上传</p>
+    </div>
+  </div>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

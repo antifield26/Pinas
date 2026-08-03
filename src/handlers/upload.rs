@@ -45,6 +45,30 @@ pub struct MergeRequest {
     pub parent_path: String,
 }
 
+/// 合并过程失败时自动清理临时文件和目录的 RAII guard
+struct MergeCleanup {
+    target_file: std::path::PathBuf,
+    tmp_dir: String,
+    armed: bool,
+}
+
+impl MergeCleanup {
+    fn new(target_file: std::path::PathBuf, tmp_dir: String) -> Self {
+        Self { target_file, tmp_dir, armed: true }
+    }
+    /// 提交成功，取消清理
+    fn disarm(&mut self) { self.armed = false; }
+}
+
+impl Drop for MergeCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.target_file);
+            let _ = std::fs::remove_dir_all(&self.tmp_dir);
+        }
+    }
+}
+
 // --- 3. 文件分片秒传/断点续传检查 ---
 pub async fn check_chunk(
     Extension(pool): Extension<sqlx::SqlitePool>,
@@ -112,6 +136,13 @@ pub async fn upload_chunk(
     Query(params): Query<ChunkParams>,
     mut multipart: Multipart,
 ) -> AppResult<(StatusCode, &'static str)> {
+    // 速率限制：每个用户每分钟最多 120 个分片（2 GB/min）
+    if !crate::handlers::rate_limit::check_rate_limit(
+        &session.username, 120, std::time::Duration::from_secs(60)
+    ).await {
+        return Err(AppError::TooManyRequests("上传过于频繁，请稍后再试".into()));
+    }
+
     // 校验分片索引合法性
     if params.chunk_index < 0 || params.chunk_index >= params.total_chunks {
         return Err(AppError::bad_request("分片索引超出范围"));
@@ -243,20 +274,16 @@ pub async fn merge_chunks(
         .await
         .map_err(|e| AppError::internal(format!("创建物理文件失败: {}", e)))?;
 
+    // RAII cleanup guard — 错误发生时自动清理 target_file + tmp_dir
+    let mut cleanup = MergeCleanup::new(target_file_path.clone(), tmp_dir.clone());
+
     // 按顺序合并所有分片
     for idx in chunks {
         let chunk_path = format!("{}/{}", tmp_dir, idx);
-        let mut chunk_file = match tokio::fs::File::open(&chunk_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&target_file_path).await;
-                return Err(AppError::internal(format!("读取分片 {} 失败: {}", idx, e)));
-            }
-        };
-        if let Err(e) = tokio::io::copy(&mut chunk_file, &mut out_file).await {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            return Err(AppError::internal(format!("合并分片 {} 失败: {}", idx, e)));
-        }
+        let mut chunk_file = tokio::fs::File::open(&chunk_path).await
+            .map_err(|e| AppError::internal(format!("读取分片 {} 失败: {}", idx, e)))?;
+        tokio::io::copy(&mut chunk_file, &mut out_file).await
+            .map_err(|e| AppError::internal(format!("合并分片 {} 失败: {}", idx, e)))?;
     }
     let _ = out_file.flush().await;
 
@@ -270,92 +297,58 @@ pub async fn merge_chunks(
 
     // 获取文件元数据
     let meta = target_file_path.metadata().map(|m| m.len()).unwrap_or(0);
-    let file_size_mb = bytes_to_mb_ceil(meta);
+    let file_size_mb_exact = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
+    let file_size_mb_ceil = bytes_to_mb_ceil(meta);
 
     // 使用事务避免 TOCTOU 竞态：在事务内原子地检查并扣减配额
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(AppError::internal(format!("开启事务失败: {}", e)));
-        }
-    };
+    let mut tx = pool.begin().await.map_err(|e| AppError::internal(format!("开启事务失败: {}", e)))?;
 
     // 在事务内原子读取 used_mb + quota_mb
-    let (current_used, quota): (i64, i64) = match sqlx::query_as(
+    let (current_used, quota): (i64, i64) = sqlx::query_as(
         "SELECT used_mb, quota_mb FROM users WHERE username = ?"
     )
     .bind(username)
     .fetch_optional(&mut *tx)
     .await
-    {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(AppError::not_found("用户不存在"));
-        }
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            return Err(AppError::internal(format!("查询用户配额失败: {}", e)));
-        }
-    };
+    .map_err(|e| AppError::internal(format!("查询用户配额失败: {}", e)))?
+    .ok_or_else(|| AppError::not_found("用户不存在"))?;
 
-    if current_used + file_size_mb > quota {
-        let _ = tokio::fs::remove_file(&target_file_path).await;
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    if current_used + file_size_mb_ceil > quota {
         return Err(AppError::forbidden(format!("存储空间不足，配额 {} MB，已使用 {} MB", quota, current_used)));
     }
 
     // 完整文件 MIME 检测（安全增强）
-    match is_allowed_mime_streaming(&target_file_path).await {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            return Err(AppError::forbidden("完整文件安全检测未通过：非法内容"));
-        }
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&target_file_path).await;
-            return Err(AppError::internal(format!("无法验证文件完整性: {}", e)));
-        }
+    if !is_allowed_mime_streaming(&target_file_path).await
+        .map_err(|e| AppError::internal(format!("无法验证文件完整性: {}", e)))? {
+        return Err(AppError::forbidden("完整文件安全检测未通过：非法内容"));
     }
 
     // 在事务内插入文件记录并更新配额（原子操作）
-    if let Err(e) = sqlx::query(
+    // size_mb 存精确值用于显示，配额用向上取整值
+    sqlx::query(
         "INSERT INTO files (username, name, parent_path, is_dir, size_mb, identifier) VALUES (?, ?, ?, 0, ?, ?)"
     )
     .bind(username)
     .bind(&payload.file_name)
     .bind(&parent_path)
-    .bind(file_size_mb)
+    .bind(file_size_mb_exact)
     .bind(&payload.identifier)
     .execute(&mut *tx)
     .await
-    {
-        let _ = tokio::fs::remove_file(&target_file_path).await;
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        return Err(AppError::internal(format!("数据库录入失败: {}", e)));
-    }
+    .map_err(|e| AppError::internal(format!("数据库录入失败: {}", e)))?;
 
-    // 在事务内更新用户已用容量
-    if let Err(e) = sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
-        .bind(file_size_mb)
+    // 在事务内更新用户已用容量（配额用向上取整值避免微文件累积逃逸）
+    sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
+        .bind(file_size_mb_ceil)
         .bind(username)
         .execute(&mut *tx)
         .await
-    {
-        let _ = tokio::fs::remove_file(&target_file_path).await;
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        return Err(AppError::internal(format!("更新用户容量失败: {}", e)));
-    }
+        .map_err(|e| AppError::internal(format!("更新用户容量失败: {}", e)))?;
 
-    if let Err(e) = tx.commit().await {
-        let _ = tokio::fs::remove_file(&target_file_path).await;
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-        return Err(AppError::internal(format!("提交事务失败: {}", e)));
-    }
+    tx.commit().await.map_err(|e| AppError::internal(format!("提交事务失败: {}", e)))?;
+
+    // 提交成功 — 取消自动清理
+    cleanup.disarm();
 
     // 审计日志：记录上传操作
     let target = if parent_path.is_empty() {
@@ -363,7 +356,7 @@ pub async fn merge_chunks(
     } else {
         format!("{}/{}", parent_path, payload.file_name)
     };
-    let details = format!("{} MB", file_size_mb);
+    let details = format!("{:.2} MB", file_size_mb_exact);
     let _ = log_audit(&pool, username, "upload", Some(&target), Some(&details), None, None).await;
 
     Ok((StatusCode::OK, "文件上传合并成功"))

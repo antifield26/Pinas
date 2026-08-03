@@ -1,0 +1,31 @@
+{# Link list fragment #}
+{% if links.is_empty() %}
+<div class="text-center text-gray-400 col-span-full py-8">
+  <p class="text-lg font-medium mb-2">暂无链接</p>
+  <p class="text-xs mt-1">点击"添加链接"开始收藏</p>
+</div>
+{% else %}
+{% for link in links %}
+<a href="{{ link.url }}" target="_blank" rel="noopener"
+   class="bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-xl p-4 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500 transition group block"
+   id="link-{{ link.id }}">
+  <div class="flex items-start justify-between gap-2">
+    <div class="flex items-center gap-2 min-w-0">
+      {% if link.icon.is_some() %}
+      <span class="text-xl shrink-0">{{ link.icon.as_ref().unwrap() }}</span>
+      {% endif %}
+      <h3 class="font-medium text-sm text-gray-800 dark:text-gray-200 truncate">{{ link.title }}</h3>
+    </div>
+    <div class="flex gap-0.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition">
+      <button hx-get="/links/form/{{ link.id }}" hx-target="#modal-container" hx-swap="innerHTML"
+              onclick="event.preventDefault()"
+              class="w-6 h-6 flex items-center justify-center rounded text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/40 text-xs" title="编辑">编辑</button>
+      <button hx-delete="/links/{{ link.id }}" hx-target="#links-container" hx-swap="innerHTML"
+              onclick="event.preventDefault()"
+              hx-confirm="确定删除？"
+              class="w-6 h-6 flex items-center justify-center rounded text-red-600 hover:bg-red-50 dark:hover:bg-red-900/40 text-xs" title="删除">删除</button>
+    </div>
+  </div>
+</a>
+{% endfor %}
+{% endif %}

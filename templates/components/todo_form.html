@@ -1,0 +1,119 @@
+<div class="bg-white dark:bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl mx-auto" onclick="event.stopPropagation()"
+     x-data="{ category: '{{ category }}', isAllDay: {{ is_all_day }}, showDate: {{ show_date }} }"
+     id="todo-form-card">
+  <div class="flex justify-between items-center p-5 border-b border-gray-100 dark:border-gray-700">
+    <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100">
+    {% if is_edit %}编辑{% else %}新建{% endif %}
+    <span x-text="category === 'schedule' ? '日程' : '待办'"></span>
+  </h3>
+    <button onclick="App.closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none">&times;</button>
+  </div>
+  <div class="p-5">
+
+  <form {% if is_edit %}hx-put="/todos/{{ id }}"{% else %}hx-post="/todos"{% endif %}
+        hx-target="#todos-container" hx-swap="innerHTML"
+        hx-on:after-request="App.closeModal()"
+        class="space-y-3">
+
+    <!-- Category -->
+    <div>
+      <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">类型</label>
+      <select name="category" x-model="category" @change="showDate = true"
+              class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <option value="todo">待办事项</option>
+        <option value="schedule">日程安排</option>
+      </select>
+    </div>
+
+    <!-- Title -->
+    <div>
+      <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">标题 *</label>
+      <input type="text" name="title" value="{{ title }}" required placeholder="输入标题..."
+             class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+    </div>
+
+    <!-- Description -->
+    <div>
+      <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">描述</label>
+      <textarea name="description" rows="2" placeholder="可选描述..."
+                class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">{{ description }}</textarea>
+    </div>
+
+    <!-- Schedule: Date + Time -->
+    <div x-show="category === 'schedule'" class="space-y-3 border border-indigo-200 dark:border-indigo-700 rounded-lg p-3 bg-white/50 dark:bg-gray-800/50">
+      <div>
+        <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">日期 *</label>
+        <input type="date" name="due_date" value="{{ due_date }}" :required="category === 'schedule'"
+               class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">时间类型</label>
+        <select name="is_all_day" x-model="isAllDay"
+                class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          <option value="true">全天</option>
+          <option value="false">自定义时间段</option>
+        </select>
+      </div>
+      <div x-show="isAllDay === 'false' || isAllDay === false" class="grid grid-cols-2 gap-2">
+        <div>
+          <label class="block text-xs text-gray-400 dark:text-gray-500 mb-1">开始</label>
+          <input type="time" name="start_time" value="{{ start_time }}" class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 dark:text-gray-500 mb-1">结束</label>
+          <input type="time" name="end_time" value="{{ end_time }}" class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        </div>
+      </div>
+    </div>
+
+    <!-- Todo: Optional due date -->
+    <div x-show="category === 'todo'">
+      <button type="button" @click="showDate = !showDate"
+              class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition p-2 rounded-lg border border-dashed border-gray-300 dark:border-gray-600 w-full justify-center">
+        <span x-text="showDate ? '隐藏截止日期' : '设置截止日期（可选）'"></span>
+      </button>
+      <div x-show="showDate" class="mt-2 grid grid-cols-2 gap-2 p-3 bg-white/50 dark:bg-gray-800/50 rounded-lg">
+        <input type="date" name="todo_due_date" value="{{ todo_due_date }}" class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <input type="time" name="todo_due_time" value="{{ todo_due_time }}" class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+      </div>
+    </div>
+
+    <!-- Priority -->
+    <div>
+      <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">优先级</label>
+      <select name="priority"
+              class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <option value="low" {% if priority == "low" %}selected{% endif %}>低</option>
+        <option value="medium" {% if priority != "high" && priority != "low" %}selected{% endif %}>中</option>
+        <option value="high" {% if priority == "high" %}selected{% endif %}>高</option>
+      </select>
+    </div>
+
+    <!-- Status (edit mode, non-schedule) -->
+    {% if is_edit && category != "schedule" %}
+    <div>
+      <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">状态</label>
+      <select name="status"
+              class="w-full px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <option value="pending" {% if status == "pending" %}selected{% endif %}>待办</option>
+        <option value="in_progress" {% if status == "in_progress" %}selected{% endif %}>进行中</option>
+        <option value="completed" {% if status == "completed" %}selected{% endif %}>已完成</option>
+        <option value="expired" {% if status == "expired" %}selected{% endif %}>已过期</option>
+      </select>
+    </div>
+    {% endif %}
+
+    <!-- Buttons -->
+    <div class="flex gap-2 pt-2">
+      <button type="submit"
+              class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-lg text-sm font-medium transition">
+        {% if is_edit %}保存{% else %}创建{% endif %}
+      </button>
+      <button type="button"
+              onclick="App.closeModal()"
+              class="px-4 py-2 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm font-medium transition">
+        取消
+      </button>
+    </div>
+  </form>
+</div>
