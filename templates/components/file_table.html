@@ -9,7 +9,7 @@
 </div>
 <table class="w-full text-left border-collapse">
   <thead>
-    <tr class="bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+    <tr class="bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
       <th class="p-4 w-8"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)" class="rounded"></th>
       <th class="p-4">
         <a href="#" hx-get="/drive/list" hx-target="#drive-file-list"
@@ -24,12 +24,12 @@
       <th class="p-4 text-right"><span class="hidden sm:inline">操作</span></th>
     </tr>
   </thead>
-  <tbody class="divide-y divide-gray-100 dark:divide-gray-700 text-sm">
+  <tbody class="divide-y divide-gray-100 dark:divide-gray-800 text-sm">
     {% if files.is_empty() %}
     <tr class="animate-fade-in"><td colspan="4" class="p-8 text-center text-gray-400">此目录为空</td></tr>
     {% else %}
     {% for f in files %}
-    <tr class="animate-fade-in hover:bg-gray-50 dark:hover:bg-gray-700/50 transition"
+    <tr class="animate-fade-in hover:bg-gray-50 dark:hover:bg-gray-800/50 transition"
         style="animation-delay: {% if loop.index0 > 8 %}240ms{% else %}{{ loop.index0 * 30 }}ms{% endif %};">
       <td class="p-2"><input type="checkbox" class="file-checkbox rounded" value="{{ f.name }}" onchange="updateBatchToolbar()"></td>
       <td class="p-4">

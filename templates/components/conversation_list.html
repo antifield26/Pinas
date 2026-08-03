@@ -1,6 +1,6 @@
 {# Conversation sidebar list fragment #}
 {% for c in conversations %}
-<div class="flex items-center gap-1 group px-2 py-1.5 rounded-lg {% if c.id == active_id %}bg-indigo-50 dark:bg-indigo-900/20{% else %}hover:bg-gray-50 dark:hover:bg-gray-700/50{% endif %} transition cursor-pointer"
+<div class="flex items-center gap-1 group px-2 py-1.5 rounded-lg {% if c.id == active_id %}bg-indigo-50 dark:bg-indigo-900/20{% else %}hover:bg-gray-50 dark:hover:bg-gray-800/50{% endif %} transition cursor-pointer"
      hx-get="/agent/conversations?active={{ c.id }}" hx-target="#conv-list" hx-swap="innerHTML">
   <span class="flex-1 text-xs truncate {% if c.id == active_id %}text-indigo-700 dark:text-indigo-300 font-medium{% else %}text-gray-600 dark:text-gray-400{% endif %}">{{ c.title }}</span>
   <button class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 text-xs px-1 transition"

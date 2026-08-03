@@ -22,7 +22,7 @@
 
   <!-- AI 快速对话 -->
   <div class="card overflow-hidden">
-    <div class="p-4 border-b border-gray-100 dark:border-gray-700 bg-gradient-to-r from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 flex justify-between items-center">
+    <div class="p-4 border-b border-gray-100 dark:border-gray-800 bg-gradient-to-r from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 flex justify-between items-center">
       <div>
         <h2 class="text-base font-semibold text-gray-700 dark:text-gray-300">AI Chat</h2>
         <p class="text-xs text-gray-400 dark:text-gray-400">由 DeepSeek 驱动</p>
@@ -39,7 +39,7 @@
         </div>
         <div class="flex gap-2">
           <input type="text" name="message" placeholder="输入问题或点击快捷操作..." required
-                 class="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                 class="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg text-sm bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
           <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition">发送</button>
         </div>
       </form>
@@ -50,12 +50,12 @@
         </button>
         <button hx-post="/agent/chat" hx-target="#home-chat-messages" hx-swap="beforeend"
                 hx-vals='{"message":"帮我整理今天的待办事项，按优先级排序并给出建议"}'
-                class="text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600 px-3 py-1 rounded-lg transition">
+                class="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 px-3 py-1 rounded-lg transition">
           整理待办
         </button>
         <button hx-post="/agent/chat" hx-target="#home-chat-messages" hx-swap="beforeend"
                 hx-vals='{"message":"根据我的日程安排，建议今天的时间规划"}'
-                class="text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600 px-3 py-1 rounded-lg transition">
+                class="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 px-3 py-1 rounded-lg transition">
           时间规划
         </button>
       </div>

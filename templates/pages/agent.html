@@ -8,13 +8,13 @@
     <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">AI Chat</h2>
     <div class="flex-1"></div>
     <select id="agent-model-select" name="model"
-            class="text-xs px-2 py-1.5 border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            class="text-xs px-2 py-1.5 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500">
       <option value="">默认模型</option>
       <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
       <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
     </select>
     <button hx-get="/agent/settings-form" hx-target="#modal-container"
-            class="text-xs font-medium text-gray-500 dark:text-gray-300 hover:text-indigo-600 dark:hover:text-indigo-400 transition bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 px-3 py-1.5 rounded-lg">设置</button>
+            class="text-xs font-medium text-gray-500 dark:text-gray-300 hover:text-indigo-600 dark:hover:text-indigo-400 transition bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-3 py-1.5 rounded-lg">设置</button>
   </div>
 
   <!-- 主体：侧边栏 + 对话区 -->
@@ -44,14 +44,14 @@
           </div>
         </div>
       </div>
-      <div class="p-4 border-t border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50">
+      <div class="p-4 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50">
         <form hx-post="/agent/chat" hx-target="#agent-chat-messages" hx-swap="beforeend"
               hx-on:after-request="this.reset(); document.getElementById('agent-input').focus()"
               class="flex gap-2">
           <input type="hidden" name="model" value="" id="agent-model-hidden">
           <textarea id="agent-input" name="message" placeholder="输入消息... (Enter 发送)"
                     onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();this.form.requestSubmit()}"
-                    class="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" rows="1" required></textarea>
+                    class="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg text-sm bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" rows="1" required></textarea>
           <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2 rounded-lg text-sm font-medium transition shrink-0">发送</button>
         </form>
       </div>

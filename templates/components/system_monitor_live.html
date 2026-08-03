@@ -3,7 +3,7 @@
     <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
       <span>CPU</span><span>{{ cpu_bar_pct }}%</span>
     </div>
-    <div class="w-full bg-gray-100 dark:bg-gray-700 rounded-full h-2 overflow-hidden">
+    <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-2 overflow-hidden">
       <div class="bg-indigo-500 h-full transition-all duration-300 rounded-full" style="width: {{ cpu_bar_pct }}%"></div>
     </div>
   </div>
@@ -11,11 +11,11 @@
     <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
       <span>内存</span><span>{{ mem_used_mb }} / {{ mem_total_mb }} MB</span>
     </div>
-    <div class="w-full bg-gray-100 dark:bg-gray-700 rounded-full h-2 overflow-hidden">
+    <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-2 overflow-hidden">
       <div class="bg-green-500 h-full transition-all duration-300 rounded-full" style="width: {{ mem_bar_pct }}%"></div>
     </div>
   </div>
-  <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 items-center md:border-l md:pl-6 border-gray-100 dark:border-gray-700">
+  <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 items-center md:border-l md:pl-6 border-gray-100 dark:border-gray-800">
     <span>温度</span>
     <span class="font-mono font-bold text-sm px-2 py-0.5 rounded-md {{ temp_color_class }}">{{ temp_display }}</span>
   </div>

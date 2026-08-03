@@ -42,7 +42,7 @@
     *:focus-visible { outline: 2px solid #6366f1; outline-offset: 2px; border-radius: 4px; }
   </style>
 </head>
-<body class="bg-gray-50 dark:bg-gray-900 text-gray-800 dark:text-gray-200 font-sans min-h-screen transition-colors duration-200">
+<body class="bg-gray-50 dark:bg-gray-950 text-gray-800 dark:text-gray-200 font-sans min-h-screen transition-colors duration-200">
 
   <a href="#main-content" class="skip-link bg-indigo-600 text-white px-3 py-2 rounded text-sm font-medium">跳到主内容</a>
 
@@ -62,27 +62,27 @@
   <div id="modal-container" role="dialog" aria-modal="true" onclick="if(event.target===this)App.closeModal()" class="fixed inset-0 bg-black/50 backdrop-blur-sm hidden items-center justify-center z-50 p-4"></div>
 
   <!-- 顶部导航栏 -->
-  <nav class="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 sticky top-0 z-40 shadow-sm" aria-label="主导航" x-data="{ open: false }">
+  <nav class="bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 sticky top-0 z-40 shadow-sm" aria-label="主导航" x-data="{ open: false }">
     <div class="max-w-4xl mx-auto px-4">
       <div class="flex items-center justify-between h-14">
         <a href="/" class="flex items-center gap-2 shrink-0" hx-boost="true">
-          <span class="text-xl font-bold text-indigo-600 dark:text-indigo-400">Cloud Drive</span>
+          <span class="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-violet-600 dark:from-indigo-400 dark:to-violet-400">Cloud Drive</span>
         </a>
 
         <!-- Desktop Nav (hidden on mobile) -->
         <div class="hidden sm:flex items-center gap-1">
           {% for item in nav %}
           <a href="{{ item.href }}" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">{{ item.label }}</a>
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}</a>
           {% endfor %}
         </div>
 
         <div class="flex items-center gap-2">
           <span class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded-md font-mono hidden sm:inline">{{ username }}</span>
-          <button @click="dark = !dark" class="text-xs p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition" aria-label="切换主题" title="切换主题">🌓</button>
+          <button @click="dark = !dark" class="text-xs p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition" aria-label="切换主题" title="切换主题">🌓</button>
           <button hx-post="/api/logout" hx-target="body" class="text-xs text-gray-400 hover:text-red-600 dark:hover:text-red-400 font-medium transition px-2 py-1" aria-label="退出登录">退出</button>
           <!-- Mobile menu toggle -->
-          <button @click="open = !open" class="sm:hidden text-sm p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition" aria-label="菜单">
+          <button @click="open = !open" class="sm:hidden text-sm p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition" aria-label="菜单">
             <span x-show="!open">菜单</span><span x-show="open">关闭</span>
           </button>
         </div>
@@ -92,7 +92,7 @@
       <div x-show="open" @click.outside="open = false" class="sm:hidden pb-3 space-y-1">
         {% for item in nav %}
         <a href="{{ item.href }}" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">{{ item.label }}</a>
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}</a>
         {% endfor %}
       </div>
     </div>
@@ -368,7 +368,7 @@
 
   <!-- 拖拽上传覆盖层 -->
   <div id="drop-overlay" class="fixed inset-0 z-50 hidden items-center justify-center bg-indigo-500/20 backdrop-blur-sm" style="display:none">
-    <div class="bg-white dark:bg-gray-800 rounded-2xl p-10 shadow-2xl border-4 border-dashed border-indigo-400 text-center pointer-events-none">
+    <div class="bg-white dark:bg-gray-900 rounded-2xl p-10 shadow-2xl border-4 border-dashed border-indigo-400 text-center pointer-events-none">
       <span class="text-5xl">📁</span>
       <p class="text-lg font-bold text-indigo-600 dark:text-indigo-400 mt-4">释放文件以上传</p>
     </div>

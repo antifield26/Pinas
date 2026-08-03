@@ -5,22 +5,22 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ====== 自定义组件类 ====== */
-/* 卡片容器 */
+/* 卡片容器（暗色层级：页面底 950 → 卡片 900 → 输入/井面 800） */
 .card {
-  @apply bg-white dark:bg-gray-800 rounded-2xl border border-gray-100 dark:border-gray-700 shadow-sm;
+  @apply bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm;
 }
 
 /* 输入框 */
 .input-field {
-  @apply w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-lg text-sm
-         bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200
+  @apply w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg text-sm
+         bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200
          focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent
          placeholder-gray-400 dark:placeholder-gray-400 transition;
 }
 
-/* 按钮 - 主要 */
+/* 按钮 - 主要（品牌渐变 indigo→violet） */
 .btn-primary {
-  @apply bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm;
+  @apply bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm;
 }
 
 /* 按钮 - 次要 */

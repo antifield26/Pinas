@@ -25,7 +25,7 @@
   <!-- Calendar Grid -->
   <div class="grid grid-cols-7 gap-1">
     {% for cell in cells %}
-    <div class="min-h-[3rem] p-1 border border-gray-100 dark:border-gray-700 rounded-lg transition {% if cell.count == 0 %}bg-white dark:bg-gray-800{% else %}bg-indigo-50/50 dark:bg-indigo-900/10 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 cursor-pointer{% endif %}"
+    <div class="min-h-[3rem] p-1 border border-gray-100 dark:border-gray-800 rounded-lg transition {% if cell.count == 0 %}bg-white dark:bg-gray-900{% else %}bg-indigo-50/50 dark:bg-indigo-900/10 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 cursor-pointer{% endif %}"
          {% if cell.count > 0 %}
          hx-get="/todos/list?date={{ cell.date }}" hx-target="#todos-container" hx-swap="innerHTML"
          {% endif %}>

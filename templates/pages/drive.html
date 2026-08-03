@@ -33,9 +33,9 @@
   <!-- 文件浏览器 -->
   <div class="card overflow-hidden">
     <!-- 面包屑 + 搜索 -->
-    <div class="p-4 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 flex items-center gap-3 flex-wrap">
+    <div class="p-4 border-b border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex items-center gap-3 flex-wrap">
       <button onclick="App.goParent()" title="上级目录"
-              class="shrink-0 text-xs font-medium px-2 py-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">↑ 上级</button>
+              class="shrink-0 text-xs font-medium px-2 py-1 rounded-lg border border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors">↑ 上级</button>
       <div id="drive-breadcrumbs" hx-get="/drive/breadcrumbs" hx-trigger="load" class="fade-me flex items-center gap-1 text-sm overflow-x-auto">
         <span class="text-gray-400">/</span>
       </div>
@@ -43,7 +43,7 @@
       <input type="search" name="search" placeholder="搜索文件..."
              hx-get="/drive/list" hx-target="#drive-file-list" hx-trigger="keyup changed delay:300ms"
              hx-include="[name='path']"
-             class="w-40 px-3 py-1.5 border border-gray-200 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+             class="w-40 px-3 py-1.5 border border-gray-200 dark:border-gray-700 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
       <input type="hidden" name="path" value="/" id="drive-current-path">
     </div>
 

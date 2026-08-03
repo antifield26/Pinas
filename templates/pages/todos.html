@@ -44,23 +44,23 @@
     <div class="flex-1"></div>
     <div class="flex gap-1">
       <button @click="activeStatus='all'" hx-get="/todos/list?status=all" hx-target="#todos-container" hx-swap="innerHTML"
-              :class="activeStatus==='all' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              :class="activeStatus==='all' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
               class="px-3 py-1.5 rounded-lg text-xs font-medium transition">全部</button>
       <button @click="activeStatus='in_progress'" hx-get="/todos/list?status=in_progress" hx-target="#todos-container" hx-swap="innerHTML"
-              :class="activeStatus==='in_progress' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              :class="activeStatus==='in_progress' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
               class="px-3 py-1.5 rounded-lg text-xs font-medium transition">进行中</button>
       <button @click="activeStatus='completed'" hx-get="/todos/list?status=completed" hx-target="#todos-container" hx-swap="innerHTML"
-              :class="activeStatus==='completed' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              :class="activeStatus==='completed' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
               class="px-3 py-1.5 rounded-lg text-xs font-medium transition">已完成</button>
       <button @click="activeStatus='expired'" hx-get="/todos/list?status=expired" hx-target="#todos-container" hx-swap="innerHTML"
-              :class="activeStatus==='expired' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+              :class="activeStatus==='expired' ? 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'"
               class="px-3 py-1.5 rounded-lg text-xs font-medium transition">已过期</button>
     </div>
   </div>
 
   <!-- 待办/日程卡片容器 -->
   <div class="card overflow-hidden">
-    <div class="p-4 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 flex justify-between items-center">
+    <div class="p-4 border-b border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex justify-between items-center">
       <span class="text-xs text-gray-400 dark:text-gray-400" id="todos-count">加载中...</span>
     </div>
     <div id="todos-container" hx-get="/todos/list?status=all" hx-trigger="load" hx-swap="innerHTML" class="fade-me p-4">
