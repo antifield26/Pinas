@@ -67,10 +67,20 @@ page_handler!(links_page, LinksPage, "links");
 page_handler!(trash_page, TrashPage, "trash");
 page_handler!(admin_page, AdminPage, "admin");
 
+/// 公开静态页面加边缘缓存头（Cloudflare 缓存，避免每次回源走慢链路）
+fn with_public_cache(resp: axum::response::Response) -> axum::response::Response {
+    let mut resp = resp;
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=60"),
+    );
+    resp
+}
+
 /// GET /login — 登录页面（公开）
 #[tracing::instrument(skip_all)]
 pub async fn login_page() -> impl IntoResponse {
-    AppTemplate(LoginPage)
+    with_public_cache(AppTemplate(LoginPage).into_response())
 }
 
 /// 修改密码页面模板（独立模板）
@@ -81,5 +91,5 @@ struct ChangePasswordPage;
 /// GET /change-password — 强制修改密码页面
 #[tracing::instrument(skip_all)]
 pub async fn change_password_page() -> impl IntoResponse {
-    AppTemplate(ChangePasswordPage)
+    with_public_cache(AppTemplate(ChangePasswordPage).into_response())
 }

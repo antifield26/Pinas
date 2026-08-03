@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Antifield Cloud — AI Chat{% endblock %}
 
+{% block head_extra %}
+<script src="/assets/marked.min.js?v=8" data-cfasync="false"></script>
+<script src="/assets/purify.min.js?v=9" data-cfasync="false"></script>
+{% endblock %}
+
 {% block content %}
 <div class="space-y-6 h-[calc(100vh-120px)] min-h-[500px]">
   <!-- 顶栏 -->

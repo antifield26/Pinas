@@ -1,22 +1,21 @@
-// ====== Antifield Cloud Service Worker v8 ======
-const CACHE_NAME = 'antifield-v8';
-const RUNTIME_CACHE = 'antifield-runtime-v8';
+// ====== Antifield Cloud Service Worker v9 ======
+const CACHE_NAME = 'antifield-v9';
+const RUNTIME_CACHE = 'antifield-runtime-v9';
 
-// CDN 资源也纳入预缓存（支持离线使用）
-// 注：CSS 版本号与 HTML 引用（base.html 等 4 处 ?v=）严格对齐，保证预缓存命中
+// 资源全部本地化（HTMX/Alpine 已从 unpkg 移入 assets/）
+// 注：版本号与 HTML 引用（base.html 等 4 处 ?v=）严格对齐，保证预缓存命中
 const PRE_CACHE_URLS = [
   '/',
   '/assets/css/tailwind.min.css?v=16',
   '/assets/marked.min.js?v=8',
   '/assets/purify.min.js?v=9',
-  // HTMX + Alpine CDN — 预缓存以支持离线
-  'https://unpkg.com/htmx.org@2.0.4',
-  'https://unpkg.com/alpinejs@3.14.9',
+  '/assets/htmx.min.js?v=1',
+  '/assets/alpine.min.js?v=1',
 ];
 
 // ====== Install ======
 self.addEventListener('install', (event) => {
-  console.log('[SW] v8 安装中...');
+  console.log('[SW] v9 安装中...');
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(PRE_CACHE_URLS).catch((err) => {
@@ -28,7 +27,7 @@ self.addEventListener('install', (event) => {
 
 // ====== Activate: 清理旧缓存，通知客户端 ======
 self.addEventListener('activate', (event) => {
-  console.log('[SW] v8 已激活，清理旧缓存');
+  console.log('[SW] v9 已激活，清理旧缓存');
   event.waitUntil(
     caches.keys().then((keys) => {
       return Promise.all(

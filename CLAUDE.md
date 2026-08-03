@@ -264,4 +264,16 @@ curl -s http://localhost:3000/health
 
 **systemd 服务**: `antifield-cloud.service`，已启用自动启动。
 
-反向代理需设置 `X-Forwarded-Proto` 头以启用 Cookie `Secure` 标志。
+**Cloudflare 隧道**（`cloudflared.service`，公网入口，`/etc/cloudflared/config.yml`）：
+- `drive.antifield.work → http://localhost:3000`；`mc.antifield.work → tcp://localhost:25565`
+- **`protocol: auto`**（QUIC 优先，UDP 失败自动退化 HTTP/2）——曾因 UDP 被 QoS 触发 502 改为 http2，
+  TCP 又被限速导致 TLS 5-15s；QUIC 无队头阻塞 + 0-RTT，为当前最优
+- 边缘节点 LAX/SJC（回环 RTT ~200ms），应用本地 TTFB 1ms，瓶颈全在运营商链路
+- 本机 nginx 为默认站点，未参与反代
+
+**性能要点**（2026-08 实测）：
+- 全部前端依赖本地化（htmx/alpine 原走 unpkg，国内链路不可控）；marked/purify 仅 AI 页按需加载
+- 脚本加 `data-cfasync="false"` 防 Rocket Loader 异步化破坏 htmx 同步时序
+- login/change_password 公开页带 `Cache-Control: public, max-age=60`（浏览器缓存；
+  CF 边缘缓存 HTML 需面板 Cache Everything 规则）
+- 静态资源 CF 自动 gzip + 缓存（max-age=86400，cf-cache-status: HIT）

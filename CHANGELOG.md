@@ -28,6 +28,15 @@
 - clippy 44 处既有警告清零（if-let 合并/事务回滚同步化/类型别名等）+ rustfmt 全库统一
 - 部署路径 `~/pi/cloud_drive` → `~/pinas`（systemd unit 同步，开发机即部署机）
 
+### Performance
+- Cloudflare 隧道协议 `http2 → auto`（QUIC 建立成功，隧道段无队头阻塞；曾 502 后改 http2 治标，
+  TCP 被运营商限速导致 TLS 握手 5-15s、TTFB 波动 1-62s）
+- 前端依赖全本地化：htmx/alpine 从 unpkg 移入 `assets/`（第三方 CDN 国内链路不可控）
+- marked/purify 改为按页加载（仅 home/agent 的 `head_extra`，其他页省 2 请求 + ~66KB）
+- 脚本加 `data-cfasync="false"`（Rocket Loader 异步化会破坏 htmx 同步语义）
+- login/change_password 公开页加 `Cache-Control: public, max-age=60`
+- SW v9：预缓存全部本地资源，移除 unpkg 依赖
+
 ### Security
 - 限速兜底：无代理直连（无 IP 头）时按 username 限速（login/register）
 

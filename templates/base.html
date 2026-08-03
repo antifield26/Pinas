@@ -19,15 +19,12 @@
   <link rel="manifest" href="/assets/manifest.json">
   <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=16">
 
-  <!-- HTMX -->
-  <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
-  <!-- Alpine.js -->
-  <script defer src="https://unpkg.com/alpinejs@3.14.9" crossorigin="anonymous"></script>
-  <!-- Marked + DOMPurify (AI chat markdown) -->
-  <script src="/assets/marked.min.js?v=8"></script>
-  <script src="/assets/purify.min.js?v=9"></script>
+  <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
+  <script src="/assets/htmx.min.js?v=1" data-cfasync="false"></script>
+  <script defer src="/assets/alpine.min.js?v=1" data-cfasync="false"></script>
 
   {% block head_extra %}{% endblock %}
+  <!-- Marked + DOMPurify 仅 AI 页按需加载（见 agent.html/home.html head_extra）-->
 
   <style>
     .htmx-indicator { display: none; }
@@ -139,7 +136,7 @@
 
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=8', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=9', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;
