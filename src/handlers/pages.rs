@@ -2,7 +2,7 @@
 use askama::Template;
 use axum::{extract::Extension, response::IntoResponse};
 use pinas_core::UserSession;
-use crate::templates::AppTemplate;
+use crate::templates::{AppTemplate, NavItem, nav_items};
 
 // ====== 页面模板结构体（继承 base.html） ======
 
@@ -14,6 +14,7 @@ macro_rules! page_struct {
             username: String,
             is_admin: bool,
             current_page: String,
+            nav: Vec<NavItem>,
         }
     };
 }
@@ -46,7 +47,7 @@ macro_rules! page_handler {
             Extension(session): Extension<UserSession>,
         ) -> impl IntoResponse {
             let (username, is_admin, current_page) = page_context(&session, $page)();
-            AppTemplate($PageType { username, is_admin, current_page })
+            AppTemplate($PageType { username, is_admin, current_page, nav: nav_items(is_admin) })
         }
     };
 }

@@ -49,6 +49,30 @@ pub const PAGE_LINKS: &str = "links";
 pub const PAGE_TRASH: &str = "trash";
 pub const PAGE_ADMIN: &str = "admin";
 
+/// 导航栏条目（base.html 通过 {% for item in nav %} 渲染）
+#[derive(Debug)]
+pub struct NavItem {
+    pub href: &'static str,
+    pub label: &'static str,
+    pub page: &'static str,
+}
+
+/// 生成导航栏条目（admin 项按权限过滤），页面模板统一消费
+pub fn nav_items(is_admin: bool) -> Vec<NavItem> {
+    let mut items = vec![
+        NavItem { href: "/", label: "首页", page: PAGE_HOME },
+        NavItem { href: "/drive", label: "云盘", page: PAGE_DRIVE },
+        NavItem { href: "/todos", label: "待办", page: PAGE_TODOS },
+        NavItem { href: "/agent", label: "AI", page: PAGE_AGENT },
+        NavItem { href: "/links", label: "链接", page: PAGE_LINKS },
+        NavItem { href: "/trash", label: "回收站", page: PAGE_TRASH },
+    ];
+    if is_admin {
+        items.push(NavItem { href: "/admin", label: "管理", page: PAGE_ADMIN });
+    }
+    items
+}
+
 /// 为 HTML 元素的 class 生成 active 样式（用于 nav 链接）
 #[macro_export]
 macro_rules! nav_active {

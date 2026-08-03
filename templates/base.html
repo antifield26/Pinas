@@ -71,22 +71,10 @@
 
         <!-- Desktop Nav (hidden on mobile) -->
         <div class="hidden sm:flex items-center gap-1">
-          <a href="/" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "home" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">首页</a>
-          <a href="/drive" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "drive" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">云盘</a>
-          <a href="/todos" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "todos" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">待办</a>
-          <a href="/agent" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "agent" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">AI</a>
-          <a href="/links" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "links" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">链接</a>
-          <a href="/trash" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "trash" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">回收站</a>
-          {% if is_admin %}
-          <a href="/admin" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == "admin" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">管理</a>
-          {% endif %}
+          {% for item in nav %}
+          <a href="{{ item.href }}" hx-boost="true"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">{{ item.label }}</a>
+          {% endfor %}
         </div>
 
         <div class="flex items-center gap-2">
@@ -102,22 +90,10 @@
 
       <!-- Mobile Nav Dropdown -->
       <div x-show="open" @click.outside="open = false" class="sm:hidden pb-3 space-y-1">
-        <a href="/" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "home" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">首页</a>
-        <a href="/drive" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "drive" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">云盘</a>
-        <a href="/todos" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "todos" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">待办</a>
-        <a href="/agent" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "agent" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">AI</a>
-        <a href="/links" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "links" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">链接</a>
-        <a href="/trash" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "trash" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">回收站</a>
-        {% if is_admin %}
-        <a href="/admin" hx-boost="true" @click="open = false"
-           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == "admin" %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">管理</a>
-        {% endif %}
+        {% for item in nav %}
+        <a href="{{ item.href }}" hx-boost="true" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">{{ item.label }}</a>
+        {% endfor %}
       </div>
     </div>
   </nav>
