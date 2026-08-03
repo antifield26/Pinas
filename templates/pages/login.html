@@ -6,21 +6,10 @@
   <title>Antifield Cloud — 登录</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
   <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=14">
-  <script>
-    // 暗色模式（无框架依赖）
-    (function() {
-      var dark = localStorage.getItem('theme') === 'dark' ||
-        (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
-      if (dark) document.documentElement.classList.add('dark');
-    })();
-    function toggleDark() {
-      var html = document.documentElement;
-      html.classList.toggle('dark');
-      localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
-    }
-  </script>
+  {% include "partials/theme_head.html" %}
 </head>
 <body class="bg-gray-100 dark:bg-gray-900 min-h-screen flex items-center justify-center p-4 transition-colors duration-200">
+  <button onclick="toggleDark()" class="fixed top-4 right-4 text-lg p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition" aria-label="切换主题" title="切换主题">🌓</button>
   <div class="bg-white dark:bg-gray-800 p-8 rounded-2xl shadow-xl w-full max-w-md border border-gray-100 dark:border-gray-700 text-center">
     <h1 class="text-xl font-bold text-gray-800 dark:text-gray-200 mb-8">Antifield Cloud</h1>
 
@@ -53,12 +42,6 @@
       document.getElementById('login-btn').textContent = isRegister ? '注册' : '验证并进入';
       document.getElementById('toggle-btn').textContent = isRegister ? '已有账号？点击登录' : '没有账号？点击注册';
       document.getElementById('login-error').classList.add('hidden');
-    }
-
-    function toggleDark() {
-      var html = document.documentElement;
-      html.classList.toggle('dark');
-      localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
     }
 
     async function handleLogin(e) {

@@ -34,11 +34,8 @@
   <div class="card overflow-hidden">
     <!-- 面包屑 + 搜索 -->
     <div class="p-4 border-b border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 flex items-center gap-3 flex-wrap">
-      <button hx-get="/drive/list" hx-target="#drive-file-list" hx-vals='{"path":"/"}'
-              hx-on:after-request="var v=document.getElementById('drive-current-path').value;var p=v.substring(0,v.lastIndexOf('/'))||'/';document.getElementById('drive-current-path').value=p;htmx.ajax('GET','/drive/breadcrumbs',{target:'#drive-breadcrumbs',values:{path:p}})"
-              onmousedown="var v=document.getElementById('drive-current-path').value;if(v!=='/'){var p=v.substring(0,v.lastIndexOf('/'))||'/';this.setAttribute('hx-vals','{&quot;path&quot;:&quot;'+p+'&quot;}')}"
-              title="上级目录"
-              class="shrink-0 text-xs font-medium px-2 py-1 rounded-md border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">↑ 上级</button>
+      <button onclick="App.goParent()" title="上级目录"
+              class="shrink-0 text-xs font-medium px-2 py-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">↑ 上级</button>
       <div id="drive-breadcrumbs" hx-get="/drive/breadcrumbs" hx-trigger="load" class="fade-me flex items-center gap-1 text-sm overflow-x-auto">
         <span class="text-gray-400">/</span>
       </div>

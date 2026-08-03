@@ -19,7 +19,7 @@
       <td class="p-4 text-gray-500 dark:text-gray-400">{{ u.used_mb }} / {{ u.quota_mb }} MB</td>
       <td class="p-4 text-right">
         <button hx-post="/api/admin/user/reset_password" hx-vals='{"username":"{{ u.username }}"}'
-                hx-confirm="重置 {{ u.username }} 的密码？" class="text-xs bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400 px-2 py-1 rounded hover:bg-amber-100 dark:hover:bg-amber-900/50 transition">重置密码</button>
+                hx-confirm="重置 {{ u.username }} 的密码？" class="text-xs font-medium bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-300 px-2.5 py-1 rounded-lg hover:bg-amber-100 dark:hover:bg-amber-900/50 transition">重置密码</button>
       </td>
     </tr>
     {% endfor %}

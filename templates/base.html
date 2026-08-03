@@ -117,6 +117,20 @@
         modal.innerHTML = '';
         modal.classList.add('hidden');
         modal.classList.remove('flex');
+      },
+      // 云盘路径导航统一入口（路径唯一来源 = #drive-current-path，先更新再刷新列表与面包屑）
+      navigateTo: function(path) {
+        var el = document.getElementById('drive-current-path');
+        if (el) el.value = path;
+        htmx.ajax('GET', '/drive/list', { target: '#drive-file-list', values: { path: path } });
+        htmx.ajax('GET', '/drive/breadcrumbs', { target: '#drive-breadcrumbs', values: { path: path } });
+      },
+      // 返回上级目录
+      goParent: function() {
+        var el = document.getElementById('drive-current-path');
+        var v = el ? el.value || '/' : '/';
+        if (v === '/' || v === '') return;
+        App.navigateTo(v.substring(0, v.lastIndexOf('/')) || '/');
       }
     };
     // 向后兼容别名
