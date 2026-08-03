@@ -4,16 +4,18 @@
 # 自动生成的初始密码（修改密码后应删除）
 credentials.txt
 
-# 数据库文件
-cloud_disk.db
-cloud_disk.db-shm
-cloud_disk.db-wal
+# 数据库文件（含 WAL/SHM 与备份）
+*.db
+*.db-shm
+*.db-wal
+backups/
 
 # 编译产物
 /target/
 
-# 日志
+# 日志与运行时数据
 /logs/
+uploads/
 
 # Node.js 依赖
 /node_modules/
