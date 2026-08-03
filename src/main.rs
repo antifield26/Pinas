@@ -9,20 +9,27 @@ use pi_nas::router;
 use pi_nas::tasks;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 加载配置
     let config = Config::from_env().expect("加载配置失败");
-    info!("配置加载完成 (host={}, port={})", config.server_host, config.server_port);
+    info!(
+        "配置加载完成 (host={}, port={})",
+        config.server_host, config.server_port
+    );
 
     // 2. 初始化日志（文件 + 控制台）
     tokio::fs::create_dir_all(LOGS_DIR).await?;
     let file_appender = tracing_appender::rolling::daily(LOGS_DIR, "app.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::registry()
-        .with(fmt::Layer::new().with_writer(std::io::stdout).with_ansi(true))
+        .with(
+            fmt::Layer::new()
+                .with_writer(std::io::stdout)
+                .with_ansi(true),
+        )
         .with(fmt::Layer::new().with_writer(non_blocking).with_ansi(false))
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
@@ -57,9 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sigterm = async {
                 #[cfg(unix)]
                 {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut stream = signal(SignalKind::terminate())
-                        .expect("无法注册 SIGTERM 处理器");
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut stream =
+                        signal(SignalKind::terminate()).expect("无法注册 SIGTERM 处理器");
                     stream.recv().await;
                     info!("收到 SIGTERM 信号");
                 }

@@ -1,14 +1,14 @@
+use crate::UserSession;
+use crate::crypto::hash_token;
 use axum::{
+    Extension,
     extract::Request,
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
-    Extension,
 };
 use sqlx::Row;
-use crate::UserSession;
-use crate::crypto::hash_token;
-use tracing::{warn, error};
+use tracing::{error, warn};
 
 fn reject_no_token(uri_path: &str) -> Result<Response, StatusCode> {
     warn!("[Auth] 未提供有效 Token, path={}", uri_path);
@@ -25,7 +25,7 @@ fn reject_no_token(uri_path: &str) -> Result<Response, StatusCode> {
 
 pub async fn auth_middleware(
     Extension(pool): Extension<sqlx::SqlitePool>,
-    mut req: Request, 
+    mut req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
     let uri_path = req.uri().path();
@@ -66,13 +66,13 @@ pub async fn auth_middleware(
     };
 
     // 优先级：Cookie (httpOnly) > Authorization Header > Query param
-    let mut target_token = extract_from_cookie(&req)
-        .or_else(|| extract_from_header(&req));
+    let mut target_token = extract_from_cookie(&req).or_else(|| extract_from_header(&req));
 
     // media/ssh 路径额外支持 query 参数
-    if target_token.is_none() && (uri_path.starts_with("/api/media/") || uri_path.starts_with("/api/ssh/")) {
-        target_token = extract_from_query(&req)
-            .or_else(|| extract_from_header(&req));
+    if target_token.is_none()
+        && (uri_path.starts_with("/api/media/") || uri_path.starts_with("/api/ssh/"))
+    {
+        target_token = extract_from_query(&req).or_else(|| extract_from_header(&req));
     }
 
     let target_token = match target_token {
@@ -84,13 +84,17 @@ pub async fn auth_middleware(
     let session_row = sqlx::query(
         "SELECT s.username, s.role, COALESCE(u.must_change_pwd, 0) as must_change_pwd \
          FROM sessions s LEFT JOIN users u ON s.username = u.username \
-         WHERE s.token = ? AND s.expires_at > datetime('now')"
+         WHERE s.token = ? AND s.expires_at > datetime('now')",
     )
     .bind(&token_hash)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
-        error!("[Auth Error] 数据库查询失败, token_prefix={}: {}", &target_token.chars().take(8).collect::<String>(), e);
+        error!(
+            "[Auth Error] 数据库查询失败, token_prefix={}: {}",
+            &target_token.chars().take(8).collect::<String>(),
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -101,16 +105,27 @@ pub async fn auth_middleware(
             row.get::<i64, _>("must_change_pwd") != 0,
         ),
         None => {
-            warn!("[Auth] Token 无效或已过期: {}...", &target_token.chars().take(8).collect::<String>());
+            warn!(
+                "[Auth] Token 无效或已过期: {}...",
+                &target_token.chars().take(8).collect::<String>()
+            );
             return reject_no_token(uri_path);
         }
     };
 
     // 强制密码修改：must_change_pwd 时仅允许密码修改相关路由
     if must_change_pwd {
-        let exempt = ["/change-password", "/api/user/password", "/api/logout", "/api/login"];
+        let exempt = [
+            "/change-password",
+            "/api/user/password",
+            "/api/logout",
+            "/api/login",
+        ];
         if !exempt.iter().any(|p| uri_path.starts_with(p)) {
-            warn!("[Auth] 用户 '{}' 需要修改密码，拒绝访问: {}", username, uri_path);
+            warn!(
+                "[Auth] 用户 '{}' 需要修改密码，拒绝访问: {}",
+                username, uri_path
+            );
             if uri_path.starts_with("/api/") {
                 return Err(StatusCode::FORBIDDEN);
             }
@@ -118,6 +133,10 @@ pub async fn auth_middleware(
         }
     }
 
-    req.extensions_mut().insert(UserSession { username, role, must_change_pwd });
+    req.extensions_mut().insert(UserSession {
+        username,
+        role,
+        must_change_pwd,
+    });
     Ok(next.run(req).await)
 }

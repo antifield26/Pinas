@@ -1,18 +1,18 @@
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     extract::Extension,
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
 };
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::handlers::utils::{log_audit};
 use crate::config::Config;
-use crate::handlers::rate_limit;
-use crate::db::queries;
 use crate::constants::*;
+use crate::db::queries;
+use crate::handlers::rate_limit;
+use crate::handlers::utils::log_audit;
 use pinas_core::hash_token;
 
 /// 校验用户名格式：2-32 字符，仅允许字母/数字/下划线/连字符
@@ -20,7 +20,10 @@ fn validate_username(username: &str) -> Result<(), &'static str> {
     if username.len() < 2 || username.len() > 32 {
         return Err("用户名长度必须为 2-32 个字符");
     }
-    if !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err("用户名仅允许字母、数字、下划线和连字符");
     }
     Ok(())
@@ -91,13 +94,15 @@ fn extract_ip(headers: &HeaderMap) -> Option<&str> {
     // X-Real-IP 由反向代理直接设置，更难伪造
     if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
         let ip = ip.trim();
-        if !ip.is_empty() { return Some(ip); }
-    }
-    // X-Forwarded-For：取最左侧 IP（原始客户端），取第一个非空值
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(ip) = xff.split(',').map(|s| s.trim()).find(|s| !s.is_empty()) {
+        if !ip.is_empty() {
             return Some(ip);
         }
+    }
+    // X-Forwarded-For：取最左侧 IP（原始客户端），取第一个非空值
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(ip) = xff.split(',').map(|s| s.trim()).find(|s| !s.is_empty())
+    {
+        return Some(ip);
     }
     None
 }
@@ -125,8 +130,18 @@ pub async fn login(
     let rate_key = extract_ip(&headers)
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| format!("user:{}", payload.username));
-    if !rate_limit::check_rate_limit(&rate_key, LOGIN_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS)).await {
-        return (StatusCode::TOO_MANY_REQUESTS, "登录尝试过于频繁，请稍后再试").into_response();
+    if !rate_limit::check_rate_limit(
+        &rate_key,
+        LOGIN_RATE_LIMIT_ATTEMPTS,
+        std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS),
+    )
+    .await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录尝试过于频繁，请稍后再试",
+        )
+            .into_response();
     }
 
     let row = queries::get_user_auth(&pool, &payload.username)
@@ -136,17 +151,17 @@ pub async fn login(
     if let Some((db_hash, role, must_change)) = row {
         let password = payload.password.clone();
 
-        let is_valid = tokio::task::spawn_blocking(move || {
-            match PasswordHash::new(&db_hash) {
-                Ok(parsed_hash) => Argon2::default()
-                    .verify_password(password.as_bytes(), &parsed_hash)
-                    .is_ok(),
-                Err(e) => {
-                    tracing::error!("[Login] 密码哈希解析失败: {}", e);
-                    false
-                }
+        let is_valid = tokio::task::spawn_blocking(move || match PasswordHash::new(&db_hash) {
+            Ok(parsed_hash) => Argon2::default()
+                .verify_password(password.as_bytes(), &parsed_hash)
+                .is_ok(),
+            Err(e) => {
+                tracing::error!("[Login] 密码哈希解析失败: {}", e);
+                false
             }
-        }).await.unwrap_or(false);
+        })
+        .await
+        .unwrap_or(false);
 
         if is_valid {
             let token = Uuid::new_v4().to_string();
@@ -157,32 +172,57 @@ pub async fn login(
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
 
-            if let Err(e) = queries::create_session(&pool, &token_hash, &payload.username, &role, &expires).await
+            if let Err(e) =
+                queries::create_session(&pool, &token_hash, &payload.username, &role, &expires)
+                    .await
             {
                 tracing::error!("创建会话失败: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "创建会话失败，请稍后重试").into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "创建会话失败，请稍后重试",
+                )
+                    .into_response();
             }
 
-            let _ = log_audit(&pool, &payload.username, "login", None, None, extract_ip(&headers), extract_ua(&headers)).await;
+            let _ = log_audit(
+                &pool,
+                &payload.username,
+                "login",
+                None,
+                None,
+                extract_ip(&headers),
+                extract_ua(&headers),
+            )
+            .await;
 
             // 构建 httpOnly Cookie（服务器端设置，JS 不可访问）
             // Secure 标志确保 Cookie 仅通过 HTTPS 传输（反向代理场景必需）
             let max_age = config.session_days * 86400;
-            let secure_flag = if should_secure_cookie(&headers) { "; Secure" } else { "" };
+            let secure_flag = if should_secure_cookie(&headers) {
+                "; Secure"
+            } else {
+                ""
+            };
             let cookie = format!(
                 "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 token, max_age, secure_flag
             );
 
-            let mut resp = (StatusCode::OK, Json(LoginResponse {
-                token: token.clone(),
-                username: payload.username,
-                role,
-                must_change_pwd: must_change,
-            })).into_response();
+            let mut resp = (
+                StatusCode::OK,
+                Json(LoginResponse {
+                    token: token.clone(),
+                    username: payload.username,
+                    role,
+                    must_change_pwd: must_change,
+                }),
+            )
+                .into_response();
             resp.headers_mut().insert(
                 axum::http::header::SET_COOKIE,
-                cookie.parse().unwrap_or_else(|_| HeaderValue::from_static("")),
+                cookie
+                    .parse()
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
             );
             return resp;
         }
@@ -214,11 +254,20 @@ pub async fn register(
     let rate_key = extract_ip(&headers)
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| format!("user:{}", payload.username));
-    if !rate_limit::check_rate_limit(&rate_key, REGISTER_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(REGISTER_RATE_LIMIT_WINDOW_SECS)).await {
+    if !rate_limit::check_rate_limit(
+        &rate_key,
+        REGISTER_RATE_LIMIT_ATTEMPTS,
+        std::time::Duration::from_secs(REGISTER_RATE_LIMIT_WINDOW_SECS),
+    )
+    .await
+    {
         return (StatusCode::TOO_MANY_REQUESTS, "注册过于频繁，请稍后再试").into_response();
     }
 
-    if queries::user_exists(&pool, &payload.username).await.unwrap_or(false) {
+    if queries::user_exists(&pool, &payload.username)
+        .await
+        .unwrap_or(false)
+    {
         return (StatusCode::BAD_REQUEST, "用户已被注册").into_response();
     }
 
@@ -234,27 +283,42 @@ pub async fn register(
 
     // 直接 INSERT，依赖 UNIQUE 约束防止 TOCTOU 竞态
     // quota_mb 显式写入默认配额（否则 NULL 被当作 0，注册用户将无法上传）
-    let insert_result = sqlx::query("INSERT INTO users (username, password, role, quota_mb) VALUES (?, ?, ?, ?)")
-        .bind(&payload.username)
-        .bind(&hashed_password)
-        .bind(role)
-        .bind(config.default_quota_mb)
-        .execute(&pool)
-        .await;
+    let insert_result =
+        sqlx::query("INSERT INTO users (username, password, role, quota_mb) VALUES (?, ?, ?, ?)")
+            .bind(&payload.username)
+            .bind(&hashed_password)
+            .bind(role)
+            .bind(config.default_quota_mb)
+            .execute(&pool)
+            .await;
 
     if let Err(e) = insert_result {
-        if let Some(db_err) = e.as_database_error() {
-            if db_err.is_unique_violation() {
-                return (StatusCode::CONFLICT, "用户已被注册").into_response();
-            }
+        if let Some(db_err) = e.as_database_error()
+            && db_err.is_unique_violation()
+        {
+            return (StatusCode::CONFLICT, "用户已被注册").into_response();
         }
         tracing::error!("注册用户失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "注册失败").into_response();
     }
 
-    let _ = tokio::fs::create_dir_all(format!("{}/{}", crate::constants::UPLOADS_DIR, payload.username)).await;
+    let _ = tokio::fs::create_dir_all(format!(
+        "{}/{}",
+        crate::constants::UPLOADS_DIR,
+        payload.username
+    ))
+    .await;
 
-    let _ = log_audit(&pool, &payload.username, "register", None, None, extract_ip(&headers), extract_ua(&headers)).await;
+    let _ = log_audit(
+        &pool,
+        &payload.username,
+        "register",
+        None,
+        None,
+        extract_ip(&headers),
+        extract_ua(&headers),
+    )
+    .await;
 
     (StatusCode::OK, "用户初始化注册成功").into_response()
 }
@@ -289,7 +353,7 @@ pub async fn change_password(
     // 从 session 获取 username
     let token_hash = hash_token(&current_token);
     let username: Option<String> = sqlx::query_scalar(
-        "SELECT username FROM sessions WHERE token = ? AND expires_at > datetime('now')"
+        "SELECT username FROM sessions WHERE token = ? AND expires_at > datetime('now')",
     )
     .bind(&token_hash)
     .fetch_optional(&pool)
@@ -302,21 +366,23 @@ pub async fn change_password(
     };
 
     // 验证当前密码
-    let row = queries::get_user_auth(&pool, &username).await.unwrap_or(None);
+    let row = queries::get_user_auth(&pool, &username)
+        .await
+        .unwrap_or(None);
     let db_hash = match row {
         Some((hash, _, _)) => hash,
         None => return (StatusCode::NOT_FOUND, "用户不存在").into_response(),
     };
 
     let current_pwd = payload.current_password.clone();
-    let is_valid = tokio::task::spawn_blocking(move || {
-        match PasswordHash::new(&db_hash) {
-            Ok(parsed) => Argon2::default()
-                .verify_password(current_pwd.as_bytes(), &parsed)
-                .is_ok(),
-            Err(_) => false,
-        }
-    }).await.unwrap_or(false);
+    let is_valid = tokio::task::spawn_blocking(move || match PasswordHash::new(&db_hash) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(current_pwd.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    })
+    .await
+    .unwrap_or(false);
 
     if !is_valid {
         return (StatusCode::BAD_REQUEST, "当前密码错误").into_response();
@@ -340,14 +406,20 @@ pub async fn change_password(
     };
 
     if let Err(e) = sqlx::query("DELETE FROM sessions WHERE username = ?")
-        .bind(&username).execute(&mut *tx).await
+        .bind(&username)
+        .execute(&mut *tx)
+        .await
     {
         tracing::error!("清除会话失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
     }
 
-    if let Err(e) = sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
-        .bind(&hashed).bind(&username).execute(&mut *tx).await
+    if let Err(e) =
+        sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
+            .bind(&hashed)
+            .bind(&username)
+            .execute(&mut *tx)
+            .await
     {
         tracing::error!("更新密码失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
@@ -371,19 +443,35 @@ pub async fn change_password(
         .bind(&username)
         .fetch_optional(&pool)
         .await
-        .ok().flatten()
+        .ok()
+        .flatten()
         .map(|r| r.get::<String, _>("role"))
         .unwrap_or_else(|| "user".to_string());
 
-    if let Err(e) = queries::create_session(&pool, &new_token_hash, &username, &role, &expires).await {
+    if let Err(e) =
+        queries::create_session(&pool, &new_token_hash, &username, &role, &expires).await
+    {
         tracing::error!("创建新会话失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
     }
 
-    let _ = log_audit(&pool, &username, "change_password", None, None, extract_ip(&headers), extract_ua(&headers)).await;
+    let _ = log_audit(
+        &pool,
+        &username,
+        "change_password",
+        None,
+        None,
+        extract_ip(&headers),
+        extract_ua(&headers),
+    )
+    .await;
 
     let max_age = config.session_days * 86400;
-    let secure_flag = if should_secure_cookie(&headers) { "; Secure" } else { "" };
+    let secure_flag = if should_secure_cookie(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
         "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
         new_token, max_age, secure_flag
@@ -392,7 +480,9 @@ pub async fn change_password(
     let mut resp = (StatusCode::OK, "密码修改成功").into_response();
     resp.headers_mut().insert(
         axum::http::header::SET_COOKIE,
-        cookie.parse().unwrap_or_else(|_| HeaderValue::from_static("")),
+        cookie
+            .parse()
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
     resp
 }
@@ -431,21 +521,35 @@ pub async fn logout(
     }
 
     if let Some(name) = username {
-        let _ = log_audit(&pool, &name, "logout", None, None, extract_ip(headers), extract_ua(headers)).await;
+        let _ = log_audit(
+            &pool,
+            &name,
+            "logout",
+            None,
+            None,
+            extract_ip(headers),
+            extract_ua(headers),
+        )
+        .await;
     }
 
-    let secure_flag = if should_secure_cookie(headers) { "; Secure" } else { "" };
+    let secure_flag = if should_secure_cookie(headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     let mut resp = (StatusCode::OK, "已退出登录").into_response();
     resp.headers_mut().insert(
         axum::http::header::SET_COOKIE,
-        format!("auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}", secure_flag)
-            .parse()
-            .unwrap(),
+        format!(
+            "auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+            secure_flag
+        )
+        .parse()
+        .unwrap(),
     );
     // 通知 HTMX 整页跳转到登录页
-    resp.headers_mut().insert(
-        "HX-Redirect",
-        "/login".parse().unwrap(),
-    );
+    resp.headers_mut()
+        .insert("HX-Redirect", "/login".parse().unwrap());
     resp
 }

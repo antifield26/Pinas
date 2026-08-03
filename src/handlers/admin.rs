@@ -6,11 +6,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
-use pinas_core::UserSession;
-use sqlx::Connection;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, log_audit};
+use pinas_core::UserSession;
+use sqlx::Connection;
 
 // DTOs
 #[derive(Deserialize)]
@@ -58,7 +58,10 @@ pub async fn get_user_quota(
         Some(r) => {
             let quota: i64 = r.get("quota_mb");
             let used: i64 = r.get("used_mb");
-            Ok(Json(QuotaInfo { quota_mb: quota, used_mb: used }))
+            Ok(Json(QuotaInfo {
+                quota_mb: quota,
+                used_mb: used,
+            }))
         }
         None => Err(AppError::not_found("用户不存在")),
     }
@@ -88,7 +91,16 @@ pub async fn set_user_quota(
         .execute(&pool)
         .await?;
     let details = format!("{} MB -> {} MB", old_quota, payload.quota_mb);
-    let _ = log_audit(&pool, &session.username, "set_quota", Some(&payload.username), Some(&details), None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "set_quota",
+        Some(&payload.username),
+        Some(&details),
+        None,
+        None,
+    )
+    .await;
     Ok((StatusCode::OK, "配额更新成功"))
 }
 
@@ -102,19 +114,25 @@ pub async fn list_users(
         return Err(AppError::forbidden("需要管理员权限"));
     }
     let users = sqlx::query_as::<_, (String, String, i64, i64)>(
-        "SELECT username, role, used_mb, quota_mb FROM users ORDER BY username"
+        "SELECT username, role, used_mb, quota_mb FROM users ORDER BY username",
     )
     .fetch_all(&pool)
     .await?;
-    let list: Vec<UserInfo> = users.into_iter().map(|(username, role, used_mb, quota_mb)| {
-        UserInfo { username, role, used_mb, quota_mb }
-    }).collect();
+    let list: Vec<UserInfo> = users
+        .into_iter()
+        .map(|(username, role, used_mb, quota_mb)| UserInfo {
+            username,
+            role,
+            used_mb,
+            quota_mb,
+        })
+        .collect();
     Ok(Json(list))
 }
 
 // ====== HTMX Fragment ======
-use askama::Template;
 use crate::templates::AppTemplate;
+use askama::Template;
 
 #[derive(Template)]
 #[template(path = "components/admin_users.html")]
@@ -131,13 +149,18 @@ pub async fn admin_users_fragment(
         return AppTemplate(AdminUsersFragment { users: vec![] }).into_response();
     }
     let users = sqlx::query_as::<_, (String, String, i64, i64)>(
-        "SELECT username, role, used_mb, quota_mb FROM users ORDER BY username"
+        "SELECT username, role, used_mb, quota_mb FROM users ORDER BY username",
     )
     .fetch_all(&pool)
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(username, role, used_mb, quota_mb)| UserInfo { username, role, used_mb, quota_mb })
+    .map(|(username, role, used_mb, quota_mb)| UserInfo {
+        username,
+        role,
+        used_mb,
+        quota_mb,
+    })
     .collect();
     AppTemplate(AdminUsersFragment { users }).into_response()
 }
@@ -171,7 +194,11 @@ pub async fn reset_user_password(
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            tracing::error!("reset_password: 清除用户 {} 会话失败: {}", payload.username, e);
+            tracing::error!(
+                "reset_password: 清除用户 {} 会话失败: {}",
+                payload.username,
+                e
+            );
             AppError::internal("清除会话失败")
         })?;
 
@@ -183,7 +210,16 @@ pub async fn reset_user_password(
 
     tx.commit().await?;
 
-    let _ = log_audit(&pool, &session.username, "reset_password", Some(&payload.username), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "reset_password",
+        Some(&payload.username),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok((StatusCode::OK, "密码重置成功"))
 }
 
@@ -209,8 +245,14 @@ pub async fn get_audit_logs(
     if session.role != crate::constants::ROLE_ADMIN {
         return Err(AppError::forbidden("需要管理员权限"));
     }
-    let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100);
-    let offset = params.get("offset").and_then(|o| o.parse::<i64>().ok()).unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<i64>().ok())
+        .unwrap_or(100);
+    let offset = params
+        .get("offset")
+        .and_then(|o| o.parse::<i64>().ok())
+        .unwrap_or(0);
     let logs = sqlx::query_as::<_, AuditLogItem>(
         "SELECT id, username, action, target, details, ip_address, user_agent, created_at FROM audit_logs ORDER BY created_at DESC LIMIT ? OFFSET ?"
     )
@@ -242,7 +284,10 @@ pub async fn create_backup(
     let backup_path = format!("{}/{}", BACKUPS_DIR, filename);
 
     // VACUUM INTO 需要独立连接
-    let db_path = config.database_url.strip_prefix("sqlite:").unwrap_or("cloud_disk.db");
+    let db_path = config
+        .database_url
+        .strip_prefix("sqlite:")
+        .unwrap_or("cloud_disk.db");
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false);
@@ -250,10 +295,20 @@ pub async fn create_backup(
 
     let sql = format!("VACUUM INTO '{}'", backup_path);
     sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-        .execute(&mut conn).await?;
+        .execute(&mut conn)
+        .await?;
 
     let _ = conn.close().await;
-    let _ = log_audit(&pool, &session.username, "backup_create", Some(&filename), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "backup_create",
+        Some(&filename),
+        None,
+        None,
+        None,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -295,7 +350,9 @@ pub async fn download_backup(
         return Err(AppError::forbidden("需要管理员权限"));
     }
 
-    let filename = params.get("file").ok_or_else(|| AppError::bad_request("缺少 file 参数"))?;
+    let filename = params
+        .get("file")
+        .ok_or_else(|| AppError::bad_request("缺少 file 参数"))?;
     // 防止路径穿越
     if filename.contains('/') || filename.contains("..") {
         return Err(AppError::bad_request("非法文件名"));
@@ -305,16 +362,23 @@ pub async fn download_backup(
         return Err(AppError::not_found("备份文件不存在"));
     }
 
-    let file = tokio::fs::File::open(&path).await.map_err(|_| AppError::internal("无法读取备份文件"))?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| AppError::internal("无法读取备份文件"))?;
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = axum::body::Body::from_stream(stream);
 
     use axum::http::header;
     let mut resp = axum::response::Response::new(body);
-    resp.headers_mut().insert(header::CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
     resp.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{}\"", filename).parse().unwrap(),
+        format!("attachment; filename=\"{}\"", filename)
+            .parse()
+            .unwrap(),
     );
 
     Ok(resp)

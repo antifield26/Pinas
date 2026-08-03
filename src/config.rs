@@ -33,17 +33,39 @@ pub struct Config {
 }
 
 // serde default 函数
-fn default_server_host() -> String { "0.0.0.0".into() }
-fn default_server_port() -> u16 { 3000 }
-fn default_database_url() -> String { "sqlite:cloud_disk.db".into() }
-fn default_session_days() -> i64 { 7 }
-fn default_temp_cleanup_hours() -> u64 { 24 }
-fn default_trash_cleanup_days() -> u32 { 30 }
-fn default_trash_cleanup_interval_hours() -> u64 { 24 }
-fn default_upload_limit_mb() -> i64 { 100 }
-fn default_quota_mb() -> i64 { 10240 }
-fn default_deepseek_api_base() -> String { "https://api.deepseek.com".into() }
-fn default_deepseek_model() -> String { "deepseek-v4-flash".into() }
+fn default_server_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_server_port() -> u16 {
+    3000
+}
+fn default_database_url() -> String {
+    "sqlite:cloud_disk.db".into()
+}
+fn default_session_days() -> i64 {
+    7
+}
+fn default_temp_cleanup_hours() -> u64 {
+    24
+}
+fn default_trash_cleanup_days() -> u32 {
+    30
+}
+fn default_trash_cleanup_interval_hours() -> u64 {
+    24
+}
+fn default_upload_limit_mb() -> i64 {
+    100
+}
+fn default_quota_mb() -> i64 {
+    10240
+}
+fn default_deepseek_api_base() -> String {
+    "https://api.deepseek.com".into()
+}
+fn default_deepseek_model() -> String {
+    "deepseek-v4-flash".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -70,7 +92,10 @@ impl Default for Config {
 fn load_dotenv_manual() {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
-        Err(e) => { eprintln!("[Config] 无法获取当前目录: {}", e); return; }
+        Err(e) => {
+            eprintln!("[Config] 无法获取当前目录: {}", e);
+            return;
+        }
     };
     let env_path = cwd.join(".env");
 
@@ -94,11 +119,15 @@ fn load_dotenv_manual() {
         if let Some(eq_pos) = trimmed.find('=') {
             let key = trimmed[..eq_pos].trim();
             let value = trimmed[eq_pos + 1..].trim().trim_matches('"');
-            unsafe { std::env::set_var(key, value); }
+            unsafe {
+                std::env::set_var(key, value);
+            }
             if key == "PINAS_ADMIN_PASSWORD" {
                 let masked = if value.len() > 3 {
-                    format!("{}***{}", &value[..3], &value[value.len()-1..])
-                } else { "***".into() };
+                    format!("{}***{}", &value[..3], &value[value.len() - 1..])
+                } else {
+                    "***".into()
+                };
                 eprintln!("[Config]   PINAS_ADMIN_PASSWORD={}", masked);
             }
         }
@@ -127,7 +156,10 @@ impl Config {
             eprintln!("[Config] 警告: upload_limit_mb=0，上传功能将不可用");
         }
         if self.session_days < 1 {
-            eprintln!("[Config] 警告: session_days={}，会话将立即过期", self.session_days);
+            eprintln!(
+                "[Config] 警告: session_days={}，会话将立即过期",
+                self.session_days
+            );
         }
     }
 }
@@ -136,21 +168,40 @@ impl Config {
 mod tests {
     #[test]
     fn test_env_prefix_maps_flat_keys() {
-        unsafe { std::env::set_var("PINAS_ADMIN_PASSWORD", "antifield"); }
-        unsafe { std::env::set_var("PINAS_SERVER_HOST", "0.0.0.0"); }
-        unsafe { std::env::set_var("PINAS_SERVER_PORT", "3000"); }
-        unsafe { std::env::set_var("PINAS_DATABASE_URL", "sqlite:test.db"); }
+        unsafe {
+            std::env::set_var("PINAS_ADMIN_PASSWORD", "antifield");
+        }
+        unsafe {
+            std::env::set_var("PINAS_SERVER_HOST", "0.0.0.0");
+        }
+        unsafe {
+            std::env::set_var("PINAS_SERVER_PORT", "3000");
+        }
+        unsafe {
+            std::env::set_var("PINAS_DATABASE_URL", "sqlite:test.db");
+        }
 
         let settings = config::Config::builder()
             .add_source(config::Environment::with_prefix("PINAS").try_parsing(true))
             .build()
             .unwrap();
 
-        assert_eq!(settings.get::<String>("admin_password").unwrap(), "antifield");
+        assert_eq!(
+            settings.get::<String>("admin_password").unwrap(),
+            "antifield"
+        );
 
-        unsafe { std::env::remove_var("PINAS_ADMIN_PASSWORD"); }
-        unsafe { std::env::remove_var("PINAS_SERVER_HOST"); }
-        unsafe { std::env::remove_var("PINAS_SERVER_PORT"); }
-        unsafe { std::env::remove_var("PINAS_DATABASE_URL"); }
+        unsafe {
+            std::env::remove_var("PINAS_ADMIN_PASSWORD");
+        }
+        unsafe {
+            std::env::remove_var("PINAS_SERVER_HOST");
+        }
+        unsafe {
+            std::env::remove_var("PINAS_SERVER_PORT");
+        }
+        unsafe {
+            std::env::remove_var("PINAS_DATABASE_URL");
+        }
     }
 }

@@ -86,14 +86,30 @@ impl From<Box<dyn std::error::Error>> for AppError {
 // Convenience constructors
 
 impl AppError {
-    pub fn bad_request(msg: impl Into<String>) -> Self { AppError::BadRequest(msg.into()) }
-    pub fn forbidden(msg: impl Into<String>) -> Self { AppError::Forbidden(msg.into()) }
-    pub fn not_found(msg: impl Into<String>) -> Self { AppError::NotFound(msg.into()) }
-    pub fn conflict(msg: impl Into<String>) -> Self { AppError::Conflict(msg.into()) }
-    pub fn gone(msg: impl Into<String>) -> Self { AppError::Gone(msg.into()) }
-    pub fn internal(msg: impl Into<String>) -> Self { AppError::Internal(msg.into()) }
-    pub fn payload_too_large(msg: impl Into<String>) -> Self { AppError::PayloadTooLarge(msg.into()) }
-    pub fn service_unavailable(msg: impl Into<String>) -> Self { AppError::ServiceUnavailable(msg.into()) }
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        AppError::BadRequest(msg.into())
+    }
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        AppError::Forbidden(msg.into())
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        AppError::NotFound(msg.into())
+    }
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        AppError::Conflict(msg.into())
+    }
+    pub fn gone(msg: impl Into<String>) -> Self {
+        AppError::Gone(msg.into())
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        AppError::Internal(msg.into())
+    }
+    pub fn payload_too_large(msg: impl Into<String>) -> Self {
+        AppError::PayloadTooLarge(msg.into())
+    }
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        AppError::ServiceUnavailable(msg.into())
+    }
 
     /// 内部错误：错误细节仅写入日志，客户端只收到通用文案（防止 IO/DB 细节泄露）
     pub fn internal_log(ctx: impl Into<String>, e: impl std::fmt::Display) -> Self {

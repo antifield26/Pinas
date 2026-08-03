@@ -1,6 +1,6 @@
 // ====== Askama → Axum 集成层 ======
-use axum::response::{Html, IntoResponse, Response};
 use askama::Template;
+use axum::response::{Html, IntoResponse, Response};
 
 /// Wrapper: 为所有 Askama 模板实现 Axum 的 `IntoResponse`
 ///
@@ -60,15 +60,43 @@ pub struct NavItem {
 /// 生成导航栏条目（admin 项按权限过滤），页面模板统一消费
 pub fn nav_items(is_admin: bool) -> Vec<NavItem> {
     let mut items = vec![
-        NavItem { href: "/", label: "首页", page: PAGE_HOME },
-        NavItem { href: "/drive", label: "云盘", page: PAGE_DRIVE },
-        NavItem { href: "/todos", label: "待办", page: PAGE_TODOS },
-        NavItem { href: "/agent", label: "AI", page: PAGE_AGENT },
-        NavItem { href: "/links", label: "链接", page: PAGE_LINKS },
-        NavItem { href: "/trash", label: "回收站", page: PAGE_TRASH },
+        NavItem {
+            href: "/",
+            label: "首页",
+            page: PAGE_HOME,
+        },
+        NavItem {
+            href: "/drive",
+            label: "云盘",
+            page: PAGE_DRIVE,
+        },
+        NavItem {
+            href: "/todos",
+            label: "待办",
+            page: PAGE_TODOS,
+        },
+        NavItem {
+            href: "/agent",
+            label: "AI",
+            page: PAGE_AGENT,
+        },
+        NavItem {
+            href: "/links",
+            label: "链接",
+            page: PAGE_LINKS,
+        },
+        NavItem {
+            href: "/trash",
+            label: "回收站",
+            page: PAGE_TRASH,
+        },
     ];
     if is_admin {
-        items.push(NavItem { href: "/admin", label: "管理", page: PAGE_ADMIN });
+        items.push(NavItem {
+            href: "/admin",
+            label: "管理",
+            page: PAGE_ADMIN,
+        });
     }
     items
 }

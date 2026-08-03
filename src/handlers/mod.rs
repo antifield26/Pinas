@@ -1,39 +1,39 @@
 // 模块声明
-mod utils;
-mod auth;
-mod file_ops;
-mod upload;
-mod share;
-mod trash;
 mod admin;
-mod media;
-mod system;
-mod minecraft;
-mod links;
-pub mod rate_limit;
-mod todos;
 mod agent;
-mod settings;
-mod pages;
+mod auth;
 mod conversations;
+mod file_ops;
+mod links;
+mod media;
+mod minecraft;
+mod pages;
+pub mod rate_limit;
+mod settings;
+mod share;
+mod system;
+mod todos;
+mod trash;
+mod upload;
+mod utils;
 
 // 公共导出
-pub use utils::*;
-pub use auth::*;
-pub use file_ops::*;
-pub use upload::*;
-pub use share::*;
-pub use trash::*;
 pub use admin::*;
-pub use media::*;
-pub use system::*;
-pub use minecraft::*;
-pub use links::*;
-pub use todos::*;
 pub use agent::*;
-pub use settings::*;
-pub use pages::*;
+pub use auth::*;
 pub use conversations::*;
+pub use file_ops::*;
+pub use links::*;
+pub use media::*;
+pub use minecraft::*;
+pub use pages::*;
+pub use settings::*;
+pub use share::*;
+pub use system::*;
+pub use todos::*;
+pub use trash::*;
+pub use upload::*;
+pub use utils::*;
 
 // 公共 DTO
 use serde::Deserialize;

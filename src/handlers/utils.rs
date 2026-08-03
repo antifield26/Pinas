@@ -1,5 +1,5 @@
 // 密码学函数已迁移至 pinas-core::crypto，此处仅做重导出以保持向后兼容
-pub use pinas_core::{hash_password, verify_password, generate_random_password};
+pub use pinas_core::{generate_random_password, hash_password, verify_password};
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -22,30 +22,44 @@ pub fn bytes_to_mb_ceil(bytes: u64) -> i64 {
 
 pub static BLOCKED_EXTENSIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     let mut m = HashSet::new();
-    m.insert("exe"); m.insert("bat"); m.insert("sh"); m.insert("msi");
-    m.insert("vbs"); m.insert("cmd"); m.insert("com");
+    m.insert("exe");
+    m.insert("bat");
+    m.insert("sh");
+    m.insert("msi");
+    m.insert("vbs");
+    m.insert("cmd");
+    m.insert("com");
     m
 });
 
 pub fn is_blocked_extension(file_name: &str) -> bool {
-    if let Some(ext) = std::path::Path::new(file_name).extension().and_then(|s| s.to_str()) {
+    if let Some(ext) = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|s| s.to_str())
+    {
         return BLOCKED_EXTENSIONS.contains(ext.to_lowercase().as_str());
     }
     false
 }
 
 pub fn is_allowed_mime(data: &[u8]) -> bool {
-    if data.is_empty() { return true; }
+    if data.is_empty() {
+        return true;
+    }
     if let Some(kind) = infer::get(data) {
         let mime = kind.mime_type();
-        if mime.starts_with("application/x-executable") || mime.starts_with("application/x-sharedlib") {
+        if mime.starts_with("application/x-executable")
+            || mime.starts_with("application/x-sharedlib")
+        {
             return false;
         }
     }
     true
 }
 
-pub async fn is_allowed_mime_streaming(file_path: &std::path::Path) -> Result<bool, std::io::Error> {
+pub async fn is_allowed_mime_streaming(
+    file_path: &std::path::Path,
+) -> Result<bool, std::io::Error> {
     const CHECK_SIZE: usize = 1024 * 1024;
     let mut file = tokio::fs::File::open(file_path).await?;
     let mut buffer = vec![0u8; CHECK_SIZE];
@@ -62,7 +76,10 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
     for component in std::path::Path::new(&normalized).components() {
         match component {
             std::path::Component::ParentDir => {
-                tracing::warn!("[路径安全] 检测到路径穿越攻击 (ParentDir), path='{}'", user_raw_path);
+                tracing::warn!(
+                    "[路径安全] 检测到路径穿越攻击 (ParentDir), path='{}'",
+                    user_raw_path
+                );
                 return base.to_path_buf();
             }
             std::path::Component::CurDir => {
@@ -73,11 +90,19 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
                 // 拒绝 .. 路径穿越（Unix 上 .. 可能作为 Normal 出现），跳过 . 和空白伪装
                 let s = p.to_string_lossy();
                 if s == ".." {
-                    tracing::warn!("[路径安全] 检测到路径穿越攻击，返回安全回退: component='{}', path='{}'", s, user_raw_path);
+                    tracing::warn!(
+                        "[路径安全] 检测到路径穿越攻击，返回安全回退: component='{}', path='{}'",
+                        s,
+                        user_raw_path
+                    );
                     return base.to_path_buf();
                 }
                 if s == "." || s.trim().is_empty() {
-                    tracing::warn!("[路径安全] 跳过无效路径组件: component='{}', path='{}'", s, user_raw_path);
+                    tracing::warn!(
+                        "[路径安全] 跳过无效路径组件: component='{}', path='{}'",
+                        s,
+                        user_raw_path
+                    );
                     continue;
                 }
                 result.push(p);
@@ -104,13 +129,21 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
                 // 目标不存在时，向上查找最近的已存在父目录进行校验
                 let mut ancestor = result.clone();
                 loop {
-                    if !ancestor.pop() { break; }
+                    if !ancestor.pop() {
+                        break;
+                    }
                     if let Ok(canon) = ancestor.canonicalize() {
                         // 将未创建部分拼接回去
-                        let remaining = result.strip_prefix(&ancestor).unwrap_or(std::path::Path::new(""));
+                        let remaining = result
+                            .strip_prefix(&ancestor)
+                            .unwrap_or(std::path::Path::new(""));
                         let full = canon.join(remaining);
                         if !full.starts_with(&canonical_base) {
-                            tracing::error!("[路径安全] 路径穿越: ancestor={:?}, base={:?}", canon, canonical_base);
+                            tracing::error!(
+                                "[路径安全] 路径穿越: ancestor={:?}, base={:?}",
+                                canon,
+                                canonical_base
+                            );
                             return base.to_path_buf();
                         }
                         break;
@@ -120,7 +153,11 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
             }
         };
         if !canonical_result.starts_with(&canonical_base) {
-            tracing::error!("[路径安全] 路径穿越兜底拦截: base={:?}, result={:?}", canonical_base, canonical_result);
+            tracing::error!(
+                "[路径安全] 路径穿越兜底拦截: base={:?}, result={:?}",
+                canonical_base,
+                canonical_result
+            );
             return base.to_path_buf();
         }
     }
@@ -130,22 +167,34 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
 
 pub fn user_dir_path(raw: Option<String>) -> String {
     let s = raw.unwrap_or_default().trim().to_owned();
-    if s == "/" || s.is_empty() { String::new() } else { s }
+    if s == "/" || s.is_empty() {
+        String::new()
+    } else {
+        s
+    }
 }
 
 // （路径工具函数保留以备 handler 后续重构使用）
 
 /// 全量重算用户已用容量（回退方案，兼容旧逻辑）
-pub async fn update_user_used_mb(pool: &sqlx::SqlitePool, username: &str) -> Result<(), sqlx::Error> {
+pub async fn update_user_used_mb(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+) -> Result<(), sqlx::Error> {
     tracing::debug!("[配额更新] 开始计算用户 {} 的已用容量", username);
     let used_mb_f64: f64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_mb), 0.0) FROM files WHERE username = ? AND is_dir = 0"
+        "SELECT COALESCE(SUM(size_mb), 0.0) FROM files WHERE username = ? AND is_dir = 0",
     )
     .bind(username)
     .fetch_one(pool)
     .await?;
     let used_mb = (used_mb_f64 + 0.5).round() as i64;
-    tracing::debug!("[配额更新] 用户 {} 计算得已用: {:.2} MB -> 取整为 {} MB", username, used_mb_f64, used_mb);
+    tracing::debug!(
+        "[配额更新] 用户 {} 计算得已用: {:.2} MB -> 取整为 {} MB",
+        username,
+        used_mb_f64,
+        used_mb
+    );
     sqlx::query("UPDATE users SET used_mb = ? WHERE username = ?")
         .bind(used_mb)
         .bind(username)

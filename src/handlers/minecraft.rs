@@ -1,8 +1,8 @@
 // ====== Minecraft 服务器状态查询 ======
+use crate::error::{AppError, AppResult};
 use axum::{extract::Extension, response::Json};
 use pinas_core::UserSession;
 use serde::Serialize;
-use crate::error::{AppError, AppResult};
 
 // ====== VarInt 编解码 ======
 
@@ -34,9 +34,7 @@ fn encode_packet(packet_id: i32, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
-async fn read_varint_async(
-    stream: &mut tokio::net::TcpStream,
-) -> Result<i32, String> {
+async fn read_varint_async(stream: &mut tokio::net::TcpStream) -> Result<i32, String> {
     let mut value: i32 = 0;
     let mut buf = [0u8; 1];
     for i in 0..5 {
@@ -61,10 +59,10 @@ fn extract_motd(desc: &serde_json::Value) -> String {
         serde_json::Value::String(s) => strip_mc_colors(s),
         serde_json::Value::Object(obj) => {
             let mut parts = Vec::new();
-            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    parts.push(strip_mc_colors(text));
-                }
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                parts.push(strip_mc_colors(text));
             }
             if let Some(extra) = obj.get("extra").and_then(|v| v.as_array()) {
                 for item in extra {
@@ -130,23 +128,19 @@ impl McServerStatus {
 // ====== 核心查询函数 ======
 
 async fn query_mc_server(host: &str, port: u16) -> McServerStatus {
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use std::time::Duration;
 
     let addr = format!("{}:{}", host, port);
 
     // 连接（3 秒超时）
-    let mut stream = match tokio::time::timeout(
-        Duration::from_secs(3),
-        TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return McServerStatus::offline(format!("连接失败: {}", e)),
-        Err(_) => return McServerStatus::offline("连接超时".into()),
-    };
+    let mut stream =
+        match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return McServerStatus::offline(format!("连接失败: {}", e)),
+            Err(_) => return McServerStatus::offline("连接超时".into()),
+        };
 
     // 构建 Handshake 包
     let mut handshake_payload = Vec::new();
@@ -177,11 +171,13 @@ async fn query_mc_server(host: &str, port: u16) -> McServerStatus {
     // 读取响应（2 秒超时）
     let response_bytes = match tokio::time::timeout(Duration::from_secs(2), async {
         // 读取包长度（VarInt）
-        let _packet_len = read_varint_async(&mut stream).await
+        let _packet_len = read_varint_async(&mut stream)
+            .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         // 读取包 ID
-        let packet_id = read_varint_async(&mut stream).await
+        let packet_id = read_varint_async(&mut stream)
+            .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         if packet_id != 0x00 {
@@ -192,7 +188,8 @@ async fn query_mc_server(host: &str, port: u16) -> McServerStatus {
         }
 
         // 读取 JSON 字符串长度
-        let json_len = read_varint_async(&mut stream).await
+        let json_len = read_varint_async(&mut stream)
+            .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         if !(0..=65536).contains(&json_len) {
@@ -256,7 +253,11 @@ async fn query_mc_server(host: &str, port: u16) -> McServerStatus {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .filter_map(|p| {
+                    p.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -289,7 +290,10 @@ pub async fn get_minecraft_status(
     }
 
     let host = std::env::var("MINECRAFT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port: u16 = std::env::var("MINECRAFT_PORT").unwrap_or_else(|_| "25565".into()).parse().unwrap_or(25565);
+    let port: u16 = std::env::var("MINECRAFT_PORT")
+        .unwrap_or_else(|_| "25565".into())
+        .parse()
+        .unwrap_or(25565);
     let status = query_mc_server(&host, port).await;
     let json = serde_json::to_value(&status).unwrap_or(serde_json::json!({
         "online": false,
@@ -300,8 +304,8 @@ pub async fn get_minecraft_status(
 }
 
 // ====== HTMX Fragment ======
-use askama::Template;
 use crate::templates::AppTemplate;
+use askama::Template;
 
 #[derive(Template)]
 #[template(path = "components/minecraft_status.html")]
@@ -318,26 +322,49 @@ struct MinecraftStatusFragment {
 pub async fn minecraft_status_fragment() -> impl axum::response::IntoResponse {
     // Default config — same as get_minecraft_status
     let host = std::env::var("MINECRAFT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port: u16 = std::env::var("MINECRAFT_PORT").unwrap_or_else(|_| "25565".into()).parse().unwrap_or(25565);
+    let port: u16 = std::env::var("MINECRAFT_PORT")
+        .unwrap_or_else(|_| "25565".into())
+        .parse()
+        .unwrap_or(25565);
 
     match query_mc_server(&host, port).await {
-        McServerStatus { online: true, motd, version, players_online, players_max, player_names, .. } => {
-            let players = format!("{} / {}", players_online.unwrap_or(0), players_max.unwrap_or(0));
+        McServerStatus {
+            online: true,
+            motd,
+            version,
+            players_online,
+            players_max,
+            player_names,
+            ..
+        } => {
+            let players = format!(
+                "{} / {}",
+                players_online.unwrap_or(0),
+                players_max.unwrap_or(0)
+            );
             let names = player_names.join(", ");
             AppTemplate(MinecraftStatusFragment {
                 online: true,
                 motd: motd.unwrap_or_else(|| "---".into()),
                 version: version.unwrap_or_else(|| "---".into()),
                 players,
-                player_names: if names.is_empty() { String::new() } else { names },
+                player_names: if names.is_empty() {
+                    String::new()
+                } else {
+                    names
+                },
                 error: String::new(),
             })
         }
         status => {
             let err = status.error.unwrap_or_else(|| "无法连接".into());
             AppTemplate(MinecraftStatusFragment {
-                online: false, motd: "---".into(), version: "---".into(),
-                players: "---".into(), player_names: String::new(), error: err,
+                online: false,
+                motd: "---".into(),
+                version: "---".into(),
+                players: "---".into(),
+                player_names: String::new(),
+                error: err,
             })
         }
     }

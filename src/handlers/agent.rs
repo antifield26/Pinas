@@ -7,8 +7,17 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::sync::LazyLock;
 
-use pinas_core::UserSession;
 use crate::config::Config;
+use pinas_core::UserSession;
+
+/// 用户 Agent 设置行（user_settings 表一行）：(api_key, api_base, model, temperature, max_tokens)
+type UserSettingsRow = Option<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<f32>,
+    Option<u32>,
+)>;
 
 // ====== 共享 HTTP 客户端 ======
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -20,8 +29,9 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 // ====== 系统提示缓存 (30s TTL) ======
 use tokio::sync::Mutex;
-static PROMPT_CACHE: LazyLock<Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PROMPT_CACHE: LazyLock<
+    Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 // ====== 模型列表 ======
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
@@ -48,8 +58,12 @@ pub struct ChatRequest {
     pub max_tokens: u32,
 }
 
-fn default_temperature() -> f32 { 0.7 }
-fn default_max_tokens() -> u32 { 4096 }
+fn default_temperature() -> f32 {
+    0.7
+}
+fn default_max_tokens() -> u32 {
+    4096
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
@@ -119,15 +133,17 @@ const SYSTEM_PROMPT_BASE: &str = r#"你是 Antifield Cloud 的 AI 智能助手�
 async fn get_cached_prompt(pool: &SqlitePool, username: &str) -> String {
     let mut cache = PROMPT_CACHE.lock().await;
     let now = std::time::Instant::now();
-    if let Some((cached, ts)) = cache.get(username) {
-        if now.duration_since(*ts) < std::time::Duration::from_secs(30) {
-            return cached.clone();
-        }
+    if let Some((cached, ts)) = cache.get(username)
+        && now.duration_since(*ts) < std::time::Duration::from_secs(30)
+    {
+        return cached.clone();
     }
     let prompt = build_system_prompt(pool, username).await;
     cache.insert(username.to_string(), (prompt.clone(), now));
     // 防止缓存无限增长
-    if cache.len() > 100 { cache.clear(); }
+    if cache.len() > 100 {
+        cache.clear();
+    }
     prompt
 }
 
@@ -154,8 +170,14 @@ async fn build_system_prompt(pool: &SqlitePool, username: &str) -> String {
         return prompt;
     }
 
-    let todos: Vec<_> = items.iter().filter(|i| i.category.as_deref() == Some("todo")).collect();
-    let schedules: Vec<_> = items.iter().filter(|i| i.category.as_deref() == Some("schedule")).collect();
+    let todos: Vec<_> = items
+        .iter()
+        .filter(|i| i.category.as_deref() == Some("todo"))
+        .collect();
+    let schedules: Vec<_> = items
+        .iter()
+        .filter(|i| i.category.as_deref() == Some("schedule"))
+        .collect();
 
     prompt.push_str("\n\n---\n## 当前用户数据\n\n");
 
@@ -173,12 +195,14 @@ async fn build_system_prompt(pool: &SqlitePool, username: &str) -> String {
             };
             prompt.push_str(&format!(
                 "- {} {} **{}**",
-                priority_icon, status_label, t.title.as_deref().unwrap_or("无标题")
+                priority_icon,
+                status_label,
+                t.title.as_deref().unwrap_or("无标题")
             ));
-            if let Some(ref desc) = t.description {
-                if !desc.trim().is_empty() {
-                    prompt.push_str(&format!(" — {}", desc));
-                }
+            if let Some(ref desc) = t.description
+                && !desc.trim().is_empty()
+            {
+                prompt.push_str(&format!(" — {}", desc));
             }
             if let Some(ref due) = t.due_date {
                 prompt.push_str(&format!(" (截止: {})", due));
@@ -206,10 +230,10 @@ async fn build_system_prompt(pool: &SqlitePool, username: &str) -> String {
                 s.title.as_deref().unwrap_or("无标题"),
                 date_time_label
             ));
-            if let Some(ref desc) = s.description {
-                if !desc.trim().is_empty() {
-                    prompt.push_str(&format!(" — {}", desc));
-                }
+            if let Some(ref desc) = s.description
+                && !desc.trim().is_empty()
+            {
+                prompt.push_str(&format!(" — {}", desc));
             }
             prompt.push('\n');
         }
@@ -252,7 +276,7 @@ async fn resolve_agent_config(
     requested_model: Option<String>,
 ) -> Result<ResolvedAgentConfig, (StatusCode, String)> {
     // 尝试读取用户设置
-    let user_settings: Option<(Option<String>, Option<String>, Option<String>, Option<f32>, Option<u32>)> = sqlx::query_as(
+    let user_settings: UserSettingsRow = sqlx::query_as(
         "SELECT deepseek_api_key, deepseek_api_base, deepseek_model, temperature, max_tokens FROM user_settings WHERE username = ?"
     )
     .bind(&session.username)
@@ -269,8 +293,11 @@ async fn resolve_agent_config(
     // API Key: 用户设置 > 全局配置
     let api_key = match user_api_key.or_else(|| config.deepseek_api_key.clone()) {
         Some(k) if !k.is_empty() => k,
-        _ => return Err((StatusCode::SERVICE_UNAVAILABLE,
-            "AI 服务未配置。请在 Agent 设置中配置 API Key 或设置环境变量 PINAS_DEEPSEEK_API_KEY".to_string())),
+        _ => return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI 服务未配置。请在 Agent 设置中配置 API Key 或设置环境变量 PINAS_DEEPSEEK_API_KEY"
+                .to_string(),
+        )),
     };
 
     // API Base: 用户设置 > 全局配置 > 默认值
@@ -284,14 +311,21 @@ async fn resolve_agent_config(
         .or_else(|| user_model.filter(|m| !m.is_empty()))
         .unwrap_or_else(|| config.deepseek_model.clone());
 
-    Ok(ResolvedAgentConfig { api_key, api_base, model, temperature: user_temperature, max_tokens: user_max_tokens })
+    Ok(ResolvedAgentConfig {
+        api_key,
+        api_base,
+        model,
+        temperature: user_temperature,
+        max_tokens: user_max_tokens,
+    })
 }
 
 /// GET /api/agent/models — 返回可用模型列表
 pub async fn get_models() -> impl IntoResponse {
-    let models: Vec<serde_json::Value> = AVAILABLE_MODELS.iter().map(|(id, name)| {
-        serde_json::json!({ "id": id, "name": name })
-    }).collect();
+    let models: Vec<serde_json::Value> = AVAILABLE_MODELS
+        .iter()
+        .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+        .collect();
     Json(models)
 }
 
@@ -327,10 +361,16 @@ async fn call_deepseek(
             let status = response.status();
             if status.is_success() {
                 response.json::<DeepSeekResponse>().await.map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("AI 响应解析失败: {}", e))
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("AI 响应解析失败: {}", e),
+                    )
                 })
             } else {
-                let err_msg = response.text().await.unwrap_or_else(|_| "未知错误".to_string());
+                let err_msg = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "未知错误".to_string());
                 let user_msg = match status.as_u16() {
                     401 => "AI API 密钥无效".to_string(),
                     429 => "AI 请求过于频繁，请稍后重试".to_string(),
@@ -359,7 +399,8 @@ pub async fn agent_chat(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await {
+    let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await
+    {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
@@ -393,9 +434,12 @@ pub async fn agent_chat(
         deepseek_messages,
         payload.temperature.clamp(0.0, 2.0),
         payload.max_tokens.clamp(1, 8192),
-    ).await {
+    )
+    .await
+    {
         Ok(ds_resp) => {
-            let reply = ds_resp.choices
+            let reply = ds_resp
+                .choices
                 .first()
                 .map(|c| c.message.content.clone())
                 .unwrap_or_else(|| "（AI 未返回内容）".to_string());
@@ -411,7 +455,12 @@ pub async fn agent_chat(
                 usage.as_ref().map_or(0, |u| u.prompt_tokens),
                 usage.as_ref().map_or(0, |u| u.completion_tokens)
             );
-            Json(ChatResponse { reply, model, usage }).into_response()
+            Json(ChatResponse {
+                reply,
+                model,
+                usage,
+            })
+            .into_response()
         }
         Err(e) => e.into_response(),
     }
@@ -444,7 +493,8 @@ pub async fn generate_briefing(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<BriefingRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await {
+    let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await
+    {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
@@ -459,8 +509,16 @@ pub async fn generate_briefing(
     );
 
     // 分类整理
-    let todos: Vec<_> = payload.todos.iter().filter(|t| t.category == "todo").collect();
-    let schedules: Vec<_> = payload.todos.iter().filter(|t| t.category == "schedule").collect();
+    let todos: Vec<_> = payload
+        .todos
+        .iter()
+        .filter(|t| t.category == "todo")
+        .collect();
+    let schedules: Vec<_> = payload
+        .todos
+        .iter()
+        .filter(|t| t.category == "schedule")
+        .collect();
 
     if !todos.is_empty() {
         prompt.push_str("### 待办事项\n\n");
@@ -477,12 +535,15 @@ pub async fn generate_briefing(
             };
             prompt.push_str(&format!(
                 "{}. {} {} **{}**",
-                i + 1, status_icon, priority_icon, t.title
+                i + 1,
+                status_icon,
+                priority_icon,
+                t.title
             ));
-            if let Some(ref desc) = t.description {
-                if !desc.trim().is_empty() {
-                    prompt.push_str(&format!(" — {}", desc));
-                }
+            if let Some(ref desc) = t.description
+                && !desc.trim().is_empty()
+            {
+                prompt.push_str(&format!(" — {}", desc));
             }
             if let Some(ref due) = t.due_date {
                 prompt.push_str(&format!(" (截止: {})", due));
@@ -498,14 +559,11 @@ pub async fn generate_briefing(
         let mut sorted_schedules = schedules.clone();
         sorted_schedules.sort_by(|a, b| a.due_date.cmp(&b.due_date));
         for (i, s) in sorted_schedules.iter().enumerate() {
-            prompt.push_str(&format!(
-                "{}. **{}**",
-                i + 1, s.title
-            ));
-            if let Some(ref desc) = s.description {
-                if !desc.trim().is_empty() {
-                    prompt.push_str(&format!(" — {}", desc));
-                }
+            prompt.push_str(&format!("{}. **{}**", i + 1, s.title));
+            if let Some(ref desc) = s.description
+                && !desc.trim().is_empty()
+            {
+                prompt.push_str(&format!(" — {}", desc));
             }
             if let Some(ref due) = s.due_date {
                 prompt.push_str(&format!(" [日期: {}]", due));
@@ -519,7 +577,8 @@ pub async fn generate_briefing(
         prompt.push_str("（暂无待办事项和日程安排）\n\n请生成一条鼓励性的消息，建议用户添加一些待办事项或日程。\n");
     }
 
-    prompt.push_str("\
+    prompt.push_str(
+        "\
 ---
 请生成一份专业的每日简报，包含：
 1. **今日概览** — 简要总结今日安排
@@ -528,16 +587,27 @@ pub async fn generate_briefing(
 4. **小贴士** — 一条关于提高效率的建议
 5. **总结** — 一句鼓励的话
 
-使用 Markdown 格式，风格专业且温暖。");
+使用 Markdown 格式，风格专业且温暖。",
+    );
 
     let messages = vec![DeepSeekMessage {
         role: "user".to_string(),
         content: prompt,
     }];
 
-    match call_deepseek(&resolved.api_base, &resolved.api_key, &model, messages, resolved.temperature, resolved.max_tokens).await {
+    match call_deepseek(
+        &resolved.api_base,
+        &resolved.api_key,
+        &model,
+        messages,
+        resolved.temperature,
+        resolved.max_tokens,
+    )
+    .await
+    {
         Ok(ds_resp) => {
-            let briefing = ds_resp.choices
+            let briefing = ds_resp
+                .choices
                 .first()
                 .map(|c| c.message.content.clone())
                 .unwrap_or_else(|| "（AI 未返回内容）".to_string());
@@ -549,8 +619,8 @@ pub async fn generate_briefing(
 }
 
 // ====== HTMX Fragment 处理器 ======
-use askama::Template;
 use crate::templates::AppTemplate;
+use askama::Template;
 
 /// 聊天消息 HTML 片段（用户消息 + AI 回复）
 #[derive(Template)]
@@ -585,7 +655,8 @@ pub async fn agent_chat_fragment(
             assistant_reply: "请输入消息".to_string(),
             model: String::new(),
             usage_info: String::new(),
-        }).into_response();
+        })
+        .into_response();
     }
 
     let user_msg = message.trim().to_string();
@@ -599,37 +670,64 @@ pub async fn agent_chat_fragment(
                 assistant_reply: format!("配置错误: {}", msg),
                 model: String::new(),
                 usage_info: String::new(),
-            }).into_response();
+            })
+            .into_response();
         }
     };
 
     let model = resolved.model.clone();
     let system_prompt = get_cached_prompt(&pool, &session.username).await;
     let messages = vec![
-        DeepSeekMessage { role: "system".to_string(), content: system_prompt },
-        DeepSeekMessage { role: "user".to_string(), content: user_msg.clone() },
+        DeepSeekMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        DeepSeekMessage {
+            role: "user".to_string(),
+            content: user_msg.clone(),
+        },
     ];
 
-    match call_deepseek(&resolved.api_base, &resolved.api_key, &model, messages, resolved.temperature, resolved.max_tokens).await {
+    match call_deepseek(
+        &resolved.api_base,
+        &resolved.api_key,
+        &model,
+        messages,
+        resolved.temperature,
+        resolved.max_tokens,
+    )
+    .await
+    {
         Ok(ds_resp) => {
-            let reply = ds_resp.choices.first()
+            let reply = ds_resp
+                .choices
+                .first()
                 .map(|c| c.message.content.clone())
                 .unwrap_or_else(|| "（AI 未返回内容）".to_string());
-            let usage = ds_resp.usage.map(|u| format!("tokens: {} in / {} out", u.prompt_tokens, u.completion_tokens))
+            let usage = ds_resp
+                .usage
+                .map(|u| {
+                    format!(
+                        "tokens: {} in / {} out",
+                        u.prompt_tokens, u.completion_tokens
+                    )
+                })
                 .unwrap_or_default();
             AppTemplate(ChatMessageFragment {
                 user_message: user_msg,
                 assistant_reply: reply,
                 model,
                 usage_info: usage,
-            }).into_response()
+            })
+            .into_response()
         }
         Err((_, msg)) => AppTemplate(ChatMessageFragment {
             user_message: user_msg,
             assistant_reply: format!("请求失败: {}", msg),
             model,
             usage_info: String::new(),
-        }).into_response(),
+        })
+        .into_response(),
     }
 }
 
@@ -649,7 +747,8 @@ pub async fn agent_briefing_fragment(
             return AppTemplate(BriefingFragment {
                 content: format!("配置错误: {}", msg),
                 model: String::new(),
-            }).into_response();
+            })
+            .into_response();
         }
     };
     let model = resolved.model.clone();
@@ -672,8 +771,14 @@ pub async fn agent_briefing_fragment(
         prompt.push_str("### 待办事项\n\n");
         for (i, t) in todo_items.iter().enumerate() {
             prompt.push_str(&format!("{}. **{}**", i + 1, t.title));
-            if let Some(ref desc) = t.description { if !desc.trim().is_empty() { prompt.push_str(&format!(" — {}", desc)); } }
-            if let Some(ref due) = t.due_date { prompt.push_str(&format!(" (截止: {})", due)); }
+            if let Some(ref desc) = t.description
+                && !desc.trim().is_empty()
+            {
+                prompt.push_str(&format!(" — {}", desc));
+            }
+            if let Some(ref due) = t.due_date {
+                prompt.push_str(&format!(" (截止: {})", due));
+            }
             prompt.push('\n');
         }
         prompt.push('\n');
@@ -682,7 +787,12 @@ pub async fn agent_briefing_fragment(
     if !schedule_items.is_empty() {
         prompt.push_str("### 日程安排\n\n");
         for (i, s) in schedule_items.iter().enumerate() {
-            prompt.push_str(&format!("{}. **{}** (日期: {})", i + 1, s.title, s.due_date.as_deref().unwrap_or("未知")));
+            prompt.push_str(&format!(
+                "{}. **{}** (日期: {})",
+                i + 1,
+                s.title,
+                s.due_date.as_deref().unwrap_or("未知")
+            ));
             prompt.push('\n');
         }
         prompt.push('\n');
@@ -694,16 +804,38 @@ pub async fn agent_briefing_fragment(
 
     prompt.push_str("\n---\n请生成一份专业的每日简报，包含今日概览、优先事项、时间建议和一句鼓励的话。使用 Markdown 格式。");
 
-    let messages = vec![DeepSeekMessage { role: "user".to_string(), content: prompt }];
+    let messages = vec![DeepSeekMessage {
+        role: "user".to_string(),
+        content: prompt,
+    }];
 
-    match call_deepseek(&resolved.api_base, &resolved.api_key, &model, messages, resolved.temperature, resolved.max_tokens).await {
+    match call_deepseek(
+        &resolved.api_base,
+        &resolved.api_key,
+        &model,
+        messages,
+        resolved.temperature,
+        resolved.max_tokens,
+    )
+    .await
+    {
         Ok(ds_resp) => {
-            let briefing = ds_resp.choices.first()
+            let briefing = ds_resp
+                .choices
+                .first()
                 .map(|c| c.message.content.clone())
                 .unwrap_or_else(|| "（AI 未返回内容）".to_string());
-            AppTemplate(BriefingFragment { content: briefing, model }).into_response()
+            AppTemplate(BriefingFragment {
+                content: briefing,
+                model,
+            })
+            .into_response()
         }
-        Err((_, msg)) => AppTemplate(BriefingFragment { content: format!("简报生成失败: {}", msg), model }).into_response(),
+        Err((_, msg)) => AppTemplate(BriefingFragment {
+            content: format!("简报生成失败: {}", msg),
+            model,
+        })
+        .into_response(),
     }
 }
 
@@ -723,7 +855,7 @@ pub async fn agent_settings_form(
     Extension(pool): Extension<SqlitePool>,
     Extension(session): Extension<UserSession>,
 ) -> impl IntoResponse {
-    let row: Option<(Option<String>, Option<String>, Option<String>, Option<f32>, Option<u32>)> = sqlx::query_as(
+    let row: UserSettingsRow = sqlx::query_as(
         "SELECT deepseek_api_key, deepseek_api_base, deepseek_model, temperature, max_tokens FROM user_settings WHERE username = ?"
     )
     .bind(&session.username)
@@ -743,8 +875,16 @@ pub async fn agent_settings_form(
     };
 
     AppTemplate(SettingsFormFragment {
-        api_key_placeholder: if has_key { "已配置（输入新值覆盖）".into() } else { "sk-...".into() },
-        api_key_hint: if has_key { "已配置 API Key（已脱敏保存）".into() } else { "留空则使用服务器全局设置".into() },
+        api_key_placeholder: if has_key {
+            "已配置（输入新值覆盖）".into()
+        } else {
+            "sk-...".into()
+        },
+        api_key_hint: if has_key {
+            "已配置 API Key（已脱敏保存）".into()
+        } else {
+            "留空则使用服务器全局设置".into()
+        },
         api_base,
         model,
         temperature,

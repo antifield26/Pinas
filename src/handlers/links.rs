@@ -6,8 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-use crate::handlers::utils::log_audit;
 use crate::error::{AppError, AppResult};
+use crate::handlers::utils::log_audit;
 use pinas_core::UserSession;
 
 // DTOs
@@ -71,7 +71,16 @@ pub async fn create_link(
         .bind(&payload.icon)
         .execute(&pool)
         .await?;
-    let _ = log_audit(&pool, &session.username, "create_link", Some(&payload.title), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "create_link",
+        Some(&payload.title),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok((StatusCode::CREATED, "链接添加成功"))
 }
 
@@ -83,16 +92,17 @@ pub async fn update_link(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateLinkRequest>,
 ) -> AppResult<(StatusCode, &'static str)> {
-    if let Some(ref url) = payload.url {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(AppError::bad_request("URL必须以http://或https://开头"));
-        }
+    if let Some(ref url) = payload.url
+        && !url.starts_with("http://")
+        && !url.starts_with("https://")
+    {
+        return Err(AppError::bad_request("URL必须以http://或https://开头"));
     }
     // 不允许将标题更新为空字符串
-    if let Some(ref t) = payload.title {
-        if t.trim().is_empty() {
-            return Err(AppError::bad_request("标题不能为空"));
-        }
+    if let Some(ref t) = payload.title
+        && t.trim().is_empty()
+    {
+        return Err(AppError::bad_request("标题不能为空"));
     }
     if payload.title.as_ref().is_none_or(|t| t.trim().is_empty())
         && payload.url.is_none()
@@ -118,7 +128,16 @@ pub async fn update_link(
         return Err(AppError::not_found("记录不存在或无权操作"));
     }
 
-    let _ = log_audit(&pool, &session.username, "update_link", Some(&id.to_string()), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "update_link",
+        Some(&id.to_string()),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok((StatusCode::OK, "链接更新成功"))
 }
 
@@ -139,14 +158,23 @@ pub async fn delete_link(
         return Err(AppError::not_found("记录不存在或无权操作"));
     }
 
-    let _ = log_audit(&pool, &session.username, "delete_link", Some(&id.to_string()), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "delete_link",
+        Some(&id.to_string()),
+        None,
+        None,
+        None,
+    )
+    .await;
     Ok((StatusCode::OK, "链接删除成功"))
 }
 
 // ====== HTMX Fragment 处理器 ======
+use crate::templates::AppTemplate;
 use askama::Template;
 use axum::response::IntoResponse;
-use crate::templates::AppTemplate;
 
 #[derive(Template)]
 #[template(path = "components/link_list.html")]
@@ -165,13 +193,21 @@ struct LinkFormFragment {
 }
 
 fn empty_link_form() -> LinkFormFragment {
-    LinkFormFragment { is_edit: false, id: 0, title: String::new(), url: String::new(), icon: String::new() }
+    LinkFormFragment {
+        is_edit: false,
+        id: 0,
+        title: String::new(),
+        url: String::new(),
+        icon: String::new(),
+    }
 }
 
 fn edit_link_form(item: &LinkItem) -> LinkFormFragment {
     LinkFormFragment {
-        is_edit: true, id: item.id,
-        title: item.title.clone(), url: item.url.clone(),
+        is_edit: true,
+        id: item.id,
+        title: item.title.clone(),
+        url: item.url.clone(),
         icon: item.icon.clone().unwrap_or_default(),
     }
 }
@@ -209,10 +245,23 @@ pub async fn links_create_fragment(
     let icon = form.get("icon").cloned().filter(|s| !s.is_empty());
 
     let _ = sqlx::query("INSERT INTO links (username, title, url, icon) VALUES (?, ?, ?, ?)")
-        .bind(&session.username).bind(&title).bind(&url).bind(&icon)
-        .execute(&pool).await;
+        .bind(&session.username)
+        .bind(&title)
+        .bind(&url)
+        .bind(&icon)
+        .execute(&pool)
+        .await;
 
-    let _ = log_audit(&pool, &session.username, "link_create", Some(&title), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "link_create",
+        Some(&title),
+        None,
+        None,
+        None,
+    )
+    .await;
 
     let links = get_user_links(&pool, &session.username).await;
     AppTemplate(LinkListFragment { links }).into_response()
@@ -235,7 +284,16 @@ pub async fn links_update_fragment(
     .bind(&title).bind(&url).bind(&icon).bind(id).bind(&session.username)
     .execute(&pool).await;
 
-    let _ = log_audit(&pool, &session.username, "link_update", Some(&id.to_string()), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "link_update",
+        Some(&id.to_string()),
+        None,
+        None,
+        None,
+    )
+    .await;
 
     let links = get_user_links(&pool, &session.username).await;
     AppTemplate(LinkListFragment { links })
@@ -248,9 +306,21 @@ pub async fn links_delete_fragment(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let _ = sqlx::query("DELETE FROM links WHERE id = ? AND username = ?")
-        .bind(id).bind(&session.username).execute(&pool).await;
+        .bind(id)
+        .bind(&session.username)
+        .execute(&pool)
+        .await;
 
-    let _ = log_audit(&pool, &session.username, "link_delete", Some(&id.to_string()), None, None, None).await;
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "link_delete",
+        Some(&id.to_string()),
+        None,
+        None,
+        None,
+    )
+    .await;
 
     let links = get_user_links(&pool, &session.username).await;
     AppTemplate(LinkListFragment { links })

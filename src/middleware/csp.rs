@@ -44,10 +44,7 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     );
 
     // 禁止被嵌入 iframe
-    headers.insert(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
 
     // Referrer 策略
     headers.insert(

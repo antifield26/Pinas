@@ -4,13 +4,13 @@
 mod migrations;
 pub mod queries;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::time::Duration;
 use tracing::info;
 
 use crate::config::Config;
 use crate::constants::*;
-use pinas_core::{hash_password, generate_random_password};
+use pinas_core::{generate_random_password, hash_password};
 
 /// 创建 SQLite 连接池（WAL 模式，高并发读）
 pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
@@ -30,7 +30,8 @@ pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::E
         }
     }
 
-    let connection_options = database_url.parse::<SqliteConnectOptions>()?
+    let connection_options = database_url
+        .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
@@ -38,14 +39,20 @@ pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::E
 
     let pool = SqlitePoolOptions::new()
         .max_connections(DB_MAX_CONNECTIONS)
-        .connect_with(connection_options).await?;
+        .connect_with(connection_options)
+        .await?;
 
-    sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await?;
     Ok(pool)
 }
 
 /// 初始化数据库：建表 → 迁移 → 索引 → 默认用户
-pub async fn init(pool: &sqlx::SqlitePool, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn init(
+    pool: &sqlx::SqlitePool,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     init_tables(pool).await?;
     migrations::run(pool).await;
     init_indexes(pool).await?;
@@ -64,8 +71,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             role TEXT NOT NULL,
             quota_mb INTEGER,
             used_mb INTEGER DEFAULT 0
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -73,8 +82,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             username TEXT NOT NULL,
             role TEXT NOT NULL,
             expires_at DATETIME NOT NULL
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS files (
@@ -87,8 +98,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             identifier TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(username, parent_path, name)
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS upload_chunks (
@@ -98,8 +111,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             total_chunks INTEGER NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(username, identifier)
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS shares (
@@ -113,8 +128,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             has_password INTEGER DEFAULT 0,
             download_count INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS trash (
@@ -123,8 +140,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             original_path TEXT NOT NULL,
             trash_uuid TEXT NOT NULL,
             deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS audit_logs (
@@ -136,8 +155,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             ip_address TEXT,
             user_agent TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS links (
@@ -149,8 +170,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             sort_order INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS todos (
@@ -168,8 +191,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS user_settings (
@@ -178,8 +203,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             deepseek_api_base TEXT,
             deepseek_model TEXT,
             FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     // AI 对话管理
     sqlx::query(
@@ -190,8 +217,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -201,8 +230,10 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             content TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-        )"
-    ).execute(pool).await?;
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -234,17 +265,29 @@ async fn init_indexes(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
 
 /// 为用户存储或更新密码哈希（env 设置→UPDATE，首次运行→INSERT，否则跳过）
 async fn sync_user_password(
-    pool: &sqlx::SqlitePool, username: &str, role: &str,
-    env_pwd: Option<&str>, is_first_run: bool, quota_mb: i64,
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    role: &str,
+    env_pwd: Option<&str>,
+    is_first_run: bool,
+    quota_mb: i64,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match env_pwd.filter(|p| !p.is_empty()) {
         Some(pwd) => {
             let hash = hash_password(pwd)?;
             let exists = sqlx::query("SELECT 1 FROM users WHERE username = ?")
-                .bind(username).fetch_optional(pool).await?.is_some();
+                .bind(username)
+                .fetch_optional(pool)
+                .await?
+                .is_some();
             if exists {
-                sqlx::query("UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?")
-                    .bind(&hash).bind(username).execute(pool).await?;
+                sqlx::query(
+                    "UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?",
+                )
+                .bind(&hash)
+                .bind(username)
+                .execute(pool)
+                .await?;
                 info!("[Init] {} 密码已从环境变量同步更新", username);
             } else {
                 sqlx::query("INSERT INTO users (username, password, role, quota_mb, must_change_pwd) VALUES (?, ?, ?, ?, 0)")
@@ -254,9 +297,16 @@ async fn sync_user_password(
         }
         None if is_first_run => {
             let pwd = generate_random_password();
-            let label = if username == ROLE_ADMIN { "管理员" } else { "访客" };
+            let label = if username == ROLE_ADMIN {
+                "管理员"
+            } else {
+                "访客"
+            };
             tracing::warn!("══════════════════════════════════════════════════");
-            tracing::warn!("  未设置 PINAS_{}_PASSWORD 环境变量", username.to_uppercase());
+            tracing::warn!(
+                "  未设置 PINAS_{}_PASSWORD 环境变量",
+                username.to_uppercase()
+            );
             tracing::warn!("  已自动生成{}随机密码: {}", label, pwd);
             tracing::warn!("  请立即登录并修改密码！");
             tracing::warn!("══════════════════════════════════════════════════");
@@ -269,20 +319,35 @@ async fn sync_user_password(
     }
 }
 
-async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn init_default_users(
+    pool: &sqlx::SqlitePool,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(pool).await.unwrap_or(0);
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
     let is_first_run = user_count == 0;
 
     let admin_pwd = sync_user_password(
-        pool, ROLE_ADMIN, ROLE_ADMIN,
-        config.admin_password.as_deref(), is_first_run, config.default_quota_mb,
-    ).await?;
+        pool,
+        ROLE_ADMIN,
+        ROLE_ADMIN,
+        config.admin_password.as_deref(),
+        is_first_run,
+        config.default_quota_mb,
+    )
+    .await?;
 
     let guest_pwd = sync_user_password(
-        pool, "guest", ROLE_USER,
-        config.guest_password.as_deref(), is_first_run, config.default_quota_mb,
-    ).await?;
+        pool,
+        "guest",
+        ROLE_USER,
+        config.guest_password.as_deref(),
+        is_first_run,
+        config.default_quota_mb,
+    )
+    .await?;
 
     if is_first_run {
         tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, ROLE_ADMIN)).await?;
@@ -290,22 +355,29 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
         info!("✅ 已初始化默认账号");
 
         // 自动生成的密码写 credentials.txt 兜底（仅本用户可读，登录后应立即删除）
-        let admin_is_auto = config.admin_password.as_deref().is_none_or(|p| p.is_empty());
+        let admin_is_auto = config
+            .admin_password
+            .as_deref()
+            .is_none_or(|p| p.is_empty());
         if admin_is_auto && let (Some(ap), Some(gp)) = (&admin_pwd, &guest_pwd) {
             let _ = tokio::fs::write(
                 "credentials.txt",
                 format!("管理员: admin / {}\n访客: guest / {}\n", ap, gp),
-            ).await;
+            )
+            .await;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = tokio::fs::set_permissions(
                     "credentials.txt",
                     std::fs::Permissions::from_mode(0o600),
-                ).await;
+                )
+                .await;
             }
             info!("自动生成的密码已保存到 credentials.txt（权限 600）");
-            tracing::warn!("请立即使用自动生成的密码登录并修改密码，然后删除 credentials.txt 文件！");
+            tracing::warn!(
+                "请立即使用自动生成的密码登录并修改密码，然后删除 credentials.txt 文件！"
+            );
         }
     }
 
@@ -314,7 +386,9 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
 
 /// 测试专用：在内存数据库中创建所有表（不含默认用户，不创建文件系统目录）
 pub async fn init_test_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(pool)
+        .await?;
     init_tables(pool).await?;
     migrations::run(pool).await;
     Ok(())

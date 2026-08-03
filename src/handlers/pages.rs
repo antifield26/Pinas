@@ -1,8 +1,8 @@
 // ====== HTMX 页面路由处理器 ======
+use crate::templates::{AppTemplate, NavItem, nav_items};
 use askama::Template;
 use axum::{extract::Extension, response::IntoResponse};
 use pinas_core::UserSession;
-use crate::templates::{AppTemplate, NavItem, nav_items};
 
 // ====== 页面模板结构体（继承 base.html） ======
 
@@ -45,11 +45,14 @@ fn page_context(session: &UserSession, page: &str) -> impl FnOnce() -> (String, 
 
 macro_rules! page_handler {
     ($func:ident, $PageType:ident, $page:expr) => {
-        pub async fn $func(
-            Extension(session): Extension<UserSession>,
-        ) -> impl IntoResponse {
+        pub async fn $func(Extension(session): Extension<UserSession>) -> impl IntoResponse {
             let (username, is_admin, current_page) = page_context(&session, $page)();
-            AppTemplate($PageType { username, is_admin, current_page, nav: nav_items(is_admin) })
+            AppTemplate($PageType {
+                username,
+                is_admin,
+                current_page,
+                nav: nav_items(is_admin),
+            })
         }
     };
 }

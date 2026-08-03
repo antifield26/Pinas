@@ -8,13 +8,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{
-    is_allowed_mime,
-    is_allowed_mime_streaming,
-    is_blocked_extension,
-    safe_join_sandbox,
-    user_dir_path,
-    log_audit,
-    bytes_to_mb_ceil,
+    bytes_to_mb_ceil, is_allowed_mime, is_allowed_mime_streaming, is_blocked_extension, log_audit,
+    safe_join_sandbox, user_dir_path,
 };
 use pinas_core::UserSession;
 
@@ -54,10 +49,16 @@ struct MergeCleanup {
 
 impl MergeCleanup {
     fn new(target_file: std::path::PathBuf, tmp_dir: String) -> Self {
-        Self { target_file, tmp_dir, armed: true }
+        Self {
+            target_file,
+            tmp_dir,
+            armed: true,
+        }
     }
     /// 提交成功，取消清理
-    fn disarm(&mut self) { self.armed = false; }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for MergeCleanup {
@@ -80,13 +81,14 @@ pub async fn check_chunk(
     validate_identifier(identifier)?;
 
     // 检查文件是否已完全上传（通过文件的 content identifier 匹配）
-    let file_exists = sqlx::query("SELECT 1 FROM files WHERE username = ? AND identifier = ? LIMIT 1")
-        .bind(username)
-        .bind(identifier)
-        .fetch_optional(&pool)
-        .await
-        .unwrap_or(None)
-        .is_some();
+    let file_exists =
+        sqlx::query("SELECT 1 FROM files WHERE username = ? AND identifier = ? LIMIT 1")
+            .bind(username)
+            .bind(identifier)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None)
+            .is_some();
 
     if file_exists {
         return Ok(Json(CheckResponse {
@@ -101,10 +103,10 @@ pub async fn check_chunk(
     let mut uploaded_chunks = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(idx_str) = entry.file_name().to_str() {
-                if let Ok(idx) = idx_str.parse::<i32>() {
-                    uploaded_chunks.push(idx);
-                }
+            if let Some(idx_str) = entry.file_name().to_str()
+                && let Ok(idx) = idx_str.parse::<i32>()
+            {
+                uploaded_chunks.push(idx);
             }
         }
     }
@@ -123,7 +125,9 @@ use crate::constants::MAX_CHUNK_SIZE_BYTES as MAX_CHUNK_SIZE;
 /// 校验上传标识符安全性（仅允许字母数字及连字符，防止路径穿越）
 fn validate_identifier(identifier: &str) -> AppResult<()> {
     if identifier.is_empty()
-        || !identifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || !identifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return Err(AppError::bad_request("非法的文件标识符"));
     }
@@ -138,8 +142,12 @@ pub async fn upload_chunk(
 ) -> AppResult<(StatusCode, &'static str)> {
     // 速率限制：每个用户每分钟最多 120 个分片（2 GB/min）
     if !crate::handlers::rate_limit::check_rate_limit(
-        &session.username, 120, std::time::Duration::from_secs(60)
-    ).await {
+        &session.username,
+        120,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    {
         return Err(AppError::TooManyRequests("上传过于频繁，请稍后再试".into()));
     }
 
@@ -178,7 +186,10 @@ pub async fn upload_chunk(
 
                 // 首个分片：保留前 512 字节用于 MIME 检测
                 if is_first_chunk && mime_read < crate::constants::MIME_HEADER_BUF_SIZE {
-                    let to_copy = std::cmp::min(chunk.len(), crate::constants::MIME_HEADER_BUF_SIZE - mime_read);
+                    let to_copy = std::cmp::min(
+                        chunk.len(),
+                        crate::constants::MIME_HEADER_BUF_SIZE - mime_read,
+                    );
                     mime_buf[mime_read..mime_read + to_copy].copy_from_slice(&chunk[..to_copy]);
                     mime_read += to_copy;
                 }
@@ -204,7 +215,7 @@ pub async fn upload_chunk(
 
     // 记录总分数（若不存在则插入）
     let _ = sqlx::query(
-        "INSERT OR IGNORE INTO upload_chunks (username, identifier, total_chunks) VALUES (?, ?, ?)"
+        "INSERT OR IGNORE INTO upload_chunks (username, identifier, total_chunks) VALUES (?, ?, ?)",
     )
     .bind(&session.username)
     .bind(&params.identifier)
@@ -224,13 +235,15 @@ pub async fn merge_chunks(
 ) -> AppResult<(StatusCode, &'static str)> {
     let username = &session.username;
     if is_blocked_extension(&payload.file_name) {
-        return Err(AppError::forbidden("安全策略阻断：不允许上传高危执行文件扩展名"));
+        return Err(AppError::forbidden(
+            "安全策略阻断：不允许上传高危执行文件扩展名",
+        ));
     }
     validate_identifier(&payload.identifier)?;
 
     // 从数据库获取总分片数（可选，也可直接从文件系统推断）
     let total_chunks: Option<i32> = sqlx::query_scalar(
-        "SELECT total_chunks FROM upload_chunks WHERE username = ? AND identifier = ?"
+        "SELECT total_chunks FROM upload_chunks WHERE username = ? AND identifier = ?",
     )
     .bind(username)
     .bind(&payload.identifier)
@@ -243,10 +256,10 @@ pub async fn merge_chunks(
     let mut chunks = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(idx_str) = entry.file_name().to_str() {
-                if let Ok(idx) = idx_str.parse::<i32>() {
-                    chunks.push(idx);
-                }
+            if let Some(idx_str) = entry.file_name().to_str()
+                && let Ok(idx) = idx_str.parse::<i32>()
+            {
+                chunks.push(idx);
             }
         }
     }
@@ -256,12 +269,14 @@ pub async fn merge_chunks(
     chunks.sort();
 
     // 如果已知总分片数，校验是否完整
-    if let Some(total) = total_chunks {
-        if chunks.len() != total as usize {
-            return Err(AppError::bad_request(format!(
-                "分片不完整，已上传 {} 个，预期 {} 个", chunks.len(), total
-            )));
-        }
+    if let Some(total) = total_chunks
+        && chunks.len() != total as usize
+    {
+        return Err(AppError::bad_request(format!(
+            "分片不完整，已上传 {} 个，预期 {} 个",
+            chunks.len(),
+            total
+        )));
     }
 
     let parent_path = user_dir_path(Some(payload.parent_path));
@@ -280,9 +295,11 @@ pub async fn merge_chunks(
     // 按顺序合并所有分片
     for idx in chunks {
         let chunk_path = format!("{}/{}", tmp_dir, idx);
-        let mut chunk_file = tokio::fs::File::open(&chunk_path).await
+        let mut chunk_file = tokio::fs::File::open(&chunk_path)
+            .await
             .map_err(|e| AppError::internal_log(format!("读取分片 {idx}"), e))?;
-        tokio::io::copy(&mut chunk_file, &mut out_file).await
+        tokio::io::copy(&mut chunk_file, &mut out_file)
+            .await
             .map_err(|e| AppError::internal_log(format!("合并分片 {idx}"), e))?;
     }
     let _ = out_file.flush().await;
@@ -301,25 +318,32 @@ pub async fn merge_chunks(
     let file_size_mb_ceil = bytes_to_mb_ceil(meta);
 
     // 使用事务避免 TOCTOU 竞态：在事务内原子地检查并扣减配额
-    let mut tx = pool.begin().await.map_err(|e| AppError::internal_log("开启配额事务", e))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::internal_log("开启配额事务", e))?;
 
     // 在事务内原子读取 used_mb + quota_mb
-    let (current_used, quota): (i64, i64) = sqlx::query_as(
-        "SELECT used_mb, quota_mb FROM users WHERE username = ?"
-    )
-    .bind(username)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| AppError::internal_log("查询用户配额", e))?
-    .ok_or_else(|| AppError::not_found("用户不存在"))?;
+    let (current_used, quota): (i64, i64) =
+        sqlx::query_as("SELECT used_mb, quota_mb FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::internal_log("查询用户配额", e))?
+            .ok_or_else(|| AppError::not_found("用户不存在"))?;
 
     if current_used + file_size_mb_ceil > quota {
-        return Err(AppError::forbidden(format!("存储空间不足，配额 {} MB，已使用 {} MB", quota, current_used)));
+        return Err(AppError::forbidden(format!(
+            "存储空间不足，配额 {} MB，已使用 {} MB",
+            quota, current_used
+        )));
     }
 
     // 完整文件 MIME 检测（安全增强）
-    if !is_allowed_mime_streaming(&target_file_path).await
-        .map_err(|e| AppError::internal_log("文件完整性检测", e))? {
+    if !is_allowed_mime_streaming(&target_file_path)
+        .await
+        .map_err(|e| AppError::internal_log("文件完整性检测", e))?
+    {
         return Err(AppError::forbidden("完整文件安全检测未通过：非法内容"));
     }
 
@@ -345,7 +369,9 @@ pub async fn merge_chunks(
         .await
         .map_err(|e| AppError::internal_log("更新用户容量", e))?;
 
-    tx.commit().await.map_err(|e| AppError::internal_log("提交配额事务", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::internal_log("提交配额事务", e))?;
 
     // 提交成功 — 取消自动清理
     cleanup.disarm();
@@ -357,7 +383,16 @@ pub async fn merge_chunks(
         format!("{}/{}", parent_path, payload.file_name)
     };
     let details = format!("{:.2} MB", file_size_mb_exact);
-    let _ = log_audit(&pool, username, "upload", Some(&target), Some(&details), None, None).await;
+    let _ = log_audit(
+        &pool,
+        username,
+        "upload",
+        Some(&target),
+        Some(&details),
+        None,
+        None,
+    )
+    .await;
 
     Ok((StatusCode::OK, "文件上传合并成功"))
 }

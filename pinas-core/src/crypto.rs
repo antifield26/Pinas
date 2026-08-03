@@ -29,7 +29,8 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 
 /// 使用安全随机数生成器生成随机密码
 pub fn generate_random_password() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
+    const CHARSET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
     const LEN: usize = 24;
     let mut buf = [0u8; LEN];
     getrandom::fill(&mut buf).expect("RNG failure");

@@ -1,17 +1,17 @@
 use axum::{
     body::Body,
     extract::{Extension, Path, Query},
-    http::{header, HeaderMap, HeaderValue, StatusCode, Request},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
-use tokio::io::{AsyncSeekExt, AsyncReadExt};
 
-use crate::handlers::utils::{safe_join_sandbox, user_dir_path, update_user_used_mb, log_audit};
 use crate::handlers::BatchDownloadRequest;
+use crate::handlers::utils::{log_audit, safe_join_sandbox, update_user_used_mb, user_dir_path};
 use pinas_core::UserSession;
 
 #[derive(Deserialize)]
@@ -38,18 +38,26 @@ pub async fn get_file_content_handler(
     let full_p = safe_join_sandbox(base_path, &format!("{}/{}", username, query.path));
 
     // 检查文件大小，防止读取超大文件耗尽内存
-    if let Ok(meta) = tokio::fs::metadata(&full_p).await {
-        if meta.len() > MAX_EDITOR_READ_SIZE {
-            return (StatusCode::BAD_REQUEST,
-                format!("文件过大（{} MB），编辑器最大支持 {} MB",
-                    meta.len() / 1024 / 1024, MAX_EDITOR_READ_SIZE / 1024 / 1024)
-            ).into_response();
-        }
+    if let Ok(meta) = tokio::fs::metadata(&full_p).await
+        && meta.len() > MAX_EDITOR_READ_SIZE
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "文件过大（{} MB），编辑器最大支持 {} MB",
+                meta.len() / 1024 / 1024,
+                MAX_EDITOR_READ_SIZE / 1024 / 1024
+            ),
+        )
+            .into_response();
     }
 
     match tokio::fs::read_to_string(&full_p).await {
         Ok(text) => (StatusCode::OK, text).into_response(),
-        Err(e) => { tracing::error!("[Media] 读取文件失败: {}", e); (StatusCode::NOT_FOUND, "文件不可读或非文本类型").into_response() },
+        Err(e) => {
+            tracing::error!("[Media] 读取文件失败: {}", e);
+            (StatusCode::NOT_FOUND, "文件不可读或非文本类型").into_response()
+        }
     }
 }
 
@@ -63,7 +71,14 @@ pub async fn save_file_content_handler(
     Json(payload): Json<EditSaveRequest>,
 ) -> impl IntoResponse {
     if payload.content.len() > MAX_EDIT_SIZE {
-        return (StatusCode::BAD_REQUEST, format!("文件过大，编辑器最大支持 {} MB", MAX_EDIT_SIZE / 1024 / 1024)).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "文件过大，编辑器最大支持 {} MB",
+                MAX_EDIT_SIZE / 1024 / 1024
+            ),
+        )
+            .into_response();
     }
 
     let username = &session.username;
@@ -71,24 +86,53 @@ pub async fn save_file_content_handler(
     let full_p = safe_join_sandbox(base_path, &format!("{}/{}", username, payload.path));
 
     if let Err(e) = tokio::fs::write(&full_p, payload.content.as_bytes()).await {
-        tracing::error!("[Media] 写入文件失败: {}", e); return (StatusCode::INTERNAL_SERVER_ERROR, "写入文件失败，请重试").into_response();
+        tracing::error!("[Media] 写入文件失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "写入文件失败，请重试").into_response();
     }
 
     let p = std::path::Path::new(&payload.path);
-    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let parent = p.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string();
-    let parent_cleaned = if parent == "/" { "".to_string() } else { parent };
+    let name = p
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let parent = p
+        .parent()
+        .unwrap_or(std::path::Path::new(""))
+        .to_string_lossy()
+        .to_string();
+    let parent_cleaned = if parent == "/" {
+        "".to_string()
+    } else {
+        parent
+    };
 
     let meta = full_p.metadata().map(|m| m.len()).unwrap_or(0);
     let size_mb_exact = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
 
-    let _ = sqlx::query("UPDATE files SET size_mb = ? WHERE username = ? AND name = ? AND parent_path = ?")
-        .bind(size_mb_exact).bind(username).bind(&name).bind(&parent_cleaned).execute(&pool).await;
+    let _ = sqlx::query(
+        "UPDATE files SET size_mb = ? WHERE username = ? AND name = ? AND parent_path = ?",
+    )
+    .bind(size_mb_exact)
+    .bind(username)
+    .bind(&name)
+    .bind(&parent_cleaned)
+    .execute(&pool)
+    .await;
 
     let _ = update_user_used_mb(&pool, username).await;
 
     // 审计日志：保存文件
-    let _ = log_audit(&pool, username, "edit_save", Some(&payload.path), Some(&format!("{:.2} MB", size_mb_exact)), None, None).await;
+    let _ = log_audit(
+        &pool,
+        username,
+        "edit_save",
+        Some(&payload.path),
+        Some(&format!("{:.2} MB", size_mb_exact)),
+        None,
+        None,
+    )
+    .await;
 
     (StatusCode::OK, "在线保存成功").into_response()
 }
@@ -114,28 +158,43 @@ pub async fn media_proxy(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let file_size = metadata.len();
-    let mime = normalize_media_mime(&full_path, mime_guess::from_path(&full_path).first_or_octet_stream());
+    let mime = normalize_media_mime(
+        &full_path,
+        mime_guess::from_path(&full_path).first_or_octet_stream(),
+    );
 
     // HEAD 请求：仅返回元数据头（浏览器用于探测 Range 支持）
     if req.method() == axum::http::Method::HEAD {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, mime.to_string().parse().unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")));
+        headers.insert(
+            header::CONTENT_TYPE,
+            mime.to_string()
+                .parse()
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+        );
         headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(file_size));
         return (StatusCode::OK, headers).into_response();
     }
 
-    let range_header = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok());
+    let range_header = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok());
     let (start, end, status) = if let Some(range_value) = range_header {
         if let Some((start, end)) = parse_range(range_value, file_size) {
             (start, end, StatusCode::PARTIAL_CONTENT)
         } else {
-            return (StatusCode::RANGE_NOT_SATISFIABLE,HeaderMap::new()).into_response();
+            return (StatusCode::RANGE_NOT_SATISFIABLE, HeaderMap::new()).into_response();
         }
     } else {
         // 无 Range 头时仅返回前 2 MB，避免一次性流式传输整个大文件
         // 浏览器获取元数据后会自动发送 Range 请求获取更多数据
-        (0, (file_size - 1).min(2 * 1024 * 1024 - 1), StatusCode::PARTIAL_CONTENT)
+        (
+            0,
+            (file_size - 1).min(2 * 1024 * 1024 - 1),
+            StatusCode::PARTIAL_CONTENT,
+        )
     };
 
     let length = end - start + 1;
@@ -153,23 +212,39 @@ pub async fn media_proxy(
     let body = Body::from_stream(stream);
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, mime.to_string().parse().unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")));
+    headers.insert(
+        header::CONTENT_TYPE,
+        mime.to_string()
+            .parse()
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     // 禁用 gzip 压缩 — 视频/音频已是压缩格式，再压缩会缓冲整个响应导致无法 seek
-    headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
+    headers.insert(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
 
     if status == StatusCode::PARTIAL_CONTENT {
         let content_range = format!("bytes {}-{}/{}", start, end, file_size);
-        headers.insert(header::CONTENT_RANGE, HeaderValue::from_str(&content_range).unwrap_or_else(|_| HeaderValue::from_static("bytes */0")));
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range)
+                .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+        );
     }
 
     (status, headers, body).into_response()
 }
 
 /// 将非浏览器的 MIME 类型规范化映射为浏览器兼容的类型
-fn normalize_media_mime(path: &std::path::Path, default_mime: mime_guess::Mime) -> mime_guess::Mime {
-    let ext = path.extension()
+fn normalize_media_mime(
+    path: &std::path::Path,
+    default_mime: mime_guess::Mime,
+) -> mime_guess::Mime {
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
@@ -269,7 +344,16 @@ pub async fn download_zip(
     } else {
         parent_path.clone()
     };
-    let _ = log_audit(&pool, &username, "download_zip", Some(&target), Some(&details), None, None).await;
+    let _ = log_audit(
+        &pool,
+        &username,
+        "download_zip",
+        Some(&target),
+        Some(&details),
+        None,
+        None,
+    )
+    .await;
 
     let temp_dir = std::env::temp_dir();
     let temp_file_name = format!("zip_{}.tmp", Uuid::new_v4());
@@ -286,28 +370,37 @@ pub async fn download_zip(
         for (name, full_path) in items {
             if full_path.is_file() {
                 let mut file = std::fs::File::open(&full_path).map_err(|e| e.to_string())?;
-                zip_writer.start_file(&name, options).map_err(|e| e.to_string())?;
+                zip_writer
+                    .start_file(&name, options)
+                    .map_err(|e| e.to_string())?;
                 std::io::copy(&mut file, &mut zip_writer).map_err(|e| e.to_string())?;
             } else if full_path.is_dir() {
-                zip_writer.add_directory(&name, SimpleFileOptions::default())
+                zip_writer
+                    .add_directory(&name, SimpleFileOptions::default())
                     .map_err(|e| e.to_string())?;
                 add_dir_to_zip_sync(&mut zip_writer, &full_path, &name, options)?;
             }
         }
         zip_writer.finish().map_err(|e| e.to_string())?;
         Ok(())
-    }).await;
+    })
+    .await;
 
     let zip_inner = match zip_result {
         Ok(inner) => inner,
         Err(join_err) => {
             let _ = tokio::fs::remove_file(&temp_path_clone).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("压缩任务失败: {}", join_err)).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("压缩任务失败: {}", join_err),
+            )
+                .into_response();
         }
     };
     if let Err(e) = zip_inner {
         let _ = tokio::fs::remove_file(&temp_path_clone).await;
-        tracing::error!("[Media] 压缩失败: {}", e); return (StatusCode::INTERNAL_SERVER_ERROR, "文件压缩失败，请重试").into_response();
+        tracing::error!("[Media] 压缩失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "文件压缩失败，请重试").into_response();
     }
 
     match tokio::fs::File::open(&temp_path_clone).await {
@@ -322,13 +415,19 @@ pub async fn download_zip(
             let body = Body::from_stream(stream);
             let headers = [
                 ("content-type", "application/zip"),
-                ("content-disposition", "attachment; filename=\"cloud_download.zip\""),
+                (
+                    "content-disposition",
+                    "attachment; filename=\"cloud_download.zip\"",
+                ),
             ];
             (StatusCode::OK, headers, body).into_response()
         }
         Err(e) => {
             let _ = tokio::fs::remove_file(&temp_path_clone).await;
-            { tracing::error!("[Media] 临时文件失败: {}", e); (StatusCode::INTERNAL_SERVER_ERROR, "文件操作失败，请重试").into_response() }
+            {
+                tracing::error!("[Media] 临时文件失败: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "文件操作失败，请重试").into_response()
+            }
         }
     }
 }
@@ -347,10 +446,13 @@ fn add_dir_to_zip_sync(
         let zip_name = format!("{}/{}", zip_prefix, name);
         if path.is_file() {
             let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            zip_writer.start_file(&zip_name, options).map_err(|e| e.to_string())?;
+            zip_writer
+                .start_file(&zip_name, options)
+                .map_err(|e| e.to_string())?;
             std::io::copy(&mut file, zip_writer).map_err(|e| e.to_string())?;
         } else if path.is_dir() {
-            zip_writer.add_directory(&zip_name, SimpleFileOptions::default())
+            zip_writer
+                .add_directory(&zip_name, SimpleFileOptions::default())
                 .map_err(|e| e.to_string())?;
             add_dir_to_zip_sync(zip_writer, &path, &zip_name, options)?;
         }

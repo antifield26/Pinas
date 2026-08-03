@@ -1,15 +1,12 @@
 // ====== 路由注册 ======
 use axum::{
-    extract::DefaultBodyLimit,
-    routing::{get, post, put, delete},
-    middleware,
     Extension, Router,
+    extract::DefaultBodyLimit,
     http::{HeaderValue, header},
+    middleware,
+    routing::{delete, get, post, put},
 };
-use tower_http::{
-    compression::CompressionLayer,
-    set_header::SetResponseHeaderLayer,
-};
+use tower_http::{compression::CompressionLayer, set_header::SetResponseHeaderLayer};
 
 use crate::config::Config;
 use crate::constants::*;
@@ -62,12 +59,18 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/api/files/download_zip", post(handlers::download_zip))
         // HTMX Drive fragment routes
         .route("/drive/list", get(handlers::drive_list_fragment))
-        .route("/drive/breadcrumbs", get(handlers::drive_breadcrumbs_fragment))
+        .route(
+            "/drive/breadcrumbs",
+            get(handlers::drive_breadcrumbs_fragment),
+        )
         .route("/drive/quota", get(handlers::drive_quota_fragment))
         .route("/drive/create-folder", post(handlers::drive_create_folder))
         .route("/drive/delete", post(handlers::drive_delete_item))
         .route("/drive/upload-form", get(handlers::drive_upload_form))
-        .route("/drive/new-folder-form", get(handlers::drive_new_folder_form))
+        .route(
+            "/drive/new-folder-form",
+            get(handlers::drive_new_folder_form),
+        )
         .route("/drive/rename-form", get(handlers::drive_rename_form))
         .route("/drive/rename", post(handlers::drive_rename_item))
         .route("/drive/move-form", get(handlers::drive_move_form))
@@ -81,9 +84,15 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/api/edit/get", get(handlers::get_file_content_handler))
         .route("/api/edit/save", post(handlers::save_file_content_handler))
         .route("/api/system/status", get(handlers::get_system_status))
-        .route("/home/system-monitor", get(handlers::system_monitor_fragment))
+        .route(
+            "/home/system-monitor",
+            get(handlers::system_monitor_fragment),
+        )
         .route("/api/minecraft/status", get(handlers::get_minecraft_status))
-        .route("/home/minecraft-status", get(handlers::minecraft_status_fragment))
+        .route(
+            "/home/minecraft-status",
+            get(handlers::minecraft_status_fragment),
+        )
         .route("/api/share/create", post(handlers::create_share))
         .route("/api/share/list", get(handlers::list_shares))
         .route("/api/share/delete", post(handlers::delete_share))
@@ -91,11 +100,17 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/api/trash/restore", post(handlers::restore_trash))
         .route("/api/trash/delete", post(handlers::delete_trash_permanent))
         .route("/api/trash/clear", post(handlers::clear_trash))
-        .route("/api/media/{*path}", get(handlers::media_proxy).head(handlers::media_proxy))
+        .route(
+            "/api/media/{*path}",
+            get(handlers::media_proxy).head(handlers::media_proxy),
+        )
         .route("/api/admin/quota", get(handlers::get_user_quota))
         .route("/api/admin/quota", post(handlers::set_user_quota))
         .route("/api/admin/users", get(handlers::list_users))
-        .route("/api/admin/user/reset_password", post(handlers::reset_user_password))
+        .route(
+            "/api/admin/user/reset_password",
+            post(handlers::reset_user_password),
+        )
         .route("/api/admin/audit", get(handlers::get_audit_logs))
         .route("/api/admin/backup", post(handlers::create_backup))
         .route("/api/admin/backup/list", get(handlers::list_backups))
@@ -129,13 +144,22 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/agent/chat", post(handlers::agent_chat_fragment))
         .route("/agent/briefing", post(handlers::agent_briefing_fragment))
         .route("/agent/settings-form", get(handlers::agent_settings_form))
-        .route("/agent/conversations", get(handlers::conversation_list_fragment))
+        .route(
+            "/agent/conversations",
+            get(handlers::conversation_list_fragment),
+        )
         .route("/api/agent/settings", get(handlers::get_agent_settings))
         .route("/api/agent/settings", put(handlers::save_agent_settings))
         .route("/api/conversations", get(handlers::list_conversations))
         .route("/api/conversations", post(handlers::create_conversation))
-        .route("/api/conversations/{id}", put(handlers::rename_conversation))
-        .route("/api/conversations/{id}", delete(handlers::delete_conversation))
+        .route(
+            "/api/conversations/{id}",
+            put(handlers::rename_conversation),
+        )
+        .route(
+            "/api/conversations/{id}",
+            delete(handlers::delete_conversation),
+        )
         .layer(middleware::from_fn(pinas_core::auth::auth_middleware));
 
     // --- 静态文件服务（24h 缓存） ---
