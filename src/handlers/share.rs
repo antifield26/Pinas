@@ -139,20 +139,21 @@ pub async fn share_page(
     Query(params): Query<AccessShareRequest>,
 ) -> impl IntoResponse {
     let code = &share_id;
-    // Look up share info
+    // Look up share info（username 用于解析文件真实路径）
     let share = sqlx::query(
-        "SELECT file_path, password, expires_at FROM shares WHERE code = ?"
+        "SELECT file_path, password, expires_at, username FROM shares WHERE code = ?"
     )
     .bind(code)
     .fetch_optional(&pool)
     .await
     .unwrap_or(None);
 
-    let (file_path_str, stored_password, expires_at): (String, Option<String>, Option<String>) = match share {
+    let (file_path_str, stored_password, expires_at, owner): (String, Option<String>, Option<String>, String) = match share {
         Some(row) => (
             row.get::<String, _>(0),
             row.get::<Option<String>, _>(1),
             row.get::<Option<String>, _>(2),
+            row.get::<String, _>(3),
         ),
         None => return (StatusCode::NOT_FOUND, "分享链接不存在或已失效").into_response(),
     };
@@ -191,9 +192,9 @@ pub async fn share_page(
         }).into_response();
     }
 
-    // Check if it's a directory
+    // Check if it's a directory（真实路径 = uploads/{owner}/{file_path}，与 share_subfile 一致）
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_path = crate::handlers::utils::safe_join_sandbox(base, &file_path_str);
+    let full_path = crate::handlers::utils::safe_join_sandbox(base, &format!("{}/{}", owner, file_path_str));
     let is_dir = full_path.is_dir();
     let file_size;
     let file_count;

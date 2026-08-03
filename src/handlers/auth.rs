@@ -193,9 +193,10 @@ pub async fn login(
     (StatusCode::UNAUTHORIZED, "账号或访问密码校验失败").into_response()
 }
 
-#[tracing::instrument(skip(pool, headers, payload))]
+#[tracing::instrument(skip(pool, config, headers, payload))]
 pub async fn register(
     Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(config): Extension<Config>,
     headers: HeaderMap,
     Json(payload): Json<RegisterRequest>,
 ) -> impl IntoResponse {
@@ -232,10 +233,12 @@ pub async fn register(
     let role = if count == 0 { ROLE_ADMIN } else { ROLE_USER };
 
     // 直接 INSERT，依赖 UNIQUE 约束防止 TOCTOU 竞态
-    let insert_result = sqlx::query("INSERT INTO users (username, password, role) VALUES (?, ?, ?)")
+    // quota_mb 显式写入默认配额（否则 NULL 被当作 0，注册用户将无法上传）
+    let insert_result = sqlx::query("INSERT INTO users (username, password, role, quota_mb) VALUES (?, ?, ?, ?)")
         .bind(&payload.username)
         .bind(&hashed_password)
         .bind(role)
+        .bind(config.default_quota_mb)
         .execute(&pool)
         .await;
 
