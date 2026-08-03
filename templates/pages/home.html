@@ -9,8 +9,8 @@
 {% block content %}
 <div class="space-y-8">
 
-  <!-- 系统监控 + Minecraft 状态 -->
-  <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+  <!-- 系统监控 + Minecraft 状态（单列上下排布：PC 双列时面板宽度不足导致"内存/温度"标签换行） -->
+  <div class="grid grid-cols-1 gap-6">
     {% if is_admin %}
     <div id="system-monitor"
          hx-get="/home/system-monitor" hx-trigger="load, every 1s" hx-swap="innerHTML"
