@@ -289,16 +289,23 @@ async fn init_default_users(pool: &sqlx::SqlitePool, config: &Config) -> Result<
         tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "guest")).await?;
         info!("✅ 已初始化默认账号");
 
-        // 自动生成的密码写 credentials.txt 兜底
+        // 自动生成的密码写 credentials.txt 兜底（仅本用户可读，登录后应立即删除）
         let admin_is_auto = config.admin_password.as_deref().is_none_or(|p| p.is_empty());
-        if admin_is_auto {
-            if let (Some(ap), Some(gp)) = (&admin_pwd, &guest_pwd) {
-                let _ = tokio::fs::write(
+        if admin_is_auto && let (Some(ap), Some(gp)) = (&admin_pwd, &guest_pwd) {
+            let _ = tokio::fs::write(
+                "credentials.txt",
+                format!("管理员: admin / {}\n访客: guest / {}\n", ap, gp),
+            ).await;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = tokio::fs::set_permissions(
                     "credentials.txt",
-                    format!("管理员: admin / {}\n访客: guest / {}\n", ap, gp),
+                    std::fs::Permissions::from_mode(0o600),
                 ).await;
-                info!("自动生成的密码已保存到 credentials.txt");
             }
+            info!("自动生成的密码已保存到 credentials.txt（权限 600）");
+            tracing::warn!("请立即使用自动生成的密码登录并修改密码，然后删除 credentials.txt 文件！");
         }
     }
 

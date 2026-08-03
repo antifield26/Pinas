@@ -111,6 +111,122 @@ async fn test_auth_register_login_logout() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ====== 1b. logout 必须清理 Cookie 登录的会话（浏览器场景） ======
+
+#[tokio::test]
+async fn test_logout_clears_cookie_session() {
+    let (_pool, app) = test_app().await;
+
+    // 注册并登录，捕获 Set-Cookie
+    let _ = app.clone()
+        .oneshot(post_json("/api/register", r#"{"username":"cookie_user","password":"secret123"}"#))
+        .await.unwrap();
+    let response = app.clone()
+        .oneshot(post_json("/api/login", r#"{"username":"cookie_user","password":"secret123"}"#))
+        .await.unwrap();
+    let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(cookie.contains("auth_token="), "登录响应应设置 auth_token Cookie");
+    let auth_cookie = cookie.split(';').next().unwrap().to_string(); // "auth_token=xxx"
+
+    // 带 Cookie 访问受保护路由应成功
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/files/list")
+                .header("cookie", &auth_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // 仅带 Cookie（无 Authorization 头）登出
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/logout")
+                .header("cookie", &auth_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cleared = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(cleared.contains("Max-Age=0"), "登出应清除 Cookie");
+
+    // 同一 Cookie 再次访问应 401（服务端 session 行已删除）
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/files/list")
+                .header("cookie", &auth_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ====== 1c. change_password 在 HTTPS 反代场景必须设置 Secure Cookie ======
+
+#[tokio::test]
+async fn test_change_password_sets_secure_flag() {
+    let (_pool, app) = test_app().await;
+
+    let _ = app.clone()
+        .oneshot(post_json("/api/register", r#"{"username":"secure_user","password":"secret123"}"#))
+        .await.unwrap();
+    let response = app.clone()
+        .oneshot(post_json("/api/login", r#"{"username":"secure_user","password":"secret123"}"#))
+        .await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+    let login: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let token = login["token"].as_str().unwrap().to_string();
+
+    // 带 X-Forwarded-Proto: https 修改密码 → 新会话 Cookie 必须带 Secure
+    let response = app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/user/password")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-forwarded-proto", "https")
+                .body(Body::from(r#"{"current_password":"secret123","new_password":"newpass456"}"#))
+                .unwrap(),
+        )
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(cookie.contains("; Secure"), "HTTPS 场景下改密后 Cookie 应带 Secure: {}", cookie);
+
+    // 无 X-Forwarded-Proto（直连 http）→ 不带 Secure，与 login 行为一致
+    let login2 = app.clone()
+        .oneshot(post_json("/api/login", r#"{"username":"secure_user","password":"newpass456"}"#))
+        .await.unwrap();
+    let body2 = axum::body::to_bytes(login2.into_body(), 1024).await.unwrap();
+    let login2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    let token2 = login2["token"].as_str().unwrap().to_string();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/user/password")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token2))
+                .body(Body::from(r#"{"current_password":"newpass456","new_password":"thirdpass789"}"#))
+                .unwrap(),
+        )
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie2 = response.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(!cookie2.contains("; Secure"), "直连 http 场景不应带 Secure: {}", cookie2);
+}
+
 // ====== 2. 文件 CRUD 测试 ======
 
 #[tokio::test]

@@ -61,7 +61,7 @@ pub async fn restore_trash(
 
     if let Some(p) = dst.parent() { let _ = tokio::fs::create_dir_all(p).await; }
     tokio::fs::rename(&src, &dst).await
-        .map_err(|e| AppError::internal(format!("物理媒介归位失败: {}", e)))?;
+        .map_err(|e| AppError::internal_log("回收站还原", e))?;
 
     let path_obj = std::path::Path::new(&orig_path);
     let name = path_obj.file_name().unwrap_or_default().to_string_lossy().to_string();

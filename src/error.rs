@@ -79,7 +79,7 @@ impl From<std::io::Error> for AppError {
 impl From<Box<dyn std::error::Error>> for AppError {
     fn from(e: Box<dyn std::error::Error>) -> Self {
         tracing::error!("[Error] {}", e);
-        AppError::Internal(e.to_string())
+        AppError::Internal("服务器内部错误".to_string())
     }
 }
 
@@ -94,6 +94,12 @@ impl AppError {
     pub fn internal(msg: impl Into<String>) -> Self { AppError::Internal(msg.into()) }
     pub fn payload_too_large(msg: impl Into<String>) -> Self { AppError::PayloadTooLarge(msg.into()) }
     pub fn service_unavailable(msg: impl Into<String>) -> Self { AppError::ServiceUnavailable(msg.into()) }
+
+    /// 内部错误：错误细节仅写入日志，客户端只收到通用文案（防止 IO/DB 细节泄露）
+    pub fn internal_log(ctx: impl Into<String>, e: impl std::fmt::Display) -> Self {
+        tracing::error!("[{}] {}", ctx.into(), e);
+        AppError::Internal("服务器内部错误，请稍后重试".to_string())
+    }
 }
 
 /// 便捷类型别名

@@ -160,7 +160,7 @@ pub async fn upload_chunk(
     // 直接创建文件，流式写入
     let mut file = tokio::fs::File::create(&chunk_path)
         .await
-        .map_err(|e| AppError::internal(format!("创建分片文件失败: {}", e)))?;
+        .map_err(|e| AppError::internal_log("创建分片文件", e))?;
 
     let mut total_written: u64 = 0;
     let mut mime_buf = [0u8; crate::constants::MIME_HEADER_BUF_SIZE];
@@ -185,7 +185,7 @@ pub async fn upload_chunk(
 
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
                     let _ = tokio::fs::remove_file(&chunk_path).await;
-                    return Err(AppError::internal(format!("写入分片失败: {}", e)));
+                    return Err(AppError::internal_log("写入分片", e));
                 }
             }
         }
@@ -272,7 +272,7 @@ pub async fn merge_chunks(
 
     let mut out_file = tokio::fs::File::create(&target_file_path)
         .await
-        .map_err(|e| AppError::internal(format!("创建物理文件失败: {}", e)))?;
+        .map_err(|e| AppError::internal_log("创建目标文件", e))?;
 
     // RAII cleanup guard — 错误发生时自动清理 target_file + tmp_dir
     let mut cleanup = MergeCleanup::new(target_file_path.clone(), tmp_dir.clone());
@@ -281,9 +281,9 @@ pub async fn merge_chunks(
     for idx in chunks {
         let chunk_path = format!("{}/{}", tmp_dir, idx);
         let mut chunk_file = tokio::fs::File::open(&chunk_path).await
-            .map_err(|e| AppError::internal(format!("读取分片 {} 失败: {}", idx, e)))?;
+            .map_err(|e| AppError::internal_log(format!("读取分片 {idx}"), e))?;
         tokio::io::copy(&mut chunk_file, &mut out_file).await
-            .map_err(|e| AppError::internal(format!("合并分片 {} 失败: {}", idx, e)))?;
+            .map_err(|e| AppError::internal_log(format!("合并分片 {idx}"), e))?;
     }
     let _ = out_file.flush().await;
 
@@ -301,7 +301,7 @@ pub async fn merge_chunks(
     let file_size_mb_ceil = bytes_to_mb_ceil(meta);
 
     // 使用事务避免 TOCTOU 竞态：在事务内原子地检查并扣减配额
-    let mut tx = pool.begin().await.map_err(|e| AppError::internal(format!("开启事务失败: {}", e)))?;
+    let mut tx = pool.begin().await.map_err(|e| AppError::internal_log("开启配额事务", e))?;
 
     // 在事务内原子读取 used_mb + quota_mb
     let (current_used, quota): (i64, i64) = sqlx::query_as(
@@ -310,7 +310,7 @@ pub async fn merge_chunks(
     .bind(username)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| AppError::internal(format!("查询用户配额失败: {}", e)))?
+    .map_err(|e| AppError::internal_log("查询用户配额", e))?
     .ok_or_else(|| AppError::not_found("用户不存在"))?;
 
     if current_used + file_size_mb_ceil > quota {
@@ -319,7 +319,7 @@ pub async fn merge_chunks(
 
     // 完整文件 MIME 检测（安全增强）
     if !is_allowed_mime_streaming(&target_file_path).await
-        .map_err(|e| AppError::internal(format!("无法验证文件完整性: {}", e)))? {
+        .map_err(|e| AppError::internal_log("文件完整性检测", e))? {
         return Err(AppError::forbidden("完整文件安全检测未通过：非法内容"));
     }
 
@@ -335,7 +335,7 @@ pub async fn merge_chunks(
     .bind(&payload.identifier)
     .execute(&mut *tx)
     .await
-    .map_err(|e| AppError::internal(format!("数据库录入失败: {}", e)))?;
+    .map_err(|e| AppError::internal_log("文件记录入库", e))?;
 
     // 在事务内更新用户已用容量（配额用向上取整值避免微文件累积逃逸）
     sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
@@ -343,9 +343,9 @@ pub async fn merge_chunks(
         .bind(username)
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::internal(format!("更新用户容量失败: {}", e)))?;
+        .map_err(|e| AppError::internal_log("更新用户容量", e))?;
 
-    tx.commit().await.map_err(|e| AppError::internal(format!("提交事务失败: {}", e)))?;
+    tx.commit().await.map_err(|e| AppError::internal_log("提交配额事务", e))?;
 
     // 提交成功 — 取消自动清理
     cleanup.disarm();

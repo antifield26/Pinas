@@ -54,6 +54,36 @@ pub struct LoginResponse {
     pub must_change_pwd: bool,
 }
 
+/// 从请求中提取会话 token：优先 Cookie（浏览器场景），其次 Authorization Bearer（API 场景）
+/// 与 pinas-core::auth::auth_middleware 的提取优先级保持一致
+fn extract_auth_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("Cookie")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|c| {
+                let c = c.trim();
+                c.strip_prefix("auth_token=").map(|t| t.to_string())
+            })
+        })
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.strip_prefix("Bearer "))
+                .map(|t| t.to_string())
+        })
+}
+
+/// 根据 X-Forwarded-Proto 决定 Cookie 是否带 Secure 标志（反向代理 HTTPS 场景必需）
+fn should_secure_cookie(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "https")
+        .unwrap_or(false)
+}
+
 /// 从 HTTP 请求头提取客户端 IP
 /// 优先级：X-Real-IP（反向代理设置） > X-Forwarded-For 最左侧（原始客户端） > 无
 /// 注意：X-Forwarded-For 可被伪造，仅在可信反向代理环境下安全
@@ -91,11 +121,12 @@ pub async fn login(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
-    // 速率限制：每个 IP 每分钟最多 N 次登录尝试
-    if let Some(ip) = extract_ip(&headers) {
-        if !rate_limit::check_rate_limit(ip, LOGIN_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS)).await {
-            return (StatusCode::TOO_MANY_REQUESTS, "登录尝试过于频繁，请稍后再试").into_response();
-        }
+    // 速率限制：每个 IP 每分钟最多 N 次登录尝试；无代理直连（无 IP 头）时回退为按用户名限速
+    let rate_key = extract_ip(&headers)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| format!("user:{}", payload.username));
+    if !rate_limit::check_rate_limit(&rate_key, LOGIN_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(LOGIN_RATE_LIMIT_WINDOW_SECS)).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "登录尝试过于频繁，请稍后再试").into_response();
     }
 
     let row = queries::get_user_auth(&pool, &payload.username)
@@ -137,11 +168,7 @@ pub async fn login(
             // 构建 httpOnly Cookie（服务器端设置，JS 不可访问）
             // Secure 标志确保 Cookie 仅通过 HTTPS 传输（反向代理场景必需）
             let max_age = config.session_days * 86400;
-            let is_https = headers.get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v == "https")
-                .unwrap_or(false);
-            let secure_flag = if is_https { "; Secure" } else { "" };
+            let secure_flag = if should_secure_cookie(&headers) { "; Secure" } else { "" };
             let cookie = format!(
                 "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
                 token, max_age, secure_flag
@@ -182,11 +209,12 @@ pub async fn register(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
-    // 速率限制：每个 IP 每小时最多 N 次注册
-    if let Some(ip) = extract_ip(&headers) {
-        if !rate_limit::check_rate_limit(ip, REGISTER_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(REGISTER_RATE_LIMIT_WINDOW_SECS)).await {
-            return (StatusCode::TOO_MANY_REQUESTS, "注册过于频繁，请稍后再试").into_response();
-        }
+    // 速率限制：每个 IP 每小时最多 N 次注册；无代理直连时回退为按用户名限速
+    let rate_key = extract_ip(&headers)
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| format!("user:{}", payload.username));
+    if !rate_limit::check_rate_limit(&rate_key, REGISTER_RATE_LIMIT_ATTEMPTS, std::time::Duration::from_secs(REGISTER_RATE_LIMIT_WINDOW_SECS)).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "注册过于频繁，请稍后再试").into_response();
     }
 
     if queries::user_exists(&pool, &payload.username).await.unwrap_or(false) {
@@ -250,23 +278,7 @@ pub async fn change_password(
     }
 
     // 从 Cookie 或 Header 提取当前用户
-    let current_token = headers
-        .get("Cookie")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|c| {
-                let c = c.trim();
-                c.strip_prefix("auth_token=").map(|t| t.to_string())
-            })
-        })
-        .or_else(|| {
-            headers.get("Authorization")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| h.strip_prefix("Bearer "))
-                .map(|t| t.to_string())
-        });
-
-    let current_token = match current_token {
+    let current_token = match extract_auth_token(&headers) {
         Some(t) if !t.is_empty() => t,
         _ => return (StatusCode::UNAUTHORIZED, "未登录").into_response(),
     };
@@ -368,9 +380,10 @@ pub async fn change_password(
     let _ = log_audit(&pool, &username, "change_password", None, None, extract_ip(&headers), extract_ua(&headers)).await;
 
     let max_age = config.session_days * 86400;
+    let secure_flag = if should_secure_cookie(&headers) { "; Secure" } else { "" };
     let cookie = format!(
-        "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        new_token, max_age
+        "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        new_token, max_age, secure_flag
     );
 
     let mut resp = (StatusCode::OK, "密码修改成功").into_response();
@@ -386,11 +399,8 @@ pub async fn logout(
     req: axum::http::Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let headers = req.headers();
-    let token_opt = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(|t| t.to_string());
+    // Cookie 优先（浏览器场景），Bearer 兜底（API 场景）— 与 auth_middleware 一致
+    let token_opt = extract_auth_token(headers);
 
     let username = if let Some(token) = &token_opt {
         let token_hash = hash_token(token);
@@ -421,11 +431,7 @@ pub async fn logout(
         let _ = log_audit(&pool, &name, "logout", None, None, extract_ip(headers), extract_ua(headers)).await;
     }
 
-    let is_https = headers.get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false);
-    let secure_flag = if is_https { "; Secure" } else { "" };
+    let secure_flag = if should_secure_cookie(headers) { "; Secure" } else { "" };
     let mut resp = (StatusCode::OK, "已退出登录").into_response();
     resp.headers_mut().insert(
         axum::http::header::SET_COOKIE,
