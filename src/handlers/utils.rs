@@ -42,6 +42,41 @@ pub fn is_blocked_extension(file_name: &str) -> bool {
     false
 }
 
+/// 校验文件/文件夹名称合法性(安全白名单)
+/// 拒绝:空名、`.`/`..`、路径分隔符、控制字符、以及会破坏 hx-vals JSON 与内联 JS 字符串的引号/尖括号
+pub fn validate_name(name: &str) -> crate::error::AppResult<()> {
+    use crate::error::AppError;
+    let n = name.trim();
+    if n.is_empty() {
+        return Err(AppError::bad_request("名称不能为空"));
+    }
+    if n == "." || n == ".." {
+        return Err(AppError::bad_request("非法名称"));
+    }
+    if n.contains('/') || n.contains('\\') {
+        return Err(AppError::bad_request("名称不能包含路径分隔符"));
+    }
+    for c in n.chars() {
+        if c.is_control() || matches!(c, '\'' | '"' | '<' | '>') {
+            return Err(AppError::bad_request("名称包含非法字符"));
+        }
+    }
+    Ok(())
+}
+
+/// 这些 MIME 类型若以内联方式渲染会执行脚本/标记（存储型 XSS 通道），必须强制下载
+pub fn is_force_download_mime(mime: &str) -> bool {
+    let m = mime.to_lowercase();
+    m.starts_with("text/html")
+        || m.ends_with("/html")
+        || m.ends_with("/svg+xml")
+        || m.ends_with("/xml")
+        || m.ends_with("/xhtml+xml")
+        || m.contains("javascript")
+        || m.ends_with("/x-javascript")
+        || m.ends_with("/mjs")
+}
+
 pub fn is_allowed_mime(data: &[u8]) -> bool {
     if data.is_empty() {
         return true;
@@ -68,7 +103,11 @@ pub async fn is_allowed_mime_streaming(
     Ok(is_allowed_mime(&buffer))
 }
 
-pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::path::PathBuf {
+pub fn safe_join_sandbox(
+    base: &std::path::Path,
+    user_raw_path: &str,
+) -> crate::error::AppResult<std::path::PathBuf> {
+    use crate::error::AppError;
     // 统一路径分隔符 (Windows 兼容)
     let normalized = user_raw_path.replace('\\', "/");
 
@@ -80,7 +119,7 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
                     "[路径安全] 检测到路径穿越攻击 (ParentDir), path='{}'",
                     user_raw_path
                 );
-                return base.to_path_buf();
+                return Err(AppError::bad_request("非法路径"));
             }
             std::path::Component::CurDir => {
                 // 跳过 . 组件（无害）
@@ -91,11 +130,11 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
                 let s = p.to_string_lossy();
                 if s == ".." {
                     tracing::warn!(
-                        "[路径安全] 检测到路径穿越攻击，返回安全回退: component='{}', path='{}'",
+                        "[路径安全] 检测到路径穿越攻击: component='{}', path='{}'",
                         s,
                         user_raw_path
                     );
-                    return base.to_path_buf();
+                    return Err(AppError::bad_request("非法路径"));
                 }
                 if s == "." || s.trim().is_empty() {
                     tracing::warn!(
@@ -110,7 +149,7 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
             // 显式拒绝绝对路径和 Windows 盘符前缀
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 tracing::warn!("[路径安全] 阻断绝对路径/盘符注入: path='{}'", user_raw_path);
-                return base.to_path_buf();
+                return Err(AppError::bad_request("非法路径"));
             }
         }
     }
@@ -144,12 +183,12 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
                                 canon,
                                 canonical_base
                             );
-                            return base.to_path_buf();
+                            return Err(AppError::bad_request("非法路径"));
                         }
                         break;
                     }
                 }
-                return result;
+                return Ok(result);
             }
         };
         if !canonical_result.starts_with(&canonical_base) {
@@ -158,11 +197,11 @@ pub fn safe_join_sandbox(base: &std::path::Path, user_raw_path: &str) -> std::pa
                 canonical_base,
                 canonical_result
             );
-            return base.to_path_buf();
+            return Err(AppError::bad_request("非法路径"));
         }
     }
 
-    result
+    Ok(result)
 }
 
 pub fn user_dir_path(raw: Option<String>) -> String {
@@ -174,33 +213,26 @@ pub fn user_dir_path(raw: Option<String>) -> String {
     }
 }
 
-// （路径工具函数保留以备 handler 后续重构使用）
-
-/// 全量重算用户已用容量（回退方案，兼容旧逻辑）
+/// 全量重算用户已用容量。
+/// 统一算法:SUM(CEIL(size_mb))——与上传时按文件向上取整累加的语义一致,消除显示漂移。
+/// (此前为 (SUM+0.5).round(),与上传的 ceil 增量不同,导致配额显示不一致)
 pub async fn update_user_used_mb(
     pool: &sqlx::SqlitePool,
     username: &str,
 ) -> Result<(), sqlx::Error> {
     tracing::debug!("[配额更新] 开始计算用户 {} 的已用容量", username);
-    let used_mb_f64: f64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_mb), 0.0) FROM files WHERE username = ? AND is_dir = 0",
+    let used_mb: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(CEIL(size_mb)), 0) FROM files WHERE username = ? AND is_dir = 0",
     )
     .bind(username)
     .fetch_one(pool)
     .await?;
-    let used_mb = (used_mb_f64 + 0.5).round() as i64;
-    tracing::debug!(
-        "[配额更新] 用户 {} 计算得已用: {:.2} MB -> 取整为 {} MB",
-        username,
-        used_mb_f64,
-        used_mb
-    );
     sqlx::query("UPDATE users SET used_mb = ? WHERE username = ?")
         .bind(used_mb)
         .bind(username)
         .execute(pool)
         .await?;
-    tracing::debug!("[配额更新] 用户 {} 配额更新成功", username);
+    tracing::debug!("[配额更新] 用户 {} 配额更新成功: {} MB", username, used_mb);
     Ok(())
 }
 
@@ -266,22 +298,46 @@ mod tests {
     #[test]
     fn test_safe_join_sandbox() {
         let base = std::path::Path::new("/uploads");
-        // .. 组件现在拒绝并返回 base（安全回退）
-        let result = safe_join_sandbox(base, "user/../passwd");
-        assert_eq!(result, base);
-        let result2 = safe_join_sandbox(base, "../../../etc/passwd");
-        assert_eq!(result2, base);
-        let result3 = safe_join_sandbox(base, "folder/./subfolder");
-        assert_eq!(result3, base.join("folder").join("subfolder"));
-        // 空组件和空白伪装（仍然跳过）
-        let result4 = safe_join_sandbox(base, "folder/   /subfolder");
-        assert_eq!(result4, base.join("folder").join("subfolder"));
-        // Windows 反斜杠分隔符
-        let result5 = safe_join_sandbox(base, "folder\\sub");
-        assert_eq!(result5, base.join("folder").join("sub"));
-        // 绝对路径注入被阻断 — 应返回安全回退
-        let result6 = safe_join_sandbox(base, "/etc/shadow");
-        assert_eq!(result6, base);
+        // .. 组件、绝对路径注入 → Err(非法路径)，不再回退到 base
+        assert!(safe_join_sandbox(base, "user/../passwd").is_err());
+        assert!(safe_join_sandbox(base, "../../../etc/passwd").is_err());
+        assert!(safe_join_sandbox(base, "/etc/shadow").is_err());
+        // Unix 上 "C:\windows" 归一化为相对路径 "C:/windows"，落在沙箱内（安全）
+        assert_eq!(
+            safe_join_sandbox(base, "C:\\windows").unwrap(),
+            base.join("C:").join("windows")
+        );
+        // 正常组件/子目录/反斜杠归一化/空白伪装 → Ok
+        assert_eq!(
+            safe_join_sandbox(base, "folder/./subfolder").unwrap(),
+            base.join("folder").join("subfolder")
+        );
+        assert_eq!(
+            safe_join_sandbox(base, "folder/   /subfolder").unwrap(),
+            base.join("folder").join("subfolder")
+        );
+        assert_eq!(
+            safe_join_sandbox(base, "folder\\sub").unwrap(),
+            base.join("folder").join("sub")
+        );
+    }
+
+    #[test]
+    fn test_validate_name() {
+        assert!(validate_name("文档.pdf").is_ok());
+        assert!(validate_name("中文目录").is_ok());
+        assert!(validate_name("a b-c_1").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("   ").is_err());
+        assert!(validate_name("..").is_err());
+        assert!(validate_name(".").is_err());
+        assert!(validate_name("a/b").is_err());
+        assert!(validate_name("a\\b").is_err());
+        assert!(validate_name("a'b").is_err());
+        assert!(validate_name("a\"b").is_err());
+        assert!(validate_name("a<b").is_err());
+        assert!(validate_name("a>b").is_err());
+        assert!(validate_name("a\u{0}b").is_err());
     }
 
     #[test]

@@ -160,6 +160,22 @@ pub async fn upload_chunk(
     }
     validate_identifier(&params.identifier)?;
 
+    // 分片阶段磁盘上限：未合并分片累计 + 本片上限 > 5GB 时拒绝（防临时分片耗尽磁盘）
+    let pending_bytes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes_received), 0) FROM upload_chunks WHERE username = ?",
+    )
+    .bind(&session.username)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    if pending_bytes as u64 + crate::constants::MAX_CHUNK_SIZE_BYTES
+        > crate::constants::PENDING_CHUNKS_CAP_BYTES
+    {
+        return Err(AppError::too_many_requests(
+            "临时分片存储超限，请先完成合并或等待清理",
+        ));
+    }
+
     // 确保临时目录存在
     let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, params.identifier);
     let _ = tokio::fs::create_dir_all(&tmp_dir).await;
@@ -223,6 +239,16 @@ pub async fn upload_chunk(
     .execute(&pool)
     .await;
 
+    // 累计分片字节（磁盘上限/配额核算依据）
+    let _ = sqlx::query(
+        "UPDATE upload_chunks SET bytes_received = bytes_received + ? WHERE username = ? AND identifier = ?",
+    )
+    .bind(total_written as i64)
+    .bind(&session.username)
+    .bind(&params.identifier)
+    .execute(&pool)
+    .await;
+
     Ok((StatusCode::OK, "分片暂存成功"))
 }
 
@@ -234,6 +260,8 @@ pub async fn merge_chunks(
     Json(payload): Json<MergeRequest>,
 ) -> AppResult<(StatusCode, &'static str)> {
     let username = &session.username;
+    // 文件名白名单校验：拒绝路径分隔符/穿越/引号/尖括号等（防止 join 逃逸沙箱）
+    crate::handlers::utils::validate_name(&payload.file_name)?;
     if is_blocked_extension(&payload.file_name) {
         return Err(AppError::forbidden(
             "安全策略阻断：不允许上传高危执行文件扩展名",
@@ -281,9 +309,34 @@ pub async fn merge_chunks(
 
     let parent_path = user_dir_path(Some(payload.parent_path));
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let user_dir = safe_join_sandbox(base_path, &format!("{}/{}", username, parent_path));
+    let user_dir = safe_join_sandbox(base_path, &format!("{}/{}", username, parent_path))?;
     let _ = tokio::fs::create_dir_all(&user_dir).await;
     let target_file_path = user_dir.join(&payload.file_name);
+    // 兜底复检：合并目标必须位于用户沙箱目录之下（防御未来校验绕过）
+    if !target_file_path.starts_with(&user_dir) {
+        return Err(AppError::bad_request("非法文件名"));
+    }
+
+    // 合并前配额预检：先算分片总量再写盘，避免大文件写完才被拒绝
+    let mut merged_size: u64 = 0;
+    for idx in &chunks {
+        if let Ok(m) = tokio::fs::metadata(format!("{}/{}", tmp_dir, idx)).await {
+            merged_size += m.len();
+        }
+    }
+    let (current_used, quota): (i64, i64) =
+        sqlx::query_as("SELECT used_mb, quota_mb FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| AppError::internal_log("查询用户配额", e))?
+            .ok_or_else(|| AppError::not_found("用户不存在"))?;
+    if current_used + crate::handlers::utils::bytes_to_mb_ceil(merged_size) > quota {
+        return Err(AppError::forbidden(format!(
+            "存储空间不足，配额 {} MB，已使用 {} MB",
+            quota, current_used
+        )));
+    }
 
     let mut out_file = tokio::fs::File::create(&target_file_path)
         .await

@@ -11,12 +11,12 @@
     <div class="flex items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-4">
       <img src="/api/media/{{ file_path }}" alt="{{ file_name }}"
            class="max-w-full max-h-[70vh] object-contain rounded shadow-lg"
-           onerror="this.parentElement.innerHTML='<div class=\'text-red-500 text-sm\'>✕ 图片加载失败</div>'">
+           onerror="showMediaError(this)">
     </div>
     {% else if is_video %}
     <div class="flex items-center justify-center bg-black rounded-lg overflow-hidden">
       <video controls autoplay muted playsinline class="max-w-full max-h-[70vh] rounded-lg" preload="metadata"
-             onerror="this.parentElement.innerHTML='<div class=\'flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3\'><span class=\'text-5xl\'>🎬</span><p class=\'text-gray-600 dark:text-gray-400 text-sm\'>视频无法播放</p><p class=\'text-xs text-gray-400 mt-1\'>可能是编码格式不兼容，请下载后使用本地播放器</p><a href=\'/api/media/{{ file_path }}\' download=\'{{ file_name }}\' class=\'bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3\'>↓ 下载文件</a></div>'">
+             onerror="showMediaError(this)">
         <source src="/api/media/{{ file_path }}" type="{{ mime_type }}">
         <p class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
           <span class="text-5xl">🎬</span>
@@ -36,9 +36,9 @@
       </audio>
     </div>
     {% else if is_pdf %}
-    <embed src="/api/media/{{ file_path }}#toolbar=1&navpanes=1"
-           type="application/pdf" class="w-full rounded-lg"
-           style="min-height: 75vh;">
+    <!-- iframe 而非 embed：CSP object-src 'none' 会拦截 embed，frame-src 'self' 已放行 -->
+    <iframe src="/api/media/{{ file_path }}#toolbar=1&navpanes=1"
+            class="w-full rounded-lg" style="min-height: 75vh; border: 0;">
     {% else if is_text %}
     <div class="relative">
       <div class="flex items-center justify-between mb-2">
@@ -63,6 +63,14 @@
       </div>
     </div>
     {% endif %}
+    {# 媒体加载失败静态 fallback（showMediaError 只做类切换，JS 内不含任何用户数据） #}
+    <div id="media-fallback" class="hidden flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
+      <span class="text-5xl">🎬</span>
+      <p class="text-gray-600 dark:text-gray-400 text-sm">媒体加载失败</p>
+      <p class="text-xs text-gray-400 mt-1">可能是编码格式不兼容，请下载后使用本地播放器</p>
+      <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+         class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3">↓ 下载文件</a>
+    </div>
   </div>
   {% if is_image || is_video || is_audio || is_pdf || is_text %}
   <div class="px-5 py-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex items-center gap-2 shrink-0">

@@ -57,13 +57,10 @@ pub async fn restore_trash(
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let trash_dir = std::path::Path::new(crate::constants::TRASH_DIR);
     let src = trash_dir.join(&trash_uuid);
-    let dst = safe_join_sandbox(base_path, &format!("{}/{}", username, orig_path));
+    let dst = safe_join_sandbox(base_path, &format!("{}/{}", username, orig_path))?;
 
     if dst.exists() {
-        return Err(AppError::conflict(format!(
-            "目标路径已存在: {}",
-            dst.display()
-        )));
+        return Err(AppError::conflict("目标路径已存在，请先移动或删除同名文件"));
     }
 
     if let Some(p) = dst.parent() {

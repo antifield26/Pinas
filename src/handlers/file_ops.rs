@@ -121,7 +121,10 @@ async fn ensure_file_on_disk(
 ) -> bool {
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let rel = user_file_path(username, parent_path, name);
-    let full = safe_join_sandbox(base, &rel);
+    // 路径非法(穿越)视为不存在，交由调用方清理 DB 记录
+    let Ok(full) = safe_join_sandbox(base, &rel) else {
+        return false;
+    };
     let exists = if is_dir { full.is_dir() } else { full.exists() };
     if !exists {
         tracing::warn!("[文件同步] 磁盘文件缺失，清理数据库记录: {:?}", full);
@@ -368,7 +371,8 @@ fn create_folder_common(
     parent: &str,
     name: &str,
     base: &std::path::Path,
-) -> std::path::PathBuf {
+) -> AppResult<std::path::PathBuf> {
+    crate::handlers::utils::validate_name(name)?;
     let sub = if parent.is_empty() {
         name.to_string()
     } else {
@@ -393,7 +397,7 @@ pub async fn create_folder(
         &parent,
         &name,
         std::path::Path::new(crate::constants::UPLOADS_DIR),
-    );
+    )?;
     tokio::fs::create_dir_all(&target).await.map_err(|e| {
         tracing::error!("[Files] 创建目录失败: {}", e);
         AppError::internal("操作失败")
@@ -427,9 +431,12 @@ async fn rename_core(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), String> {
+    crate::handlers::utils::validate_name(new_name).map_err(|e| e.to_string())?;
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let old_p = safe_join_sandbox(base, &user_file_path(username, parent, old_name));
-    let new_p = safe_join_sandbox(base, &user_file_path(username, parent, new_name));
+    let old_p = safe_join_sandbox(base, &user_file_path(username, parent, old_name))
+        .map_err(|e| e.to_string())?;
+    let new_p = safe_join_sandbox(base, &user_file_path(username, parent, new_name))
+        .map_err(|e| e.to_string())?;
 
     tokio::fs::rename(&old_p, &new_p)
         .await
@@ -477,6 +484,9 @@ pub async fn rename_item(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<RenameRequest>,
 ) -> impl IntoResponse {
+    if crate::handlers::utils::validate_name(&payload.new_name).is_err() {
+        return (StatusCode::BAD_REQUEST, "名称包含非法字符").into_response();
+    }
     let parent = user_dir_path(payload.current_path);
     let old_path = logical_path(&parent, &payload.name);
     match rename_core(
@@ -518,8 +528,10 @@ async fn move_core(
     name: &str,
 ) -> Result<(), String> {
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let src_p = safe_join_sandbox(base, &user_file_path(username, src_parent, name));
-    let dst_p = safe_join_sandbox(base, &user_file_path(username, dst_parent, name));
+    let src_p = safe_join_sandbox(base, &user_file_path(username, src_parent, name))
+        .map_err(|e| e.to_string())?;
+    let dst_p = safe_join_sandbox(base, &user_file_path(username, dst_parent, name))
+        .map_err(|e| e.to_string())?;
 
     tokio::fs::rename(&src_p, &dst_p)
         .await
@@ -607,17 +619,20 @@ pub async fn move_batch(
     let mut moved: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
 
     for name in &payload.names {
-        let sp = safe_join_sandbox(base, &user_file_path(&session.username, &src, name));
-        let dp = safe_join_sandbox(base, &user_file_path(&session.username, &dst, name));
+        let sp = match safe_join_sandbox(base, &user_file_path(&session.username, &src, name)) {
+            Ok(p) => p,
+            Err(_) => return (StatusCode::BAD_REQUEST, "包含非法路径").into_response(),
+        };
+        let dp = match safe_join_sandbox(base, &user_file_path(&session.username, &dst, name)) {
+            Ok(p) => p,
+            Err(_) => return (StatusCode::BAD_REQUEST, "包含非法路径").into_response(),
+        };
         if let Err(e) = tokio::fs::rename(&sp, &dp).await {
+            tracing::error!("[Files] 批量移动 '{}' 失败: {}", name, e);
             for (_, s, d) in moved.iter().rev() {
                 let _ = tokio::fs::rename(d, s).await;
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("移动 '{}' 失败: {}", name, e),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "移动失败，操作已回滚").into_response();
         }
         moved.push((name.clone(), sp, dp));
     }
@@ -709,7 +724,7 @@ async fn delete_to_trash(
     use uuid::Uuid;
     let full = logical_path(parent_path, name);
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let physical = safe_join_sandbox(base, &user_file_path(username, parent_path, name));
+    let physical = safe_join_sandbox(base, &user_file_path(username, parent_path, name))?;
 
     if physical.exists() {
         let trash_uuid = Uuid::new_v4().to_string();
@@ -761,7 +776,7 @@ pub async fn delete_item(
     let physical = safe_join_sandbox(
         base,
         &user_file_path(&session.username, &parent, &payload.name),
-    );
+    )?;
     if !physical.exists() {
         return Err(AppError::not_found("目标实体不存在"));
     }
@@ -870,7 +885,7 @@ struct MoveFormFragment {
 
 #[derive(Template)]
 #[template(path = "components/preview.html")]
-struct PreviewFragment {
+pub struct PreviewFragment {
     file_name: String,
     file_path: String,
     file_size: String,
@@ -1001,12 +1016,18 @@ pub async fn drive_create_folder(
     if name.is_empty() {
         return fallback_file_list(pool.clone(), session.username.clone(), display.clone()).await;
     }
-    let target = create_folder_common(
+    let target = match create_folder_common(
         &session.username,
         &parent,
         &name,
         std::path::Path::new(crate::constants::UPLOADS_DIR),
-    );
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            return fallback_file_list(pool.clone(), session.username.clone(), display.clone())
+                .await;
+        }
+    };
     if let Err(e) = tokio::fs::create_dir_all(&target).await {
         tracing::error!("[Drive] 创建目录失败: {}", e);
         return fallback_file_list(pool.clone(), session.username.clone(), display.clone()).await;
@@ -1198,7 +1219,7 @@ const MAX_PREVIEW_TEXT_SIZE: u64 = 1024 * 1024;
 pub async fn drive_preview(
     Extension(session): Extension<UserSession>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> AppResult<AppTemplate<PreviewFragment>> {
     let current_path = params
         .get("path")
         .cloned()
@@ -1209,7 +1230,7 @@ pub async fn drive_preview(
     let full_path = safe_join_sandbox(
         std::path::Path::new(crate::constants::UPLOADS_DIR),
         &user_file_path(&session.username, parent, &name),
-    );
+    )?;
 
     let file_size = match tokio::fs::metadata(&full_path).await {
         Ok(meta) => bytes_to_mb_string(meta.len()),
@@ -1298,7 +1319,7 @@ pub async fn drive_preview(
         String::new()
     };
 
-    AppTemplate(PreviewFragment {
+    Ok(AppTemplate(PreviewFragment {
         file_name: name,
         file_path,
         file_size,
@@ -1309,5 +1330,5 @@ pub async fn drive_preview(
         is_pdf,
         is_text,
         content,
-    })
+    }))
 }

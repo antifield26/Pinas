@@ -11,23 +11,26 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     let headers = response.headers_mut();
 
     // Content-Security-Policy
+    // 注：保留 'unsafe-inline'(htmx 片段内联脚本/内联处理器必需) 与 'unsafe-eval'(Alpine 表达式编译必需)，
+    // 均为当前架构的硬依赖；XSS 防线以消除注入点 + Askama 转义为主。nonce 迁移列为后续改造。
+    // 已移除死条目：unpkg(资源已本地化)、static.cloudflareinsights.com(未使用)、ws:/wss:(无 WebSocket 路由)。
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'self'; \
-             script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://static.cloudflareinsights.com; \
-             style-src 'self' 'unsafe-inline' https://unpkg.com; \
+             script-src 'self' 'unsafe-inline' 'unsafe-eval'; \
+             style-src 'self' 'unsafe-inline'; \
              img-src 'self' data: blob:; \
              media-src 'self' blob:; \
              font-src 'self'; \
-             connect-src 'self' blob: ws: wss: https://unpkg.com https://static.cloudflareinsights.com; \
+             connect-src 'self' blob:; \
              frame-src 'self'; \
              frame-ancestors 'self'; \
              object-src 'none'; \
              base-uri 'self'; \
              form-action 'self'; \
              worker-src 'self'; \
-             manifest-src 'self'"
+             manifest-src 'self'",
         ),
     );
 

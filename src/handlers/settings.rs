@@ -73,11 +73,31 @@ pub async fn save_agent_settings(
 ) -> AppResult<Json<serde_json::Value>> {
     if let Some(ref base) = payload.deepseek_api_base
         && !base.is_empty()
-        && !base.starts_with("http")
     {
-        return Err(AppError::bad_request(
-            "API 基础地址必须以 http:// 或 https:// 开头",
-        ));
+        // 仅允许 https，且拒绝 IP 直连与本地地址（防自定义 base 被用于窃取全局 key / 探内网）
+        if !base.starts_with("https://") {
+            return Err(AppError::bad_request(
+                "API 基础地址必须使用 https://（拒绝明文与本地传输）",
+            ));
+        }
+        let host_part = base
+            .trim_start_matches("https://")
+            .split(['/', '?', ':'])
+            .next()
+            .unwrap_or("");
+        let is_literal_ip = host_part.parse::<std::net::IpAddr>().is_ok();
+        let is_local_host = host_part.eq_ignore_ascii_case("localhost")
+            || host_part.ends_with(".localhost")
+            || host_part.starts_with("127.")
+            || host_part.starts_with("10.")
+            || host_part.starts_with("192.168.")
+            || host_part.ends_with(".local")
+            || host_part.ends_with(".internal");
+        if is_literal_ip || is_local_host {
+            return Err(AppError::bad_request(
+                "API 基础地址不允许使用 IP 地址或本地主机",
+            ));
+        }
     }
     if let Some(t) = payload.temperature
         && !(0.0..=2.0).contains(&t)

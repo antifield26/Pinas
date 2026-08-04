@@ -86,7 +86,7 @@ Browser                      Axum Server
 │   ├── components/          # 可复用 HTMX 片段 (21 个)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v8
+├── static/sw.js             # PWA Service Worker v10
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -171,11 +171,20 @@ PINAS_SESSION_DAYS=7               PINAS_DATA_DIR=
 PINAS_TEMP_CLEANUP_HOURS=24        PINAS_TRASH_CLEANUP_DAYS=30
 PINAS_ADMIN_PASSWORD=              PINAS_GUEST_PASSWORD=
 PINAS_DEEPSEEK_API_KEY=            PINAS_DEEPSEEK_API_BASE=https://api.deepseek.com
-PINAS_DEEPSEEK_MODEL=deepseek-v4-flash
+PINAS_DEEPSEEK_MODEL=deepseek-v4-flash     PINAS_ALLOW_REGISTRATION=false
 MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 ```
 
 ## 代码约定
+
+### 安全约定
+- **`validate_name`**：文件/文件夹名白名单（拒绝 `/` `\` `..` 引号 尖括号 控制字符），挂于建文件夹/重命名/merge 写入路径
+- **`safe_join_sandbox` 返回 `AppResult`**：攻击检测失败返回 Err（不可回退到 base），18 个调用点 `?` 传播
+- **强制下载类型** `is_force_download_mime`：html/svg/xml/js 一律 octet-stream + `Content-Disposition: attachment`（分享/媒体）
+- **模板内联 JS 零用户数据**：导航走 `data-nav-path`/`data-breadcrumb-path` 事件委托；`hx-vals` 一律 `|json` 过滤器
+- **限速可信源** `MaybePeer`：直连用真实对端 IP，回环(cloudflared)信任 CF-Connecting-IP，防伪造 XFF 绕过
+- **注册开关** `PINAS_ALLOW_REGISTRATION`（默认 false）；分片临时存储 5GB/用户上限；备份保留 7 份轮转
+- 密码学函数从 `pinas_core` 导入（`hash_password`, `verify_password`, `hash_token`）
 
 ### 错误处理
 - `AppError` 枚举（11 种 HTTP 状态） + `AppResult<T>` = `Result<T, AppError>`
@@ -204,7 +213,7 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v8 预缓存 CDN 依赖（marked/purify 带版本串对齐），离线可用
+- PWA：SW v10 预缓存全部本地资源（版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验），离线可用
 - 版本对齐：Cargo.toml（双 crate）→ `/health` version；CSS `?v=`（4 处）与 sw.js 预缓存 URL 严格一致
 
 ### UI 规范（v1.5 起）
@@ -219,7 +228,7 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 12 个集成测试 + 8 个单元测试
+- 19 个集成测试 + 11 个单元测试（含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/子树迁移/媒体 Range）
 - 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署

@@ -12,7 +12,16 @@ use sqlx::SqlitePool;
 use tower::util::ServiceExt;
 
 /// 创建测试应用（内存 SQLite，仅建表不含默认用户）
+/// 文件系统隔离：进程内首次调用把 CWD 切换到独立临时目录（uploads/ 不再污染项目目录）
 async fn test_app() -> (SqlitePool, axum::Router) {
+    use std::sync::Once;
+    static CWD_INIT: Once = Once::new();
+    CWD_INIT.call_once(|| {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        // tempdir 存活到进程结束（测试共用同一 CWD，用户目录按 username 天然隔离）
+        std::mem::forget(dir);
+    });
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
     db::init_test_db(&pool).await.unwrap();
     let config = Config::default();
@@ -531,7 +540,13 @@ async fn test_share_create_access_delete() {
     let shares: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
     assert!(shares.iter().any(|s| s["code"] == share_code));
 
-    // 匿名访问分享（验证链接有效）
+    // 真实创建被分享的文件（access 端点现在要求磁盘文件存在）
+    tokio::fs::create_dir_all("uploads/carol").await.unwrap();
+    tokio::fs::write("uploads/carol/test.txt", b"share-content")
+        .await
+        .unwrap();
+
+    // 匿名访问分享 → 应返回文件流（attachment 下载）
     let response = app
         .clone()
         .oneshot(
@@ -544,6 +559,17 @@ async fn test_share_create_access_delete() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("content-disposition")
+            .map(|v| v.to_str().unwrap_or("").contains("attachment"))
+            .unwrap_or(false),
+        "下载响应必须带 Content-Disposition: attachment"
+    );
+
+    // 清理
+    let _ = tokio::fs::remove_file("uploads/carol/test.txt").await;
 
     // 删除分享
     let response = app
@@ -1074,4 +1100,418 @@ async fn register_and_login_with_username(app: &axum::Router) -> (String, String
     let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
     let login: serde_json::Value = serde_json::from_slice(&body).unwrap();
     (login["token"].as_str().unwrap().to_string(), username)
+}
+
+// ====== 9. 安全回归测试 (v1.5.1) ======
+
+/// merge 的 file_name 必须拒绝路径穿越（C1 任意文件写入漏洞回归）
+#[tokio::test]
+async fn test_merge_rejects_path_traversal_filename() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 先上传一个有效分片
+    upload_one_chunk(&app, &token, "sec-trav-001", 0, 1, b"hello world").await;
+
+    // 尝试用穿越文件名合并 → 必须 400，且沙箱外不得出现文件
+    for evil_name in [
+        "../../escape_test.txt",
+        "../escape_test.txt",
+        "sub/../../escape_test.txt",
+        "..",
+        "/etc/escape_test.txt",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_with_token(
+                "/api/files/merge",
+                &format!(
+                    r#"{{"identifier":"sec-trav-001","file_name":"{}","parent_path":"/"}}"#,
+                    evil_name
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "穿越文件名 '{}' 应被拒绝",
+            evil_name
+        );
+    }
+    // 沙箱外不得出现文件
+    assert!(
+        !std::path::Path::new("escape_test.txt").exists(),
+        "沙箱外不应有写入文件"
+    );
+    assert!(
+        !std::path::Path::new(&format!("uploads/{}/escape_test.txt", username)).exists(),
+        "沙箱内也不应有 escape_test.txt"
+    );
+}
+
+/// delete name=".." 不得移走整个 uploads（P0.2 沙箱 Result 回归）
+#[tokio::test]
+async fn test_delete_parent_dir_rejected() {
+    let (_pool, app) = test_app().await;
+    let (token, _username) = register_and_login_with_username(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/delete",
+            r#"{"name":"..","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "name='..' 删除应被拒绝，实际: {}",
+        resp.status()
+    );
+    // uploads 目录必须完好
+    assert!(
+        std::path::Path::new("uploads").is_dir(),
+        "uploads 目录必须完整存在"
+    );
+}
+
+/// 创建文件夹名称含引号/尖括号 → 400（XSS 上游防线回归）
+#[tokio::test]
+async fn test_create_folder_rejects_unsafe_chars() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    for evil in [
+        "evil'folder",
+        "evil\"folder",
+        "evil<folder",
+        "evil>folder",
+        "../evil",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_with_token(
+                "/api/files/create_folder",
+                &format!(r#"{{"name":"{}","current_path":"/"}}"#, evil),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "名称 '{}' 应被拒绝",
+            evil
+        );
+        assert!(
+            !std::path::Path::new(&format!("uploads/{}/{}", username, evil)).exists(),
+            "非法名称不应创建目录: {}",
+            evil
+        );
+    }
+}
+
+/// 重命名为含引号名称 → 400（XSS 上游防线回归）
+#[tokio::test]
+async fn test_rename_rejects_unsafe_name() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 先创建合法目录
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/create_folder",
+            r#"{"name":"okdir","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 重命名为含引号名称 → 400
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/rename",
+            r#"{"name":"okdir","new_name":"bad'name","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 原目录仍在
+    assert!(
+        std::path::Path::new(&format!("uploads/{}/okdir", username)).is_dir(),
+        "原目录应保留"
+    );
+}
+
+/// 分享文件下载响应必须带 Content-Disposition: attachment（P0.5 同源 XSS 回归）
+#[tokio::test]
+async fn test_share_download_has_attachment_disposition() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 上传一个文件
+    upload_one_chunk(&app, &token, "sec-share-001", 0, 1, b"malicious-content").await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"sec-share-001","file_name":"evil.html","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 创建分享
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/share/create",
+            r#"{"file_path":"evil.html","is_dir":false}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let share: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = share["code"].as_str().unwrap().to_string();
+
+    // 访问分享下载端点 → 必须 attachment 且 Content-Type 为 octet-stream（html 强制下载）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/share/access/{}", code))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers();
+    assert!(
+        headers
+            .get("content-disposition")
+            .map(|v| v.to_str().unwrap_or("").contains("attachment"))
+            .unwrap_or(false),
+        "分享文件必须 Content-Disposition: attachment"
+    );
+    assert_eq!(
+        headers.get("content-type").unwrap(),
+        "application/octet-stream",
+        "html 分享必须强制 octet-stream"
+    );
+
+    // 清理
+    let _ = tokio::fs::remove_file(format!("uploads/{}/evil.html", username)).await;
+}
+
+// ====== 10. P2 补充测试：目录子树 rename/move + 媒体 Range ======
+
+/// rename/move 后子目录的 DB parent_path 必须随子树迁移（update_child_parent_paths 回归）
+#[tokio::test]
+async fn test_rename_move_subtree_paths() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 创建目录树 a/b/c
+    for path in ["a", "a/b", "a/b/c"] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_with_token(
+                "/api/files/create_folder",
+                &format!(
+                    r#"{{"name":"{}","current_path":"{}"}}"#,
+                    path.rsplit('/').next().unwrap(),
+                    path.trim_end_matches(path.rsplit('/').next().unwrap())
+                        .trim_end_matches('/')
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "创建 {} 失败", path);
+    }
+
+    // 重命名 a → a2，子路径应迁移
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/rename",
+            r#"{"name":"a","new_name":"a2","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "重命名失败");
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, parent_path FROM files WHERE username = ?")
+            .bind(&username)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        rows.iter().any(|(n, p)| n == "c" && p == "a2/b"),
+        "rename 后 c 的 parent_path 应为 a2/b，实际: {:?}",
+        rows
+    );
+    // 磁盘结构同样迁移
+    assert!(std::path::Path::new(&format!("uploads/{}/a2/b/c", username)).is_dir());
+
+    // 移动 a2 → x，子树应再次迁移
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/create_folder",
+            r#"{"name":"x","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/move",
+            r#"{"name":"a2","target_dir":"x","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "移动失败");
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, parent_path FROM files WHERE username = ?")
+            .bind(&username)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        rows.iter().any(|(n, p)| n == "c" && p == "x/a2/b"),
+        "move 后 c 的 parent_path 应为 x/a2/b，实际: {:?}",
+        rows
+    );
+    assert!(std::path::Path::new(&format!("uploads/{}/x/a2/b/c", username)).is_dir());
+}
+
+/// 媒体代理 Range 语义：HEAD 元数据 / 206 部分内容 / 416 越界 / 空文件 200
+#[tokio::test]
+async fn test_media_proxy_range_semantics() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 上传一个 1024 字节文件
+    let content: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+    upload_one_chunk(&app, &token, "sec-media-001", 0, 1, &content).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"sec-media-001","file_name":"range.bin","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // HEAD → 元数据（Accept-Ranges + Content-Length）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/api/media/range.bin")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(resp.headers().get("content-length").unwrap(), "1024");
+
+    // GET 带 Range → 206 + Content-Range
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/media/range.bin")
+                .header("authorization", format!("Bearer {}", token))
+                .header("range", "bytes=100-199")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(
+        resp.headers()
+            .get("content-range")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("bytes 100-199/1024")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    assert_eq!(body.len(), 100);
+    assert_eq!(body[0], content[100]);
+    assert_eq!(body[99], content[199]);
+
+    // 越界 Range → 416
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/media/range.bin")
+                .header("authorization", format!("Bearer {}", token))
+                .header("range", "bytes=2000-3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+    // 空文件 → 200 空体（避免 Range 下溢）
+    tokio::fs::write(format!("uploads/{}/empty.bin", username), b"")
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/media/empty.bin")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-length").unwrap(), "0");
+
+    // 清理
+    eprintln!(
+        "[DIAG] cwd={:?} uploads_exist={} file_exists={}",
+        std::env::current_dir(),
+        std::path::Path::new("uploads").exists(),
+        std::path::Path::new(&format!("uploads/{}/range.bin", username)).exists()
+    );
+    let _ = tokio::fs::remove_file(format!("uploads/{}/range.bin", username)).await;
+    let _ = tokio::fs::remove_file(format!("uploads/{}/empty.bin", username)).await;
+    let _ = pool;
 }

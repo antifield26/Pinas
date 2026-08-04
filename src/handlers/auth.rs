@@ -87,24 +87,58 @@ fn should_secure_cookie(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// 从 HTTP 请求头提取客户端 IP
-/// 优先级：X-Real-IP（反向代理设置） > X-Forwarded-For 最左侧（原始客户端） > 无
-/// 注意：X-Forwarded-For 可被伪造，仅在可信反向代理环境下安全
-fn extract_ip(headers: &HeaderMap) -> Option<&str> {
-    // X-Real-IP 由反向代理直接设置，更难伪造
-    if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let ip = ip.trim();
-        if !ip.is_empty() {
-            return Some(ip);
+/// 从请求提取限速键（客户端 IP）。
+/// - 直连(对端非回环):忽略一切客户端头,用真实对端 IP —— 杜绝伪造 X-Forwarded-For 绕过限速
+/// - 回环(cloudflared 本地隧道):信任 CF-Connecting-IP > X-Real-IP > X-Forwarded-For 最左侧
+/// - 无 ConnectInfo(测试场景):回退信任头,无头则 None(调用方按用户名限速)
+fn extract_ip(peer_ip: Option<std::net::IpAddr>, headers: &HeaderMap) -> Option<String> {
+    match peer_ip {
+        Some(ip) if !ip.is_loopback() => return Some(ip.to_string()),
+        Some(_) => {
+            for name in ["cf-connecting-ip", "x-real-ip", "x-forwarded-for"] {
+                if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                    let first = v.split(',').map(|s| s.trim()).find(|s| !s.is_empty());
+                    if let Some(ip) = first {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
+            return Some("loopback".to_string());
+        }
+        None => {
+            for name in ["x-real-ip", "x-forwarded-for"] {
+                if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                    let first = v.split(',').map(|s| s.trim()).find(|s| !s.is_empty());
+                    if let Some(ip) = first {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
         }
     }
-    // X-Forwarded-For：取最左侧 IP（原始客户端），取第一个非空值
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
-        && let Some(ip) = xff.split(',').map(|s| s.trim()).find(|s| !s.is_empty())
-    {
-        return Some(ip);
-    }
     None
+}
+
+/// 可选的客户端对端地址提取器：生产由 axum::serve 的 ConnectInfo 注入；
+/// 测试直连(无扩展)时返回 None，回退按用户名限速，不影响测试。
+pub struct MaybePeer(pub Option<std::net::IpAddr>);
+
+impl<S> axum::extract::FromRequestParts<S> for MaybePeer
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip());
+        Ok(MaybePeer(ip))
+    }
 }
 
 /// 从 HTTP 请求头提取 User-Agent
@@ -118,6 +152,7 @@ fn extract_ua(headers: &HeaderMap) -> Option<&str> {
 pub async fn login(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(config): Extension<Config>,
+    MaybePeer(peer_ip): MaybePeer,
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
@@ -126,10 +161,9 @@ pub async fn login(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
-    // 速率限制：每个 IP 每分钟最多 N 次登录尝试；无代理直连（无 IP 头）时回退为按用户名限速
-    let rate_key = extract_ip(&headers)
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| format!("user:{}", payload.username));
+    // 速率限制：每个客户端 IP 每分钟最多 N 次登录尝试；无法获取 IP 时回退为按用户名限速
+    let rate_key =
+        extract_ip(peer_ip, &headers).unwrap_or_else(|| format!("user:{}", payload.username));
     if !rate_limit::check_rate_limit(
         &rate_key,
         LOGIN_RATE_LIMIT_ATTEMPTS,
@@ -164,6 +198,8 @@ pub async fn login(
         .unwrap_or(false);
 
         if is_valid {
+            // 登录成功即删除含明文密码的凭据文件（一次性引导文件）
+            let _ = tokio::fs::remove_file("credentials.txt").await;
             let token = Uuid::new_v4().to_string();
             let token_hash = hash_token(&token);
             let expires = chrono::Utc::now()
@@ -190,7 +226,7 @@ pub async fn login(
                 "login",
                 None,
                 None,
-                extract_ip(&headers),
+                extract_ip(peer_ip, &headers).as_deref(),
                 extract_ua(&headers),
             )
             .await;
@@ -237,10 +273,16 @@ pub async fn login(
 pub async fn register(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(config): Extension<Config>,
+    MaybePeer(peer_ip): MaybePeer,
     headers: HeaderMap,
     Json(payload): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     use crate::handlers::utils::hash_password;
+
+    // 注册开关（PINAS_ALLOW_REGISTRATION）——默认关闭
+    if !config.allow_registration {
+        return (StatusCode::FORBIDDEN, "注册未开放").into_response();
+    }
 
     // 输入校验
     if let Err(msg) = validate_username(&payload.username) {
@@ -250,10 +292,9 @@ pub async fn register(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
-    // 速率限制：每个 IP 每小时最多 N 次注册；无代理直连时回退为按用户名限速
-    let rate_key = extract_ip(&headers)
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| format!("user:{}", payload.username));
+    // 速率限制：每个客户端 IP 每小时最多 N 次注册；无法获取 IP 时回退为按用户名限速
+    let rate_key =
+        extract_ip(peer_ip, &headers).unwrap_or_else(|| format!("user:{}", payload.username));
     if !rate_limit::check_rate_limit(
         &rate_key,
         REGISTER_RATE_LIMIT_ATTEMPTS,
@@ -315,7 +356,7 @@ pub async fn register(
         "register",
         None,
         None,
-        extract_ip(&headers),
+        extract_ip(None, &headers).as_deref(),
         extract_ua(&headers),
     )
     .await;
@@ -364,6 +405,22 @@ pub async fn change_password(
         Some(u) => u,
         None => return (StatusCode::UNAUTHORIZED, "会话已过期，请重新登录").into_response(),
     };
+
+    // 限速：每用户每分钟最多 3 次改密尝试（会话被盗后防 current_password 爆破）
+    let rate_key = format!("pwd:{}", username);
+    if !crate::handlers::rate_limit::check_rate_limit(
+        &rate_key,
+        3,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "修改密码过于频繁，请稍后再试",
+        )
+            .into_response();
+    }
 
     // 验证当前密码
     let row = queries::get_user_auth(&pool, &username)
@@ -461,7 +518,7 @@ pub async fn change_password(
         "change_password",
         None,
         None,
-        extract_ip(&headers),
+        extract_ip(None, &headers).as_deref(),
         extract_ua(&headers),
     )
     .await;
@@ -527,7 +584,7 @@ pub async fn logout(
             "logout",
             None,
             None,
-            extract_ip(headers),
+            extract_ip(None, headers).as_deref(),
             extract_ua(headers),
         )
         .await;

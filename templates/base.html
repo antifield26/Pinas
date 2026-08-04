@@ -128,15 +128,35 @@
         var v = el ? el.value || '/' : '/';
         if (v === '/' || v === '') return;
         App.navigateTo(v.substring(0, v.lastIndexOf('/')) || '/');
+      },
+      // 媒体加载失败：移除失败元素并显示静态 fallback（不拼接用户数据进 innerHTML，防 XSS）
+      showMediaError: function(el) {
+        var fallback = document.getElementById('media-fallback');
+        if (el) el.remove();
+        if (fallback) fallback.classList.remove('hidden');
       }
     };
     // 向后兼容别名
     window.showToast = App.showToast;
     window.closeModal = App.closeModal;
 
+    // 云盘导航委托：目录行 / 打开按钮 (data-nav-path) 与面包屑 (data-breadcrumb-path) 统一入口。
+    // 用户数据不进入内联 JS 字符串（防存储型 XSS），统一从 data-* 属性读取。
+    document.body.addEventListener('click', function(e) {
+      var el = e.target.closest('[data-nav-path], [data-breadcrumb-path]');
+      if (!el) return;
+      e.preventDefault();
+      var path = el.getAttribute('data-nav-path') || el.getAttribute('data-breadcrumb-path') || '';
+      App.navigateTo(path);
+      if (el.hasAttribute('data-breadcrumb-path')) {
+        // 面包屑点击时同步刷新面包屑自身（hx-on 旧实现的功能迁移）
+        htmx.ajax('GET', '/drive/breadcrumbs', { target: '#drive-breadcrumbs', values: { path: path } });
+      }
+    });
+
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=9', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=10', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;
@@ -158,6 +178,13 @@
       if (e.detail.xhr && e.detail.xhr.status === 401) {
         window.location.href = '/login';
         e.detail.shouldSwap = false;
+        return;
+      }
+      // 离线降级：SW 返回 503 JSON 时保留旧内容 + 提示（不把 JSON 原文 swap 进容器）
+      if (e.detail.xhr && e.detail.xhr.status === 503 &&
+          (e.detail.xhr.getResponseHeader('content-type') || '').indexOf('application/json') !== -1) {
+        e.detail.shouldSwap = false;
+        App.showToast('网络连接已断开，请检查网络后重试', 'error');
       }
     });
 
@@ -189,8 +216,7 @@
     };
 
     // Modal: show when content loaded, hide when emptied
-    // 注：模态框内容来自服务端 Askama 模板（自动转义），无需 DOMPurify 二次消毒
-    // DOMPurify 保留用于 AI 聊天 markdown 渲染（chat_message.html 内联调用）
+    // 注：模态框内容来自服务端 Askama 模板（自动转义），无第三方消毒依赖
     // 页面导航过渡（hx-boost 整页替换）：请求开始浅淡出 → 新页面淡入上移
     // 离场只淡到 0.6（不白屏）；请求失败/401 立即恢复
     document.body.addEventListener('htmx:beforeRequest', function(e) {
@@ -211,6 +237,17 @@
     document.body.addEventListener('htmx:afterSwap', function(e) {
       var target = e.detail.target;
       if (!target) return;
+
+      // 过期响应防护：快速连点目录时，旧请求的列表可能后到。
+      // 若本次列表请求的 path 已不是当前路径，用最新路径重发（幂等刷新）。
+      if (target.id === 'drive-file-list') {
+        var el = document.getElementById('drive-current-path');
+        var reqPath = e.detail.requestConfig && e.detail.requestConfig.parameters && e.detail.requestConfig.parameters.path;
+        if (el && reqPath && reqPath !== el.value) {
+          App.navigateTo(el.value);
+          return;
+        }
+      }
 
       // 整页导航（hx-boost）：离场浅淡结束，切换为进场淡入
       if (e.detail.boosted) {
@@ -263,7 +300,26 @@
       var MAX_RETRIES = 3;
       var chunkBytes = CHUNK_MB * 1024 * 1024;
       var totalChunks = Math.max(1, Math.ceil(file.size / chunkBytes));
+      // identifier 由内容哈希派生(前 1MB + 文件大小 SHA-256)：
+      // 同内容重传 → 同 identifier → /api/files/check 命中 → 秒传/跨会话断点续传真实生效。
+      // 非安全上下文(纯 HTTP)无 crypto.subtle 时回退随机串。
       var identifier = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      try {
+        if (window.crypto && crypto.subtle && file.size > 0) {
+          var head = file.slice(0, 1024 * 1024);
+          var headBuf = await head.arrayBuffer();
+          var sizeBuf = new ArrayBuffer(8);
+          new DataView(sizeBuf).setUint32(0, file.size >>> 0, true);
+          new DataView(sizeBuf).setUint32(4, Math.floor(file.size / 0x100000000), true);
+          var combined = new Uint8Array(headBuf.byteLength + 8);
+          combined.set(new Uint8Array(headBuf), 0);
+          combined.set(new Uint8Array(sizeBuf), headBuf.byteLength);
+          var digest = await crypto.subtle.digest('SHA-256', combined);
+          var hex = '';
+          new Uint8Array(digest).forEach(function(b) { hex += b.toString(16).padStart(2, '0'); });
+          identifier = 'f' + hex.slice(0, 32);
+        }
+      } catch (_) { /* crypto 不可用，保持随机回退 */ }
       // normalize path: collapse slashes, ensure leading /
       var raw = (path || '').replace(/\/+/g, '/');
       var parent = (raw === '/' || raw === '') ? '' : raw.replace(/\/$/, '');

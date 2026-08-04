@@ -58,32 +58,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("网盘核心服务已启动，监听: {}", addr);
 
     let shutdown_token = cancel_token.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let sigint = tokio::signal::ctrl_c();
-            let sigterm = async {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{SignalKind, signal};
-                    let mut stream =
-                        signal(SignalKind::terminate()).expect("无法注册 SIGTERM 处理器");
-                    stream.recv().await;
-                    info!("收到 SIGTERM 信号");
-                }
-                #[cfg(not(unix))]
-                std::future::pending::<()>().await;
-            };
-            tokio::select! {
-                _ = sigint => info!("收到 SIGINT (Ctrl-C) 信号"),
-                _ = sigterm => {},
+    // 注入 ConnectInfo<SocketAddr>：auth 限速据此区分可信隧道(回环)与直连来源
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let sigint = tokio::signal::ctrl_c();
+        let sigterm = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut stream = signal(SignalKind::terminate()).expect("无法注册 SIGTERM 处理器");
+                stream.recv().await;
+                info!("收到 SIGTERM 信号");
             }
-            info!("正在优雅关闭...");
-            // 通知后台任务停止
-            shutdown_token.cancel();
-            // 给予后台任务 5 秒完成清理
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        })
-        .await?;
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            _ = sigint => info!("收到 SIGINT (Ctrl-C) 信号"),
+            _ = sigterm => {},
+        }
+        info!("正在优雅关闭...");
+        // 通知后台任务停止
+        shutdown_token.cancel();
+        // 给予后台任务 5 秒完成清理
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    })
+    .await?;
 
     info!("服务已安全关闭");
     Ok(())

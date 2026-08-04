@@ -309,7 +309,7 @@ use askama::Template;
 
 #[derive(Template)]
 #[template(path = "components/minecraft_status.html")]
-struct MinecraftStatusFragment {
+pub struct MinecraftStatusFragment {
     online: bool,
     motd: String,
     version: String,
@@ -319,7 +319,13 @@ struct MinecraftStatusFragment {
 }
 
 #[tracing::instrument(skip_all)]
-pub async fn minecraft_status_fragment() -> impl axum::response::IntoResponse {
+pub async fn minecraft_status_fragment(
+    axum::extract::Extension(session): axum::extract::Extension<pinas_core::UserSession>,
+) -> Result<AppTemplate<MinecraftStatusFragment>, axum::http::StatusCode> {
+    // 与 get_minecraft_status 对齐：仅管理员可见（MC 状态含内网拓扑信息）
+    if session.role != crate::constants::ROLE_ADMIN {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
     // Default config — same as get_minecraft_status
     let host = std::env::var("MINECRAFT_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("MINECRAFT_PORT")
@@ -343,7 +349,7 @@ pub async fn minecraft_status_fragment() -> impl axum::response::IntoResponse {
                 players_max.unwrap_or(0)
             );
             let names = player_names.join(", ");
-            AppTemplate(MinecraftStatusFragment {
+            Ok(AppTemplate(MinecraftStatusFragment {
                 online: true,
                 motd: motd.unwrap_or_else(|| "---".into()),
                 version: version.unwrap_or_else(|| "---".into()),
@@ -354,18 +360,18 @@ pub async fn minecraft_status_fragment() -> impl axum::response::IntoResponse {
                     names
                 },
                 error: String::new(),
-            })
+            }))
         }
         status => {
             let err = status.error.unwrap_or_else(|| "无法连接".into());
-            AppTemplate(MinecraftStatusFragment {
+            Ok(AppTemplate(MinecraftStatusFragment {
                 online: false,
                 motd: "---".into(),
                 version: "---".into(),
                 players: "---".into(),
                 player_names: String::new(),
                 error: err,
-            })
+            }))
         }
     }
 }

@@ -110,6 +110,9 @@ impl AppError {
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
         AppError::ServiceUnavailable(msg.into())
     }
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        AppError::TooManyRequests(msg.into())
+    }
 
     /// 内部错误：错误细节仅写入日志，客户端只收到通用文案（防止 IO/DB 细节泄露）
     pub fn internal_log(ctx: impl Into<String>, e: impl std::fmt::Display) -> Self {

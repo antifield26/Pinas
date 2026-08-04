@@ -1,14 +1,12 @@
-// ====== Antifield Cloud Service Worker v9 ======
-const CACHE_NAME = 'antifield-v9';
-const RUNTIME_CACHE = 'antifield-runtime-v9';
+// ====== Antifield Cloud Service Worker v10 ======
+const CACHE_NAME = 'antifield-v10';
+const RUNTIME_CACHE = 'antifield-runtime-v10';
 
-// 资源全部本地化（HTMX/Alpine 已从 unpkg 移入 assets/）
+// 资源全部本地化（HTMX/Alpine 已从 unpkg 移入 assets/；marked/purify 无调用点已移除）
 // 注：版本号与 HTML 引用（base.html 等 4 处 ?v=）严格对齐，保证预缓存命中
 const PRE_CACHE_URLS = [
   '/',
   '/assets/css/tailwind.min.css?v=16',
-  '/assets/marked.min.js?v=8',
-  '/assets/purify.min.js?v=9',
   '/assets/htmx.min.js?v=1',
   '/assets/alpine.min.js?v=1',
 ];
@@ -19,7 +17,7 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(PRE_CACHE_URLS).catch((err) => {
-        console.warn('[SW] 部分预缓存失败（CDN 可能不可用）:', err);
+        console.warn('[SW] 部分预缓存失败:', err);
       });
     }).then(() => self.skipWaiting())
   );
@@ -48,13 +46,7 @@ self.addEventListener('fetch', (event) => {
   if (!url.protocol.startsWith('http')) return;
   if (url.pathname === '/sw.js') return;
 
-  // CDN 资源 — Cache First（预缓存中已有，离线可用）
-  if (url.hostname === 'unpkg.com') {
-    event.respondWith(cacheFirst(request));
-    return;
-  }
-
-  // 其他外部资源跳过
+  // 其他外部资源跳过（资源已全部本地化，无第三方 CDN 依赖）
   if (url.hostname !== location.hostname) return;
 
   // 静态资源 — Cache First

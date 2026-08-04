@@ -72,19 +72,6 @@ pub async fn get_user_quota(
         .await
 }
 
-/// 更新用户已用容量（重新计算 files 表中所有文件大小）
-pub async fn recalc_user_used_mb(pool: &SqlitePool, username: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE users SET used_mb = COALESCE((SELECT SUM(size_mb) FROM files WHERE username = ? AND is_dir = 0), 0) WHERE username = ?"
-    )
-    .bind(username).bind(username)
-    .execute(pool)
-    .await
-    .map(|_| ())
-}
-
-// ====== 会话查询 ======
-
 /// 创建用户会话
 pub async fn create_session(
     pool: &SqlitePool,
@@ -120,53 +107,6 @@ pub async fn clean_expired_sessions(pool: &SqlitePool) -> Result<(), sqlx::Error
         .map(|_| ())
 }
 
-// ====== 文件查询 ======
-
-/// 检查文件是否已存在（用于秒传去重）
-pub async fn file_exists_by_identifier(
-    pool: &SqlitePool,
-    username: &str,
-    identifier: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE username = ? AND identifier = ?")
-        .bind(username)
-        .bind(identifier)
-        .fetch_one(pool)
-        .await
-        .map(|count: i64| count > 0)
-}
-
-/// 获取用户在指定目录下的文件和子目录列表
-pub async fn list_user_files(
-    pool: &SqlitePool,
-    username: &str,
-    parent_path: &str,
-) -> Result<Vec<FileRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, username, name, parent_path, is_dir, size_mb, identifier, created_at
-         FROM files WHERE username = ? AND parent_path = ?
-         ORDER BY is_dir DESC, name ASC",
-    )
-    .bind(username)
-    .bind(parent_path)
-    .fetch_all(pool)
-    .await
-}
-
-/// 文件列表行（用于 FromRow 映射）
-#[derive(sqlx::FromRow, Debug, Clone)]
-pub struct FileRow {
-    pub id: i64,
-    pub username: String,
-    pub name: String,
-    pub parent_path: String,
-    pub is_dir: i64,
-    pub size_mb: f64,
-    pub identifier: Option<String>,
-    pub created_at: Option<String>,
-}
-
-/// 获取用户在指定目录下的条目数
 pub async fn count_user_files(
     pool: &SqlitePool,
     username: &str,

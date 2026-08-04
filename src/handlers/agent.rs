@@ -291,6 +291,9 @@ async fn resolve_agent_config(
     let user_max_tokens = user_settings.as_ref().and_then(|u| u.4).unwrap_or(4096);
 
     // API Key: 用户设置 > 全局配置
+    let user_has_key = user_api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty());
     let api_key = match user_api_key.or_else(|| config.deepseek_api_key.clone()) {
         Some(k) if !k.is_empty() => k,
         _ => return Err((
@@ -300,10 +303,15 @@ async fn resolve_agent_config(
         )),
     };
 
-    // API Base: 用户设置 > 全局配置 > 默认值
-    let api_base = user_api_base
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| config.deepseek_api_base.clone());
+    // API Base: 用户自配 key 时才允许自配 base；
+    // 使用全局 key 时强制全局 base（防止把全局 key 发往用户可控服务器造成凭据窃取）
+    let api_base = if user_has_key {
+        user_api_base
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| config.deepseek_api_base.clone())
+    } else {
+        config.deepseek_api_base.clone()
+    };
 
     // Model: 请求参数 > 用户设置 > 全局配置
     let model = requested_model
@@ -375,7 +383,11 @@ async fn call_deepseek(
                     401 => "AI API 密钥无效".to_string(),
                     429 => "AI 请求过于频繁，请稍后重试".to_string(),
                     500..=599 => "AI 服务暂时不可用".to_string(),
-                    _ => format!("AI 服务错误: {}", err_msg),
+                    _ => {
+                        // 上游响应体只进日志，不回显客户端（防错误细节泄露）
+                        tracing::error!("[Agent] AI API 错误 status={}: {}", status, err_msg);
+                        "AI 服务返回错误，请稍后重试".to_string()
+                    }
                 };
                 Err((StatusCode::BAD_GATEWAY, user_msg))
             }

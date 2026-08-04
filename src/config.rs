@@ -30,6 +30,9 @@ pub struct Config {
     pub deepseek_model: String,
     #[serde(default)]
     pub deepseek_api_key: Option<String>,
+    /// 注册开关：serde 默认 false（生产未配置即关闭）；Config::default() 为 true（测试/开发便利）
+    #[serde(default = "default_allow_registration")]
+    pub allow_registration: bool,
 }
 
 // serde default 函数
@@ -66,6 +69,9 @@ fn default_deepseek_api_base() -> String {
 fn default_deepseek_model() -> String {
     "deepseek-v4-flash".into()
 }
+fn default_allow_registration() -> bool {
+    false
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -84,6 +90,8 @@ impl Default for Config {
             deepseek_api_base: default_deepseek_api_base(),
             deepseek_model: default_deepseek_model(),
             deepseek_api_key: None,
+            // 测试/开发便利：Config::default() 开放注册（生产走 from_env，serde 默认关闭）
+            allow_registration: true,
         }
     }
 }

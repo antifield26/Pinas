@@ -1,10 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Antifield Cloud — 首页{% endblock %}
 
-{% block head_extra %}
-<script src="/assets/marked.min.js?v=8" data-cfasync="false"></script>
-<script src="/assets/purify.min.js?v=9" data-cfasync="false"></script>
-{% endblock %}
+{% block head_extra %}{% endblock %}
 
 {% block content %}
 <div class="space-y-8">
@@ -19,7 +16,7 @@
     </div>
     {% endif %}
     <div id="minecraft-status"
-         hx-get="/home/minecraft-status" hx-trigger="load" hx-swap="innerHTML"
+         hx-get="/home/minecraft-status" hx-trigger="load, every 5s" hx-sync="this:drop" hx-swap="innerHTML"
          class="card p-6">
       <div class="animate-pulse text-sm text-gray-400">加载 Minecraft 状态...</div>
     </div>

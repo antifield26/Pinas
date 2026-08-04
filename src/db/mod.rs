@@ -208,7 +208,7 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // AI 对话管理
+    // AI 对话管理（conversation_messages 死表已于 v5 迁移移除，消息持久化列为后续）
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,19 +217,6 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS conversation_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
         )",
     )
     .execute(pool)
@@ -302,12 +289,16 @@ async fn sync_user_password(
             } else {
                 "访客"
             };
+            // 安全:明文密码不写入日志(会进日志文件与 journald),仅提示凭据文件位置
             tracing::warn!("══════════════════════════════════════════════════");
             tracing::warn!(
                 "  未设置 PINAS_{}_PASSWORD 环境变量",
                 username.to_uppercase()
             );
-            tracing::warn!("  已自动生成{}随机密码: {}", label, pwd);
+            tracing::warn!(
+                "  已自动生成{}随机密码（明文见 credentials.txt，首次登录后自动删除）",
+                label
+            );
             tracing::warn!("  请立即登录并修改密码！");
             tracing::warn!("══════════════════════════════════════════════════");
             let hash = hash_password(&pwd)?;

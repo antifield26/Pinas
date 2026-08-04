@@ -81,8 +81,9 @@ pub async fn auth_middleware(
     };
 
     let token_hash = hash_token(&target_token);
+    // role 实时取 users 表（不信任 sessions 快照）：admin 降权后未过期会话立即生效
     let session_row = sqlx::query(
-        "SELECT s.username, s.role, COALESCE(u.must_change_pwd, 0) as must_change_pwd \
+        "SELECT s.username, COALESCE(u.role, s.role) as role, COALESCE(u.must_change_pwd, 0) as must_change_pwd \
          FROM sessions s LEFT JOIN users u ON s.username = u.username \
          WHERE s.token = ? AND s.expires_at > datetime('now')",
     )

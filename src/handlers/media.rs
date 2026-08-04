@@ -35,7 +35,10 @@ pub async fn get_file_content_handler(
 ) -> impl IntoResponse {
     let username = &session.username;
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_p = safe_join_sandbox(base_path, &format!("{}/{}", username, query.path));
+    let full_p = match safe_join_sandbox(base_path, &format!("{}/{}", username, query.path)) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "文件不存在").into_response(),
+    };
 
     // 检查文件大小，防止读取超大文件耗尽内存
     if let Ok(meta) = tokio::fs::metadata(&full_p).await
@@ -83,7 +86,10 @@ pub async fn save_file_content_handler(
 
     let username = &session.username;
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_p = safe_join_sandbox(base_path, &format!("{}/{}", username, payload.path));
+    let full_p = match safe_join_sandbox(base_path, &format!("{}/{}", username, payload.path)) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
+    };
 
     if let Err(e) = tokio::fs::write(&full_p, payload.content.as_bytes()).await {
         tracing::error!("[Media] 写入文件失败: {}", e);
@@ -147,7 +153,10 @@ pub async fn media_proxy(
 ) -> impl IntoResponse {
     let username = &session.username;
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_path = safe_join_sandbox(base_path, &format!("{}/{}", username, raw_path));
+    let full_path = match safe_join_sandbox(base_path, &format!("{}/{}", username, raw_path)) {
+        Ok(p) => p,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
 
     if !full_path.exists() {
         return StatusCode::NOT_FOUND.into_response();
@@ -162,16 +171,29 @@ pub async fn media_proxy(
         &full_path,
         mime_guess::from_path(&full_path).first_or_octet_stream(),
     );
+    let mime_str = mime.to_string();
+    // html/svg/xml 等内联渲染可执行脚本 → 强制 octet-stream（存储型 XSS 通道封堵）
+    let force_download = crate::handlers::utils::is_force_download_mime(&mime_str);
+    let content_type = if force_download {
+        HeaderValue::from_static("application/octet-stream")
+    } else {
+        mime_str
+            .parse()
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+    };
+
+    // 空文件：直接返回 200 空体（避免 (file_size-1) 下溢为 u64::MAX）
+    if file_size == 0 {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, content_type);
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(0u64));
+        return (StatusCode::OK, headers, Body::empty()).into_response();
+    }
 
     // HEAD 请求：仅返回元数据头（浏览器用于探测 Range 支持）
     if req.method() == axum::http::Method::HEAD {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            mime.to_string()
-                .parse()
-                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-        );
+        headers.insert(header::CONTENT_TYPE, content_type);
         headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(file_size));
         return (StatusCode::OK, headers).into_response();
@@ -212,12 +234,10 @@ pub async fn media_proxy(
     let body = Body::from_stream(stream);
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        mime.to_string()
-            .parse()
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-    );
+    headers.insert(header::CONTENT_TYPE, content_type);
+    if force_download && let Ok(d) = "attachment".parse::<HeaderValue>() {
+        headers.insert(header::CONTENT_DISPOSITION, d);
+    }
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     // 禁用 gzip 压缩 — 视频/音频已是压缩格式，再压缩会缓冲整个响应导致无法 seek
@@ -321,8 +341,10 @@ pub async fn download_zip(
     let mut items = Vec::new();
     for name in &payload.names {
         // 使用 safe_join_sandbox 而非 Path::starts_with，后者不规范化 .. 组件，
-        // 可能导致路径穿越攻击（如 ../../../etc/passwd）
-        let target_path = safe_join_sandbox(&base_dir, name);
+        // 可能导致路径穿越攻击（如 ../../../etc/passwd）；非法路径直接跳过
+        let Ok(target_path) = safe_join_sandbox(&base_dir, name) else {
+            continue;
+        };
         if target_path.starts_with(&user_root) && target_path.exists() {
             items.push((name.clone(), target_path));
         }
@@ -368,6 +390,10 @@ pub async fn download_zip(
             .unix_permissions(0o644);
 
         for (name, full_path) in items {
+            // 条目名净化：跳过 "."/".."（防 zip-slip 解压穿越）
+            if name == "." || name == ".." {
+                continue;
+            }
             if full_path.is_file() {
                 let mut file = std::fs::File::open(&full_path).map_err(|e| e.to_string())?;
                 zip_writer
@@ -390,11 +416,8 @@ pub async fn download_zip(
         Ok(inner) => inner,
         Err(join_err) => {
             let _ = tokio::fs::remove_file(&temp_path_clone).await;
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("压缩任务失败: {}", join_err),
-            )
-                .into_response();
+            tracing::error!("[Media] 压缩任务失败: {}", join_err);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "文件压缩失败，请重试").into_response();
         }
     };
     if let Err(e) = zip_inner {
@@ -405,14 +428,12 @@ pub async fn download_zip(
 
     match tokio::fs::File::open(&temp_path_clone).await {
         Ok(file) => {
-            let path_for_cleanup = temp_path_clone.clone();
-            // 延迟清理临时文件（10 分钟，足够大多数下载完成）
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
-                let _ = tokio::fs::remove_file(&path_for_cleanup).await;
-            });
-            let stream = ReaderStream::new(file);
-            let body = Body::from_stream(stream);
+            // 临时文件在流结束时删除（替代固定 600s 延迟删除：
+            // 慢链路下大 zip 可能未传完就被删，且崩溃时残留堆积）
+            let body = Body::from_stream(ReaderStream::new(DeleteOnDropFile {
+                inner: file,
+                path: temp_path_clone,
+            }));
             let headers = [
                 ("content-type", "application/zip"),
                 (
@@ -432,6 +453,28 @@ pub async fn download_zip(
     }
 }
 
+/// 流式传输文件，Drop 时删除临时文件（连接完成或中断均触发）
+struct DeleteOnDropFile {
+    inner: tokio::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl tokio::io::AsyncRead for DeleteOnDropFile {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl Drop for DeleteOnDropFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 // 辅助：同步递归添加目录到 ZIP
 fn add_dir_to_zip_sync(
     zip_writer: &mut zip::ZipWriter<std::fs::File>,
@@ -443,6 +486,10 @@ fn add_dir_to_zip_sync(
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
+        // 跳过 "."/".." 条目（zip-slip 防御）
+        if name == "." || name == ".." {
+            continue;
+        }
         let zip_name = format!("{}/{}", zip_prefix, name);
         if path.is_file() {
             let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;

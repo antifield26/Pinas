@@ -13,12 +13,12 @@
       <th class="p-4 w-8"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)" class="rounded"></th>
       <th class="p-4">
         <a href="#" hx-get="/drive/list" hx-target="#drive-file-list"
-           hx-vals='{"path":"{{ current_path }}","sort_by":"name_desc"}'
+           hx-vals='{"path":{{ current_path | json }},"sort_by":"name_desc"}'
            class="hover:text-indigo-600 transition">文件名 ▾</a>
       </th>
       <th class="p-4 w-24 hidden sm:table-cell">
         <a href="#" hx-get="/drive/list" hx-target="#drive-file-list"
-           hx-vals='{"path":"{{ current_path }}","sort_by":"size_desc"}'
+           hx-vals='{"path":{{ current_path | json }},"sort_by":"size_desc"}'
            class="hover:text-indigo-600 transition">大小</a>
       </th>
       <th class="p-4 text-right"><span class="hidden sm:inline">操作</span></th>
@@ -36,7 +36,7 @@
         <div class="flex items-center gap-3">
           <span class="text-xs text-gray-400 w-8 shrink-0">{% if f.is_dir %}📁{% else %}📄{% endif %}</span>
           {% if f.is_dir %}
-          <a href="#" onclick="App.navigateTo('{{ current_path }}/{{ f.name }}'); return false;"
+          <a href="#" data-nav-path="{{ current_path }}/{{ f.name }}"
              class="text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 font-medium">{{ f.name }}</a>
           {% else %}
           <span class="text-gray-800 dark:text-gray-200">{{ f.name }}</span>
@@ -47,17 +47,17 @@
       <td class="p-4 text-right">
         <div class="flex gap-1 justify-end whitespace-nowrap">
           {% if f.is_dir %}
-          <button onclick="App.navigateTo('{{ current_path }}/{{ f.name }}')"
+          <button data-nav-path="{{ current_path }}/{{ f.name }}"
                   class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">打开</button>
           {% else %}
-          <button hx-get="/drive/preview" hx-vals='{"path":"{{ current_path }}","name":"{{ f.name }}"}' hx-target="#modal-container" hx-swap="innerHTML"
+          <button hx-get="/drive/preview" hx-vals='{"path":{{ current_path | json }},"name":{{ f.name | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
                   class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition">预览</button>
           {% endif %}
-          <button hx-get="/drive/rename-form" hx-vals='{"name":"{{ f.name }}","current_path":"{{ current_path }}"}' hx-target="#modal-container" hx-swap="innerHTML"
+          <button hx-get="/drive/rename-form" hx-vals='{"name":{{ f.name | json }},"current_path":{{ current_path | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
                   class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition">重命名</button>
-          <button hx-get="/drive/move-form" hx-vals='{"name":"{{ f.name }}","current_path":"{{ current_path }}"}' hx-target="#modal-container" hx-swap="innerHTML"
+          <button hx-get="/drive/move-form" hx-vals='{"name":{{ f.name | json }},"current_path":{{ current_path | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
                   class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-sky-50 dark:bg-sky-900/20 text-sky-600 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-900/50 transition">移动</button>
-          <button hx-post="/drive/delete" hx-vals='{"name":"{{ f.name }}","current_path":"{{ current_path }}"}' hx-target="#drive-file-list"
+          <button hx-post="/drive/delete" hx-vals='{"name":{{ f.name | json }},"current_path":{{ current_path | json }}}' hx-target="#drive-file-list"
                   hx-confirm="确定删除？" class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50 transition">删除</button>
         </div>
       </td>

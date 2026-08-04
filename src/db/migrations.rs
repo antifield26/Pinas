@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 3;
+const CURRENT_VERSION: i32 = 5;
 
 /// 执行所有待迁移的 schema 变更
 pub async fn run(pool: &SqlitePool) {
@@ -46,6 +46,24 @@ pub async fn run(pool: &SqlitePool) {
             .await
             .expect("记录 schema v3 失败");
         tracing::info!("[DB] Schema 迁移到 v3 完成");
+    }
+
+    if current < 4 {
+        apply_v4_migrations(pool).await;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (4)")
+            .execute(pool)
+            .await
+            .expect("记录 schema v4 失败");
+        tracing::info!("[DB] Schema 迁移到 v4 完成");
+    }
+
+    if current < 5 {
+        apply_v5_migrations(pool).await;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (5)")
+            .execute(pool)
+            .await
+            .expect("记录 schema v5 失败");
+        tracing::info!("[DB] Schema 迁移到 v5 完成");
     }
 
     tracing::debug!(
@@ -145,6 +163,42 @@ async fn apply_v2_migrations(pool: &SqlitePool) {
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     tracing::info!("[DB] v2 迁移: size_mb 列 {affected} 行 TEXT → REAL 已转换");
+}
+
+/// v5: 移除 conversation_messages 死表（全库无 INSERT/SELECT，AI 消息仅存客户端）
+async fn apply_v5_migrations(pool: &SqlitePool) {
+    sqlx::query("DROP TABLE IF EXISTS conversation_messages")
+        .execute(pool)
+        .await
+        .ok();
+    tracing::info!("[DB] v5 迁移: 移除 conversation_messages 死表");
+}
+
+/// v4: upload_chunks 添加 bytes_received 列(分片阶段磁盘上限核算) + created_at 索引(孤儿行清理)
+async fn apply_v4_migrations(pool: &SqlitePool) {
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(upload_chunks)")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.get::<String, _>(1))
+        .collect();
+
+    if !cols.iter().any(|c| c == "bytes_received") {
+        sqlx::query(
+            "ALTER TABLE upload_chunks ADD COLUMN bytes_received INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
+        .expect("迁移 upload_chunks.bytes_received 失败");
+    }
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_upload_chunks_created_at ON upload_chunks (created_at)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+    tracing::info!("[DB] v4 迁移: upload_chunks 添加 bytes_received 列与 created_at 索引");
 }
 
 /// v3: user_settings 添加 temperature 和 max_tokens 列

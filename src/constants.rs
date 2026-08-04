@@ -23,6 +23,8 @@ pub const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 pub const MAX_BODY_SIZE_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_CHUNK_SIZE_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_CHUNKS_PER_FILE: i32 = 10_000;
+/// 单用户未合并临时分片总字节上限（防分片阶段耗尽磁盘的 DoS）
+pub const PENDING_CHUNKS_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const MAX_EDITOR_READ_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_EDIT_SAVE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 
@@ -42,9 +44,3 @@ pub const RATE_LIMIT_CLEANUP_INTERVAL_SECS: u64 = 600;
 pub const RATE_LIMIT_CLEANUP_AGE_SECS: u64 = 300;
 pub const LOG_CLEANUP_INTERVAL_SECS: u64 = 86_400;
 pub const LOG_RETENTION_DAYS: u64 = 7;
-
-// --- 密码生成 ---
-pub const RANDOM_PASSWORD_LEN: usize = 24;
-
-// --- 会话默认 ---
-pub const DEFAULT_SESSION_DAYS: i64 = 7;

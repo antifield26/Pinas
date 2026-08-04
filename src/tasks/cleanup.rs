@@ -1,5 +1,5 @@
 // ====== 后台清理任务 ======
-use sqlx::{Connection, SqlitePool};
+use sqlx::SqlitePool;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -27,8 +27,70 @@ pub fn spawn_all(
         config.trash_cleanup_interval_hours,
         cancel.child_token(),
     );
+    spawn_session_cleanup(pool.clone(), cancel.child_token());
+    spawn_chunk_rows_cleanup(pool.clone(), cancel.child_token());
+    spawn_audit_cleanup(pool.clone(), cancel.child_token());
     spawn_auto_backup(pool.clone(), cancel.child_token());
     spawn_wal_checkpoint(pool.clone(), cancel.child_token());
+}
+
+/// 定期清理过期会话行（sessions 表曾只在本启动时清理，运行期无限增长）
+fn spawn_session_cleanup(pool: SqlitePool, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => { tracing::info!("会话清理任务已停止"); break; }
+                _ = interval.tick() => {
+                    if let Err(e) = sqlx::query("DELETE FROM sessions WHERE expires_at <= datetime('now')")
+                        .execute(&pool).await
+                    {
+                        tracing::error!("清理过期会话失败: {}", e);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 定期清理超 24h 的孤儿分片 DB 行（临时文件由 spawn_temp_chunk_cleanup 清理，行此前无清理）
+fn spawn_chunk_rows_cleanup(pool: SqlitePool, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => { tracing::info!("分片记录清理任务已停止"); break; }
+                _ = interval.tick() => {
+                    if let Err(e) = sqlx::query(
+                        "DELETE FROM upload_chunks WHERE created_at < datetime('now', '-1 day')",
+                    ).execute(&pool).await
+                    {
+                        tracing::error!("清理孤儿分片记录失败: {}", e);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// 审计日志保留 90 天（此前无清理，audit_logs 无限增长）
+fn spawn_audit_cleanup(pool: SqlitePool, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(86_400));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => { tracing::info!("审计日志清理任务已停止"); break; }
+                _ = interval.tick() => {
+                    if let Err(e) = sqlx::query(
+                        "DELETE FROM audit_logs WHERE created_at < datetime('now', '-90 days')",
+                    ).execute(&pool).await
+                    {
+                        tracing::error!("清理过期审计日志失败: {}", e);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 定期执行 WAL checkpoint 防止 -wal 文件无限增长
@@ -130,7 +192,7 @@ fn spawn_trash_cleanup(
     });
 }
 
-/// 自动备份（使用 VACUUM INTO 创建数据库副本）
+/// 自动备份（使用 VACUUM INTO 创建数据库副本）— 保留最近 7 份
 fn spawn_auto_backup(pool: SqlitePool, cancel: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(86_400));
@@ -138,38 +200,64 @@ fn spawn_auto_backup(pool: SqlitePool, cancel: CancellationToken) {
             tokio::select! {
                 _ = cancel.cancelled() => { tracing::info!("自动备份任务已停止"); break; }
                 _ = interval.tick() => {
-                    let backup_dir = std::path::Path::new("backups");
-                    if let Err(e) = tokio::fs::create_dir_all(backup_dir).await {
-                        tracing::error!("创建备份目录失败: {}", e);
-                        continue;
-                    }
-                    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                    let backup_path = format!("backups/cloud_disk_backup_{}.db", ts);
-                    // 备份前执行 WAL checkpoint 确保数据一致性
-                    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await;
-                    match sqlx::SqliteConnection::connect_with(
-                        &sqlx::sqlite::SqliteConnectOptions::new()
-                            .filename(&backup_path)
-                            .create_if_missing(true),
-                    ).await {
-                        Ok(mut conn) => {
-                            let sql = format!("VACUUM INTO '{}'", backup_path);
-                            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                                .execute(&mut conn)
-                                .await
-                            {
-                                tracing::error!("备份失败: {}", e);
-                                let _ = tokio::fs::remove_file(&backup_path).await;
-                            } else {
-                                tracing::info!("自动备份完成: {}", backup_path);
-                            }
-                        }
-                        Err(e) => tracing::error!("创建备份连接失败: {}", e),
+                    match auto_backup_once(&pool, std::path::Path::new("backups")).await {
+                        Ok(path) => tracing::info!("自动备份完成: {}", path),
+                        Err(e) => tracing::error!("自动备份失败: {}", e),
                     }
                 }
             }
         }
     });
+}
+
+/// 执行一次数据库备份(VACUUM INTO) + 保留轮转。
+/// 注意:VACUUM INTO 必须在**源库连接**上执行(在备份文件连接上执行会自锁/产出空文件)。
+pub async fn auto_backup_once(
+    pool: &SqlitePool,
+    backup_dir: &std::path::Path,
+) -> Result<String, crate::error::AppError> {
+    use crate::error::AppError;
+    const BACKUP_KEEP: usize = 7;
+
+    tokio::fs::create_dir_all(backup_dir)
+        .await
+        .map_err(|e| AppError::internal_log("创建备份目录", e))?;
+
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let backup_path = backup_dir.join(format!("cloud_disk_backup_{}.db", ts));
+    let backup_path_str = backup_path.to_string_lossy().to_string();
+    if backup_path_str.contains('\'') {
+        return Err(AppError::internal("备份路径非法"));
+    }
+
+    // 备份前执行 WAL checkpoint 确保数据一致性（失败不阻断备份）
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await;
+
+    // 在源库池连接上执行 VACUUM INTO（路径为服务端生成的时间戳，无注入面）
+    let sql = format!("VACUUM INTO '{}'", backup_path_str);
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::internal_log("VACUUM INTO 备份", e))?;
+
+    // 保留轮转：只保留最新 BACKUP_KEEP 份，删除更早的
+    let mut backups: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(backup_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname.starts_with("cloud_disk_backup_") && fname.ends_with(".db") {
+                backups.push((fname.clone(), entry.path()));
+            }
+        }
+    }
+    backups.sort_by(|a, b| b.0.cmp(&a.0)); // 时间戳前缀字典序 = 时间倒序
+    for (_, path) in backups.iter().skip(BACKUP_KEEP) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    Ok(backup_path_str)
 }
 
 // --- 辅助函数 ---
@@ -223,4 +311,59 @@ async fn clean_old_logs(retention_days: u64) -> Result<(), std::io::Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_auto_backup_creates_valid_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t VALUES (42)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let backup_dir = dir.path().join("backups");
+        let backup_path = auto_backup_once(&pool, &backup_dir).await.unwrap();
+
+        // 备份文件必须存在且包含源库的表与数据（验证 VACUUM INTO 在源库连接上正确执行）
+        let check_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&backup_path)
+                    .read_only(true),
+            )
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='t'",
+        )
+        .fetch_one(&check_pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "备份文件应包含源库表");
+        let v: i64 = sqlx::query_scalar("SELECT id FROM t")
+            .fetch_one(&check_pool)
+            .await
+            .unwrap();
+        assert_eq!(v, 42, "备份文件应包含源库数据");
+    }
 }

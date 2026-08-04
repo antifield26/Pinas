@@ -132,17 +132,92 @@ pub async fn delete_share(
     Ok((StatusCode::OK, "分享链条已切断"))
 }
 
-// --- 19. 外链匿名提取与子目录探索（简单响应）---
+// --- 19. 外链匿名下载（分享页下载按钮的真实目标；附件下载 + 强制下载类型，防同源 XSS）---
 pub async fn access_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Path(code): Path<String>,
-) -> AppResult<(StatusCode, &'static str)> {
-    let exists = sqlx::query("SELECT 1 FROM shares WHERE code = ? AND (expires_at IS NULL OR expires_at > datetime('now'))")
-        .bind(&code).fetch_optional(&pool).await?.is_some();
-    if exists {
-        Ok((StatusCode::OK, "分享链接有效"))
-    } else {
-        Err(AppError::gone("外链已失效或过期"))
+    Query(params): Query<AccessShareRequest>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let share =
+        sqlx::query("SELECT username, file_path, password, expires_at FROM shares WHERE code = ?")
+            .bind(&code)
+            .fetch_optional(&pool)
+            .await;
+
+    let row = match share {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "分享链接不存在或已失效").into_response(),
+    };
+    let username: String = row.get("username");
+    let file_path_str: String = row.get("file_path");
+    let db_password: Option<String> = row.get("password");
+    let expires_at: Option<String> = row.get("expires_at");
+
+    // 密码校验（有密码的分享必须验证）
+    if let Some(pwd_hash) = db_password {
+        let input_pwd = params.password.unwrap_or_default().to_string();
+        let hash_clone = pwd_hash.clone();
+        let is_valid =
+            tokio::task::spawn_blocking(move || verify_password(&hash_clone, &input_pwd))
+                .await
+                .unwrap_or(false);
+        if !is_valid {
+            return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
+        }
+    }
+
+    // 过期校验
+    if let Some(expire_str) = expires_at
+        && let Ok(expire) = NaiveDateTime::parse_from_str(&expire_str, "%Y-%m-%d %H:%M:%S")
+        && Utc::now().naive_utc() > expire
+    {
+        return (StatusCode::GONE, "分享链接已过期").into_response();
+    }
+
+    // 真实路径沙箱解析（分享根即文件本身）
+    let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
+    let full_path = match crate::handlers::utils::safe_join_sandbox(
+        base,
+        &format!("{}/{}", username, file_path_str),
+    ) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "分享内容不存在").into_response(),
+    };
+    if !full_path.is_file() {
+        return (StatusCode::BAD_REQUEST, "仅支持文件分享下载").into_response();
+    }
+    let meta = match tokio::fs::metadata(&full_path).await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "文件读取失败").into_response(),
+    };
+
+    // 流式返回：一律 attachment；html/svg/xml 强制 octet-stream（同源 XSS 通道封堵）
+    match tokio::fs::File::open(&full_path).await {
+        Ok(file) => {
+            let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
+            let mime_str = mime.to_string();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                if crate::handlers::utils::is_force_download_mime(&mime_str) {
+                    HeaderValue::from_static("application/octet-stream")
+                } else {
+                    mime_str
+                        .parse()
+                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+                },
+            );
+            if let Ok(disposition) = "attachment".parse::<HeaderValue>() {
+                headers.insert(header::CONTENT_DISPOSITION, disposition);
+            }
+            headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(meta.len()));
+            let body = Body::from_stream(ReaderStream::new(file));
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "文件读取失败").into_response(),
     }
 }
 
@@ -229,8 +304,13 @@ pub async fn share_page(
 
     // Check if it's a directory（真实路径 = uploads/{owner}/{file_path}，与 share_subfile 一致）
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_path =
-        crate::handlers::utils::safe_join_sandbox(base, &format!("{}/{}", owner, file_path_str));
+    let full_path = match crate::handlers::utils::safe_join_sandbox(
+        base,
+        &format!("{}/{}", owner, file_path_str),
+    ) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "分享内容不存在").into_response(),
+    };
     let is_dir = full_path.is_dir();
     let file_size;
     let file_count;
@@ -313,10 +393,16 @@ pub async fn share_subfile(
     }
 
     let user_root = std::path::PathBuf::from(crate::constants::UPLOADS_DIR).join(&username);
-    let share_base = safe_join_sandbox(&user_root, &share_root_path);
-    let target_path = safe_join_sandbox(&share_base, &file_path);
+    let share_base = match safe_join_sandbox(&user_root, &share_root_path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::FORBIDDEN, "访问越界").into_response(),
+    };
+    let target_path = match safe_join_sandbox(&share_base, &file_path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::FORBIDDEN, "访问越界").into_response(),
+    };
 
-    // 路径前缀检查（组件级，阻止 ../ 穿越）
+    // 路径前缀检查（组件级，阻止 ../ 穿越；沙箱 Result 已拦截主路径，此检查兜底符号链接场景）
     if !target_path.starts_with(&share_base) {
         return (StatusCode::FORBIDDEN, "访问越界").into_response();
     }
@@ -367,13 +453,22 @@ pub async fn share_subfile(
     match tokio::fs::File::open(&target_path).await {
         Ok(file) => {
             let mime = mime_guess::from_path(&target_path).first_or_octet_stream();
+            let mime_str = mime.to_string();
             let mut headers = HeaderMap::new();
+            // 分享文件一律附件下载（内联渲染 html/svg 等可导致同源存储型 XSS）
             headers.insert(
                 header::CONTENT_TYPE,
-                mime.to_string()
-                    .parse()
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+                if crate::handlers::utils::is_force_download_mime(&mime_str) {
+                    HeaderValue::from_static("application/octet-stream")
+                } else {
+                    mime_str
+                        .parse()
+                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
+                },
             );
+            if let Ok(disposition) = "attachment".parse::<HeaderValue>() {
+                headers.insert(header::CONTENT_DISPOSITION, disposition);
+            }
             headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             let body = Body::from_stream(ReaderStream::new(file));
             (StatusCode::OK, headers, body).into_response()

@@ -1,5 +1,66 @@
 # Changelog
 
+## v1.5.1 (2026-08-04)
+
+### Security（全面评估驱动,3 项 Critical 修复）
+- **C1 任意文件写入修复**:merge_chunks 的 `file_name` 绕过沙箱(可写 `../../.env`、`~/.ssh/authorized_keys` 等,
+  配合开放注册构成完整 RCE 链)→ 新增 `validate_name()` 白名单(拒绝路径分隔符/穿越/引号/尖括号/控制字符)
+  + 合并目标 `starts_with` 兜底复检;`validate_name` 同时挂到建文件夹/重命名/移动
+- **C2 存储型 XSS 通道封堵**(三条):
+  - 模板内联 JS 字符串外置:file_table/breadcrumbs 的 onclick/hx-on 改 `data-*` 属性 + 事件委托,
+    preview onerror 改静态 fallback(JS 内零用户数据)
+  - 分享/媒体下载强制类型:html/svg/xml/js 一律 `application/octet-stream` + `Content-Disposition: attachment`
+    (新增 `is_force_download_mime`);顺带修复分享页下载按钮指向"仅探测有效性"端点的功能 bug
+  - Askama `serde_json` feature:`hx-vals` 全部改用 `|json` 过滤器(引号注入系统性修复)
+- **C3(潜伏)API Key 窃取修复**:使用全局 DeepSeek key 时强制全局 api_base(用户不可自定义);
+  settings 的 api_base 仅允许 https 域名(拒绝 IP/内网/本地)
+- `safe_join_sandbox` 回退语义根治:5 处"攻击时返回 base"改为 `Err`(修复 `delete name=".."` 移走整个
+  uploads 目录的漏洞),18 个调用点全部改造;`delete_batch`/`move_batch` 非法条目跳过而非回退
+- CSP 清理死条目(unpkg/cloudflareinsights/ws/wss);`unsafe-inline`/`unsafe-eval` 保留并注明
+  (Alpine/htmx 架构硬依赖)
+
+### Fixed
+- **自动备份损坏一个月**:VACUUM INTO 在备份文件连接上执行(自锁失败/产出空文件)→ 改在源库池连接执行
+  + 保留 7 份轮转;抽 `auto_backup_once` 并加有效性测试
+- 限速可伪造 X-Forwarded-For 绕过:新增 `MaybePeer` 提取器,直连(非回环)忽略一切客户端头,
+  回环(cloudflared)信任 CF-Connecting-IP
+- 分片阶段无配额/磁盘上限:upload_chunks 新增 `bytes_received`(迁移 v4),单用户临时分片 5GB 上限,
+  merge 前先算总量预检配额(避免大文件写完才拒)
+- 空文件媒体 Range 下溢(`(file_size-1)` → u64::MAX)→ 200 空体
+- 明文密码进日志/credentials.txt:日志只打位置提示,首次登录成功自动删除凭据文件
+- 错误细节回显客户端 4 处(agent/zip 压缩/move/回收站)→ 仅日志
+- `download_zip` 临时文件:600s 延迟删除(慢链路会中途删文件)→ 流结束即删(DeleteOnDropFile)
+- 会话 role 快照:中间件实时联查 users.role(降权立即生效)
+- `/home/minecraft-status` 片段补 admin 角色校验;change_password 加限速(3 次/分钟)
+- PDF 预览 embed → iframe(CSP object-src 'none' 会拦截 embed)
+- 离线降级:SW 503 JSON 不再原文 swap 进容器(beforeSwap 拦截 + toast)
+- zip 条目名净化(拒 "."/".." 防 zip-slip)
+
+### Changed
+- 注册开关 `PINAS_ALLOW_REGISTRATION`(默认关闭,生产未配置即不可注册)
+- 配额算法统一:全量重算改 `SUM(CEIL(size_mb))`,与上传 ceil 增量语义一致(消除显示漂移)
+- 上传秒传/断点续传真启用:identifier 改内容哈希派生(SHA-256 前 1MB+大小),同内容重传自动秒传
+- 上传并发导航乱序防护:afterSwap 检测到过期列表响应自动以最新路径重发
+- argon2 `0.6.0-rc.8` → `0.5.3` stable(哈希格式兼容,既有账号可直接登录);sha2 对齐 0.10 消除双版本
+- SW v10:移除 marked/purify 死预缓存与 unpkg 死分支(全库无调用点,已核实)
+
+### Cleanup
+- 死表 `conversation_messages` 移除(迁移 v5);死代码清理(recalc_user_used_mb/count_user_files/
+  file_exists_by_identifier/list_user_files/FileRow/DEFAULT_SESSION_DAYS/RANDOM_PASSWORD_LEN)
+- jsdom 未使用 devDependency 移除;CLAUDE.md/CHANGELOG 同步
+
+### Tests
+- 新增 8 个测试:穿越 merge 拒绝(5 种载荷)、delete ".." 拒绝、非法名称创建/重命名、分享下载
+  Content-Disposition、备份有效性、rename/move 子树路径迁移、媒体 Range 语义(HEAD/206/416/空文件)
+- 集成测试文件系统隔离:test_app 将 CWD 切换到独立临时目录(不再污染项目 uploads/)
+- 全量 30 个测试通过(11 lib + 19 integration),clippy 零警告
+
+### Build & Ops
+- 版本 1.5.1;部署脚本 `scripts/deploy.sh`(按 git HEAD 构建 + VERSION 记录 + 健康检查);
+  版本对齐检查 `scripts/check-versions.sh`(模板 ?v= vs SW 预缓存,纳入构建流程)
+
+---
+
 ## v1.5.0 (2026-08-03)
 
 ### Added
