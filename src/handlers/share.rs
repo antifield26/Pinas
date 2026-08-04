@@ -10,9 +10,9 @@ use sqlx::{FromRow, Row};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, log_audit, safe_join_sandbox, verify_password};
-use pinas_core::UserSession;
 
 // --- DTOs ---
 #[derive(Deserialize)]
@@ -283,7 +283,7 @@ pub async fn share_page(
     let pwd_ok = if password_required {
         let hash = stored_pwd.clone();
         let input = submitted_password.clone();
-        tokio::task::spawn_blocking(move || pinas_core::verify_password(&hash, &input))
+        tokio::task::spawn_blocking(move || crate::core::verify_password(&hash, &input))
             .await
             .unwrap_or(false)
     } else {

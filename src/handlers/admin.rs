@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
 use crate::config::Config;
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, log_audit};
-use pinas_core::UserSession;
 use sqlx::Connection;
 
 // DTOs

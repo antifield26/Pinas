@@ -1,5 +1,5 @@
-// 密码学函数已迁移至 pinas-core::crypto，此处仅做重导出以保持向后兼容
-pub use pinas_core::{generate_random_password, hash_password, verify_password};
+// 密码学函数来自 crate::core::crypto，此处重导出以保持 handler 层调用简洁
+pub use crate::core::{generate_random_password, hash_password, verify_password};
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -269,9 +269,9 @@ mod tests {
     #[test]
     fn test_hash_token() {
         let token = "test-token";
-        let hash = pinas_core::hash_token(token);
+        let hash = crate::core::hash_token(token);
         assert_eq!(hash.len(), 64);
-        assert_eq!(hash, pinas_core::hash_token(token));
+        assert_eq!(hash, crate::core::hash_token(token));
     }
 
     #[test]
@@ -362,8 +362,8 @@ mod tests {
     #[test]
     fn test_verify_password() {
         let password = "testpass";
-        let hash = pinas_core::hash_password(password).unwrap();
-        assert!(pinas_core::verify_password(&hash, password));
-        assert!(!pinas_core::verify_password(&hash, "wrongpass"));
+        let hash = crate::core::hash_password(password).unwrap();
+        assert!(crate::core::verify_password(&hash, password));
+        assert!(!crate::core::verify_password(&hash, "wrongpass"));
     }
 }

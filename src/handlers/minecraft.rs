@@ -1,7 +1,7 @@
 // ====== Minecraft 服务器状态查询 ======
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use axum::{extract::Extension, response::Json};
-use pinas_core::UserSession;
 use serde::Serialize;
 
 // ====== VarInt 编解码 ======
@@ -320,7 +320,7 @@ pub struct MinecraftStatusFragment {
 
 #[tracing::instrument(skip_all)]
 pub async fn minecraft_status_fragment(
-    axum::extract::Extension(session): axum::extract::Extension<pinas_core::UserSession>,
+    axum::extract::Extension(session): axum::extract::Extension<crate::core::UserSession>,
 ) -> Result<AppTemplate<MinecraftStatusFragment>, axum::http::StatusCode> {
     // 与 get_minecraft_status 对齐：仅管理员可见（MC 状态含内网拓扑信息）
     if session.role != crate::constants::ROLE_ADMIN {

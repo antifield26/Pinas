@@ -3,8 +3,8 @@ use axum::{extract::Extension, response::Json};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
-use pinas_core::UserSession;
 
 // ====== DTOs ======
 

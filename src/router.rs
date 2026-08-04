@@ -153,6 +153,10 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/api/conversations", get(handlers::list_conversations))
         .route("/api/conversations", post(handlers::create_conversation))
         .route(
+            "/api/conversations/{id}/messages",
+            get(handlers::get_conversation_messages),
+        )
+        .route(
             "/api/conversations/{id}",
             put(handlers::rename_conversation),
         )
@@ -160,7 +164,7 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
             "/api/conversations/{id}",
             delete(handlers::delete_conversation),
         )
-        .layer(middleware::from_fn(pinas_core::auth::auth_middleware));
+        .layer(middleware::from_fn(crate::core::auth::auth_middleware));
 
     // --- 静态文件服务（24h 缓存） ---
     let assets_service = tower::ServiceBuilder::new()

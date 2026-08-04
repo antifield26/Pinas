@@ -2,9 +2,9 @@ use axum::{extract::Extension, http::StatusCode, response::Json};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{log_audit, safe_join_sandbox, update_user_used_mb};
-use pinas_core::UserSession;
 
 #[derive(Serialize, FromRow)]
 pub struct TrashItem {

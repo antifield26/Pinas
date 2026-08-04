@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use std::sync::LazyLock;
 
 use crate::config::Config;
-use pinas_core::UserSession;
+use crate::core::UserSession;
 
 /// 用户 Agent 设置行（user_settings 表一行）：(api_key, api_base, model, temperature, max_tokens)
 type UserSettingsRow = Option<(
@@ -56,6 +56,9 @@ pub struct ChatRequest {
     pub temperature: f32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// 会话 ID：提供时消息持久化到该对话并从库中加载上下文
+    #[serde(default)]
+    pub conversation_id: Option<i64>,
 }
 
 fn default_temperature() -> f32 {
@@ -70,6 +73,8 @@ pub struct ChatResponse {
     pub reply: String,
     pub model: String,
     pub usage: Option<UsageInfo>,
+    /// 实际写入的会话 ID（首次对话自动创建后回传，前端用于后续轮次）
+    pub conversation_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -337,6 +342,119 @@ pub async fn get_models() -> impl IntoResponse {
     Json(models)
 }
 
+// ====== 对话消息持久化 ======
+
+/// 保存一轮对话消息；无 conversation_id 时自动创建对话（标题取首条用户消息截断）
+async fn save_chat_round(
+    pool: &SqlitePool,
+    username: &str,
+    conversation_id: Option<i64>,
+    user_msg: &str,
+    assistant_reply: &str,
+) -> Result<i64, sqlx::Error> {
+    let conv_id = match conversation_id {
+        Some(id) => id,
+        None => {
+            let title: String = user_msg.chars().take(20).collect();
+            let title = if title.len() < user_msg.len() {
+                format!("{}…", title)
+            } else {
+                title
+            };
+            sqlx::query_scalar(
+                "INSERT INTO conversations (username, title) VALUES (?, ?) RETURNING id",
+            )
+            .bind(username)
+            .bind(title)
+            .fetch_one(pool)
+            .await?
+        }
+    };
+    sqlx::query(
+        "INSERT INTO conversation_messages (conversation_id, role, content) VALUES (?, 'user', ?)",
+    )
+    .bind(conv_id)
+    .bind(user_msg)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO conversation_messages (conversation_id, role, content) VALUES (?, 'assistant', ?)",
+    )
+    .bind(conv_id)
+    .bind(assistant_reply)
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?")
+        .bind(conv_id)
+        .execute(pool)
+        .await?;
+    Ok(conv_id)
+}
+
+/// 加载对话历史（最近 limit 条 user/assistant 消息，按时间正序；校验归属）
+async fn load_conversation_history(
+    pool: &SqlitePool,
+    username: &str,
+    conversation_id: i64,
+    limit: i64,
+) -> Vec<DeepSeekMessage> {
+    let owns: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ? AND username = ?")
+            .bind(conversation_id)
+            .bind(username)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+    if owns == 0 {
+        return Vec::new();
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT role, content FROM (
+            SELECT id, role, content FROM conversation_messages
+            WHERE conversation_id = ? AND role IN ('user', 'assistant')
+            ORDER BY id DESC LIMIT ?
+        ) ORDER BY id ASC",
+    )
+    .bind(conversation_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|(role, content)| DeepSeekMessage { role, content })
+        .collect()
+}
+
+/// GET /api/conversations/{id}/messages — 加载对话消息历史（仅归属用户）
+pub async fn get_conversation_messages(
+    Extension(pool): Extension<SqlitePool>,
+    Extension(session): Extension<UserSession>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let owns: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ? AND username = ?")
+            .bind(id)
+            .bind(&session.username)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+    if owns == 0 {
+        return (StatusCode::NOT_FOUND, "对话不存在").into_response();
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT role, content FROM conversation_messages WHERE conversation_id = ? ORDER BY id ASC",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    let messages: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+        .collect();
+    Json(messages).into_response()
+}
+
 // ====== DeepSeek API 调用辅助函数 ======
 
 async fn call_deepseek(
@@ -421,22 +539,46 @@ pub async fn agent_chat(
     // 构建动态系统提示词（包含用户待办/日程数据）
     let system_prompt = get_cached_prompt(&pool, &session.username).await;
 
-    // 构建消息列表：系统提示 + 用户消息历史
-    let mut deepseek_messages = Vec::with_capacity(payload.messages.len() + 1);
+    // 构建消息列表：系统提示 + 上下文
+    let mut deepseek_messages = Vec::with_capacity(64);
     deepseek_messages.push(DeepSeekMessage {
         role: "system".to_string(),
         content: system_prompt,
     });
 
-    for msg in &payload.messages {
-        let role = match msg.role.as_str() {
-            "user" | "assistant" | "system" => msg.role.clone(),
-            _ => continue,
-        };
-        deepseek_messages.push(DeepSeekMessage {
-            role,
-            content: msg.content.clone(),
-        });
+    // 本轮用户消息：带 conversation_id 时取 payload 最后一条 user 消息（历史从库中加载，防重复）；
+    // 无 conversation_id 时兼容旧调用（前端一次性发完整历史）
+    let last_user_msg = payload
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone());
+
+    match payload.conversation_id {
+        Some(conv_id) => {
+            // 校验归属并把库中历史作为上下文
+            let history = load_conversation_history(&pool, &session.username, conv_id, 20).await;
+            deepseek_messages.extend(history);
+            if let Some(um) = &last_user_msg {
+                deepseek_messages.push(DeepSeekMessage {
+                    role: "user".to_string(),
+                    content: um.clone(),
+                });
+            }
+        }
+        None => {
+            for msg in &payload.messages {
+                let role = match msg.role.as_str() {
+                    "user" | "assistant" | "system" => msg.role.clone(),
+                    _ => continue,
+                };
+                deepseek_messages.push(DeepSeekMessage {
+                    role,
+                    content: msg.content.clone(),
+                });
+            }
+        }
     }
 
     match call_deepseek(
@@ -467,10 +609,24 @@ pub async fn agent_chat(
                 usage.as_ref().map_or(0, |u| u.prompt_tokens),
                 usage.as_ref().map_or(0, |u| u.completion_tokens)
             );
+            // 持久化本轮对话（无对话时自动创建，返回新对话 ID）
+            let conv_id = match last_user_msg {
+                Some(um) => save_chat_round(
+                    &pool,
+                    &session.username,
+                    payload.conversation_id,
+                    &um,
+                    &reply,
+                )
+                .await
+                .ok(),
+                None => payload.conversation_id,
+            };
             Json(ChatResponse {
                 reply,
                 model,
                 usage,
+                conversation_id: conv_id,
             })
             .into_response()
         }
@@ -689,16 +845,23 @@ pub async fn agent_chat_fragment(
 
     let model = resolved.model.clone();
     let system_prompt = get_cached_prompt(&pool, &session.username).await;
-    let messages = vec![
-        DeepSeekMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-        },
-        DeepSeekMessage {
-            role: "user".to_string(),
-            content: user_msg.clone(),
-        },
-    ];
+
+    // 会话 ID（表单 hidden 字段）：有值则加载库历史作为上下文
+    let conversation_id: Option<i64> = form.get("conversation_id").and_then(|s| s.parse().ok());
+
+    let mut messages = Vec::with_capacity(32);
+    messages.push(DeepSeekMessage {
+        role: "system".to_string(),
+        content: system_prompt,
+    });
+    if let Some(cid) = conversation_id {
+        let history = load_conversation_history(&pool, &session.username, cid, 20).await;
+        messages.extend(history);
+    }
+    messages.push(DeepSeekMessage {
+        role: "user".to_string(),
+        content: user_msg.clone(),
+    });
 
     match call_deepseek(
         &resolved.api_base,
@@ -725,6 +888,9 @@ pub async fn agent_chat_fragment(
                     )
                 })
                 .unwrap_or_default();
+            // 持久化本轮消息（无对话时自动创建，标题取首条消息）
+            let _ =
+                save_chat_round(&pool, &session.username, conversation_id, &user_msg, &reply).await;
             AppTemplate(ChatMessageFragment {
                 user_message: user_msg,
                 assistant_reply: reply,

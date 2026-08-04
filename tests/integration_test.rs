@@ -1515,3 +1515,87 @@ async fn test_media_proxy_range_semantics() {
     let _ = tokio::fs::remove_file(format!("uploads/{}/empty.bin", username)).await;
     let _ = pool;
 }
+
+// ====== 11. AI 对话消息持久化端点 ======
+
+/// 消息端点:归属校验(他人对话 404)+ 空对话返回空数组
+#[tokio::test]
+async fn test_conversation_messages_endpoint() {
+    let (_pool, app) = test_app().await;
+    let (token_a, _ua) = register_and_login_with_username(&app).await;
+    let (token_b, _ub) = register_and_login_with_username(&app).await;
+
+    // A 创建对话
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/conversations")
+                .header("authorization", format!("Bearer {}", token_a))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let conv: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let conv_id = conv["id"].as_i64().unwrap();
+
+    // A 读取 → 空消息数组
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/conversations/{}/messages", conv_id))
+                .header("authorization", format!("Bearer {}", token_a))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    if status != StatusCode::OK {
+        let b = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        panic!(
+            "读取消息应 200，实际: {} body={}",
+            status,
+            String::from_utf8_lossy(&b)
+        );
+    }
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let messages: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(messages.as_array().unwrap().len(), 0, "新对话应无消息");
+
+    // B 访问 A 的对话 → 404（归属校验）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/conversations/{}/messages", conv_id))
+                .header("authorization", format!("Bearer {}", token_b))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "他人对话必须 404");
+
+    // 不存在 id → 404
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/conversations/999999/messages")
+                .header("authorization", format!("Bearer {}", token_a))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

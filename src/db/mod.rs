@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::constants::*;
-use pinas_core::{generate_random_password, hash_password};
+use crate::core::{generate_random_password, hash_password};
 
 /// 创建 SQLite 连接池（WAL 模式，高并发读）
 pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {

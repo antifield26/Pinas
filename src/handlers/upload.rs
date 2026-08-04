@@ -6,12 +6,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{
     bytes_to_mb_ceil, is_allowed_mime, is_allowed_mime_streaming, is_blocked_extension, log_audit,
     safe_join_sandbox, user_dir_path,
 };
-use pinas_core::UserSession;
 
 // --- DTOs ---
 #[derive(Deserialize)]

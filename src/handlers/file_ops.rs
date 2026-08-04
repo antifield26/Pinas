@@ -6,6 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
 
+use crate::core::UserSession;
 use crate::db::queries::update_child_paths as update_child_parent_paths;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{
@@ -13,7 +14,6 @@ use crate::handlers::utils::{
 };
 use crate::templates::AppTemplate;
 use askama::Template;
-use pinas_core::UserSession;
 
 // ====== DTOs ======
 

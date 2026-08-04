@@ -10,10 +10,10 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::constants::*;
+use crate::core::hash_token;
 use crate::db::queries;
 use crate::handlers::rate_limit;
 use crate::handlers::utils::log_audit;
-use pinas_core::hash_token;
 
 /// 校验用户名格式：2-32 字符，仅允许字母/数字/下划线/连字符
 fn validate_username(username: &str) -> Result<(), &'static str> {
@@ -58,7 +58,7 @@ pub struct LoginResponse {
 }
 
 /// 从请求中提取会话 token：优先 Cookie（浏览器场景），其次 Authorization Bearer（API 场景）
-/// 与 pinas-core::auth::auth_middleware 的提取优先级保持一致
+/// 与 crate::core::auth::auth_middleware 的提取优先级保持一致
 fn extract_auth_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get("Cookie")

@@ -1,8 +1,8 @@
 // ====== HTMX 页面路由处理器 ======
+use crate::core::UserSession;
 use crate::templates::{AppTemplate, NavItem, nav_items};
 use askama::Template;
 use axum::{extract::Extension, response::IntoResponse};
-use pinas_core::UserSession;
 
 // ====== 页面模板结构体（继承 base.html） ======
 

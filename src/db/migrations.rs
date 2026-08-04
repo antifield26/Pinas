@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 5;
+const CURRENT_VERSION: i32 = 6;
 
 /// 执行所有待迁移的 schema 变更
 pub async fn run(pool: &SqlitePool) {
@@ -64,6 +64,15 @@ pub async fn run(pool: &SqlitePool) {
             .await
             .expect("记录 schema v5 失败");
         tracing::info!("[DB] Schema 迁移到 v5 完成");
+    }
+
+    if current < 6 {
+        apply_v6_migrations(pool).await;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (6)")
+            .execute(pool)
+            .await
+            .expect("记录 schema v6 失败");
+        tracing::info!("[DB] Schema 迁移到 v6 完成");
     }
 
     tracing::debug!(
@@ -163,6 +172,34 @@ async fn apply_v2_migrations(pool: &SqlitePool) {
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     tracing::info!("[DB] v2 迁移: size_mb 列 {affected} 行 TEXT → REAL 已转换");
+}
+
+/// v6: 重建 conversation_messages 表（AI 消息持久化：聊天历史随对话保存，跨会话可加载）
+async fn apply_v6_migrations(pool: &SqlitePool) {
+    sqlx::query("DROP TABLE IF EXISTS conversation_messages")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await
+    .expect("重建 conversation_messages 表失败");
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv ON conversation_messages (conversation_id, id)",
+    )
+    .execute(pool)
+    .await
+    .ok();
+    tracing::info!("[DB] v6 迁移: 重建 conversation_messages 表（消息持久化）");
 }
 
 /// v5: 移除 conversation_messages 死表（全库无 INSERT/SELECT，AI 消息仅存客户端）

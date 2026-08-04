@@ -6,9 +6,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::log_audit;
-use pinas_core::UserSession;
 
 // DTOs
 #[derive(Debug, Deserialize)]

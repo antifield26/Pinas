@@ -1,6 +1,6 @@
+use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use axum::{extract::Extension, response::Json};
-use pinas_core::UserSession;
 
 // ====== 系统信息采集（消除 get_system_status 和 system_monitor_fragment 重复代码） ======
 
@@ -145,7 +145,7 @@ struct SystemMonitorLive {
 /// GET /home/system-monitor — 系统状态 HTML 片段（仅管理员）
 #[tracing::instrument(skip_all)]
 pub async fn system_monitor_fragment(
-    Extension(session): Extension<pinas_core::UserSession>,
+    Extension(session): Extension<crate::core::UserSession>,
 ) -> impl IntoResponse {
     if session.role != crate::constants::ROLE_ADMIN {
         return AppTemplate(SystemMonitorLive {

@@ -7,10 +7,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::core::UserSession;
 use crate::error::AppResult;
 use crate::templates::AppTemplate;
 use askama::Template;
-use pinas_core::UserSession;
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Conversation {

@@ -1,8 +1,11 @@
 // ====== 密码学工具函数 ======
 // 集中管理密码哈希、token 哈希、随机密码生成
-// 供 db 层和 handlers 层共用，避免循环依赖
+// 供 db 层和 handlers 层共用
 
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 哈希 token（用于数据库存储）
@@ -12,19 +15,23 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Argon2 密码哈希
+/// Argon2 密码哈希（自动随机盐）
 pub fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes())
+        .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|e| format!("密码哈希失败: {}", e))
 }
 
 /// Argon2 密码验证
 pub fn verify_password(hash: &str, password: &str) -> bool {
-    Argon2::default()
-        .verify_password(password.as_bytes(), hash)
-        .is_ok()
+    match PasswordHash::new(hash) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// 使用安全随机数生成器生成随机密码

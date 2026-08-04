@@ -10,9 +10,9 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 
+use crate::core::UserSession;
 use crate::handlers::BatchDownloadRequest;
 use crate::handlers::utils::{log_audit, safe_join_sandbox, update_user_used_mb, user_dir_path};
-use pinas_core::UserSession;
 
 #[derive(Deserialize)]
 pub struct EditGetQuery {
