@@ -1599,3 +1599,427 @@ async fn test_conversation_messages_endpoint() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ====== 10. WebDAV 测试 (v1.6.0) ======
+
+fn basic_auth_header(username: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password))
+    )
+}
+
+async fn dav_send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    auth: Option<&str>,
+    body: Vec<u8>,
+    extra: &[(&str, &str)],
+) -> axum::http::Response<axum::body::Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(a) = auth {
+        builder = builder.header("authorization", a);
+    }
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    let body = if body.is_empty() {
+        Body::empty()
+    } else {
+        Body::from(body)
+    };
+    app.clone().oneshot(builder.body(body).unwrap()).await.unwrap()
+}
+
+async fn read_body_text(resp: axum::http::Response<axum::body::Body>) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// 无凭据 PROPFIND → 401 + WWW-Authenticate
+#[tokio::test]
+async fn test_dav_propfind_requires_auth() {
+    let (_pool, app) = test_app().await;
+    let resp = dav_send(&app, "PROPFIND", "/dav/", None, vec![], &[("Depth", "1")]).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        resp.headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("Basic")),
+        "必须返回 WWW-Authenticate: Basic"
+    );
+}
+
+/// 错误密码 → 401
+#[tokio::test]
+async fn test_dav_wrong_password_rejected() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let bad = basic_auth_header(&username, "wrong-password");
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&bad), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// PUT → GET 回读一致；PROPFIND 列出子项
+#[tokio::test]
+async fn test_dav_put_get_roundtrip_and_propfind() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    let resp = dav_send(
+        &app,
+        "PUT",
+        "/dav/hello.txt",
+        Some(&auth),
+        b"hello dav".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = dav_send(&app, "GET", "/dav/hello.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_body_text(resp).await, "hello dav");
+
+    // PROPFIND 根 Depth 1 → 包含 hello.txt 与配额属性
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&auth), vec![], &[("Depth", "1")]).await;
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+    let xml = read_body_text(resp).await;
+    assert!(xml.contains("hello.txt"), "PROPFIND 应列出子项: {}", xml);
+    assert!(xml.contains("quota-available-bytes"), "应含配额属性");
+
+    // Depth infinity → 403
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&auth), vec![], &[("Depth", "infinity")]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// PUT 覆盖 → 204 + 新内容生效
+#[tokio::test]
+async fn test_dav_put_overwrite() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(&app, "PUT", "/dav/a.txt", Some(&auth), b"v1".to_vec(), &[]).await;
+    let resp = dav_send(&app, "PUT", "/dav/a.txt", Some(&auth), b"v2-longer".to_vec(), &[]).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = dav_send(&app, "GET", "/dav/a.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(read_body_text(resp).await, "v2-longer");
+}
+
+/// PUT 到不存在的子目录 → 目录行自动创建（ensure_dir_rows）
+#[tokio::test]
+async fn test_dav_put_creates_dir_rows() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    let resp = dav_send(
+        &app,
+        "PUT",
+        "/dav/sub/deep/file.txt",
+        Some(&auth),
+        b"nested".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // 目录行已登记（sub 与 sub/deep）
+    let cnt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM files WHERE username = ? AND is_dir = 1 AND parent_path IN ('', 'sub')",
+    )
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cnt, 2, "sub 与 sub/deep 目录行应存在");
+
+    // 全局搜索命中（FTS 触发器联动）——用同一用户的登录 token
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/drive/list?path=&search=file", &token))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let html = read_body_text(resp).await;
+    assert!(html.contains("file.txt"), "全局搜索应命中: {}", html);
+}
+
+/// MOVE / COPY（含 Overwrite:F → 412）
+#[tokio::test]
+async fn test_dav_move_copy_overwrite() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(&app, "PUT", "/dav/src.txt", Some(&auth), b"move-me".to_vec(), &[]).await;
+    dav_send(&app, "PUT", "/dav/dst.txt", Some(&auth), b"occupied".to_vec(), &[]).await;
+
+    // Overwrite: F 且目标存在 → 412
+    let resp = dav_send(
+        &app,
+        "MOVE",
+        "/dav/src.txt",
+        Some(&auth),
+        vec![],
+        &[("Destination", "/dav/dst.txt"), ("Overwrite", "F")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+
+    // 正常 MOVE → 201；旧路径 404
+    let resp = dav_send(
+        &app,
+        "MOVE",
+        "/dav/src.txt",
+        Some(&auth),
+        vec![],
+        &[("Destination", "/dav/moved.txt")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = dav_send(&app, "GET", "/dav/src.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = dav_send(&app, "GET", "/dav/moved.txt", Some(&auth), vec![], &[]).await;
+    let st = resp.status();
+    let cl = resp.headers().get("content-length").map(|v| v.to_str().unwrap_or("?").to_string());
+    let bd = read_body_text(resp).await;
+    println!("[TEST] GET moved status={} cl={:?} body={:?}", st, cl, bd);
+
+    // COPY → 源保留 + 副本存在
+    let resp = dav_send(
+        &app,
+        "COPY",
+        "/dav/moved.txt",
+        Some(&auth),
+        vec![],
+        &[("Destination", "/dav/copied.txt")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = dav_send(&app, "GET", "/dav/copied.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(read_body_text(resp).await, "move-me");
+    let resp = dav_send(&app, "GET", "/dav/moved.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// DELETE → 进回收站（可还原）+ 配额回落
+#[tokio::test]
+async fn test_dav_delete_goes_to_trash() {
+    let (pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(&app, "PUT", "/dav/trashme.txt", Some(&auth), b"bye".to_vec(), &[]).await;
+    let resp = dav_send(&app, "DELETE", "/dav/trashme.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = dav_send(&app, "GET", "/dav/trashme.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // 回收站有记录（可还原）
+    let cnt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trash WHERE username = ? AND original_path = 'trashme.txt'",
+    )
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cnt, 1, "删除应进回收站");
+}
+
+/// Range GET → 206 + 正确 Content-Range
+#[tokio::test]
+async fn test_dav_range_get() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/range.bin",
+        Some(&auth),
+        b"0123456789".to_vec(),
+        &[],
+    )
+    .await;
+    let resp = dav_send(
+        &app,
+        "GET",
+        "/dav/range.bin",
+        Some(&auth),
+        vec![],
+        &[("Range", "bytes=2-5")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 2-5/10")
+    );
+    assert_eq!(read_body_text(resp).await, "2345");
+}
+
+/// MKCOL 重复 → 405；配额耗尽 PUT → 507
+#[tokio::test]
+async fn test_dav_mkcol_and_quota() {
+    let (pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    let resp = dav_send(&app, "MKCOL", "/dav/newdir", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = dav_send(&app, "MKCOL", "/dav/newdir", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    // 配额压到 1MB，PUT 2MB → 507
+    sqlx::query("UPDATE users SET quota_mb = 1 WHERE username = ?")
+        .bind(&username)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    let resp = dav_send(&app, "PUT", "/dav/big.bin", Some(&auth), big, &[]).await;
+    assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+    // 目标不得出现
+    let resp = dav_send(&app, "GET", "/dav/big.bin", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 中文搜索：3 字走 FTS、2 字降级 LIKE 均命中
+#[tokio::test]
+async fn test_search_global_cjk_and_ascii() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C.pdf",
+        Some(&auth),
+        b"%PDF".to_vec(),
+        &[],
+    )
+    .await; // 使用手册.pdf
+    dav_send(&app, "PUT", "/dav/report.docx", Some(&auth), b"x".to_vec(), &[]).await;
+
+    // 3 字中文词（FTS trigram）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            "/drive/list?path=&search=%E6%89%8B%E5%86%8C",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert!(
+        read_body_text(resp).await.contains("使用手册"),
+        "3 字中文词应命中"
+    );
+    // 2 字中文词（LIKE 兜底）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            "/drive/list?path=&search=%E4%BD%BF%E7%94%A8",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(read_body_text(resp).await.contains("使用手册"), "2 字词 LIKE 兜底应命中");
+    // ASCII 子串
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/drive/list?path=&search=report", &token))
+        .await
+        .unwrap();
+    assert!(read_body_text(resp).await.contains("report.docx"));
+}
+
+/// merge 到未登记子目录 → 目录行自动补插（文件夹上传支撑）
+#[tokio::test]
+async fn test_merge_to_nested_dir_creates_rows() {
+    let (pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+    upload_one_chunk(&app, &token, "nested-001", 0, 1, b"nested file").await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"nested-001","file_name":"f.txt","parent_path":"a/b"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "merge 到子目录应成功");
+    let cnt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE is_dir = 1 AND parent_path = ''")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cnt, 1, "a 目录行应存在");
+    let cnt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE is_dir = 1 AND parent_path = 'a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cnt, 1, "a/b 目录行应存在");
+}
+
+/// markdown 预览走渲染分支（含 JSON 数据块）
+#[tokio::test]
+async fn test_preview_markdown_mode() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/readme.md",
+        Some(&auth),
+        b"# Title\n\n**bold** <script>alert(1)</script>".to_vec(),
+        &[],
+    )
+    .await;
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/drive/preview?path=%2F&name=readme.md", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = read_body_text(resp).await;
+    assert!(html.contains("markdown-data"), "markdown 模式应输出数据块: {}", html);
+    assert!(
+        html.contains("\\u003cscript"),
+        "script 标签必须转义防 </script> 逃逸: {}",
+        html
+    );
+}
+
+/// AI 流式端点：未配置 key → 503（与 agent_chat 一致）
+#[tokio::test]
+async fn test_agent_stream_unconfigured() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/agent/chat/stream",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "未配置 AI 应 503");
+}

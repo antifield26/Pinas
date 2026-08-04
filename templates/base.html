@@ -22,9 +22,11 @@
   <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
   <script src="/assets/htmx.min.js?v=1" data-cfasync="false"></script>
   <script defer src="/assets/alpine.min.js?v=1" data-cfasync="false"></script>
+  <!-- Marked + DOMPurify（AI 回复 markdown 渲染 + 文件 markdown 预览；marked v15 无内置 sanitize，必须配 DOMPurify） -->
+  <script defer src="/assets/marked.min.js?v=1" data-cfasync="false"></script>
+  <script defer src="/assets/purify.min.js?v=1" data-cfasync="false"></script>
 
   {% block head_extra %}{% endblock %}
-  <!-- Marked + DOMPurify 仅 AI 页按需加载（见 agent.html/home.html head_extra）-->
 
   <style>
     .htmx-indicator { display: none; }
@@ -134,6 +136,14 @@
         var fallback = document.getElementById('media-fallback');
         if (el) el.remove();
         if (fallback) fallback.classList.remove('hidden');
+      },
+      // Markdown 渲染（AI 回复 / 文件预览共用）：marked.parse 后必须经 DOMPurify 消毒，杜绝 XSS
+      renderMarkdown: function(el, raw) {
+        if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+          el.textContent = raw; // 库未加载（离线首启）时降级纯文本
+          return;
+        }
+        el.innerHTML = DOMPurify.sanitize(marked.parse(raw));
       }
     };
     // 向后兼容别名
@@ -146,6 +156,11 @@
       var el = e.target.closest('[data-nav-path], [data-breadcrumb-path]');
       if (!el) return;
       e.preventDefault();
+      // 从搜索结果跳转目录：退出全局搜索态（清空勾选与搜索词），navigateTo 以正常目录浏览刷新
+      var gs = document.getElementById('global-search');
+      if (gs && gs.checked) gs.checked = false;
+      var si = document.querySelector('input[name="search"]');
+      if (si && si.value) si.value = '';
       var path = el.getAttribute('data-nav-path') || el.getAttribute('data-breadcrumb-path') || '';
       App.navigateTo(path);
       if (el.hasAttribute('data-breadcrumb-path')) {
@@ -156,7 +171,7 @@
 
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=10', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=11', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;
@@ -286,15 +301,10 @@
     document.addEventListener('keydown', function(e) { if (e.key === 'Escape') App.closeModal(); });
 
     // 全局文件上传函数 — 10 MB 分片 + 并发 + 断点续传 + 自动重试
-    window.uploadFile = async function(file, path) {
-      var progress = document.getElementById('upload-progress');
-      var bar = document.getElementById('upload-bar');
-      var pct = document.getElementById('upload-pct');
-      var status = document.getElementById('upload-status');
-      if (progress) progress.classList.remove('hidden');
-      if (bar) bar.style.width = '0%';
-      if (pct) pct.textContent = '0%';
-
+    // ====== 单个文件上传核心（分片/并发3/重试3/秒传） ======
+    // onProgress(pct, msg) 回调驱动进度 UI（队列面板）；signal 支持取消
+    window.uploadOneFile = async function(file, path, onProgress, signal) {
+      onProgress = onProgress || function() {};
       var CHUNK_MB = 10;
       var CONCURRENCY = 3;
       var MAX_RETRIES = 3;
@@ -326,9 +336,7 @@
       var uploadedCount = 0; // pre-existing + completed-this-session
 
       function setProgress(pctVal, msg) {
-        if (bar) bar.style.width = pctVal + '%';
-        if (pct) pct.textContent = pctVal + '%';
-        if (status && msg !== undefined) status.textContent = msg;
+        onProgress(pctVal, msg);
       }
 
       // send a single chunk with exponential-backoff retry (1s / 2s / 4s)
@@ -341,11 +349,16 @@
 
         return new Promise(function(resolve, reject) {
           function attempt(retry) {
+            if (signal && signal.aborted) { reject(new Error('已取消')); return; }
             var xhr = new XMLHttpRequest();
             xhr.open('POST', url);
             xhr.withCredentials = true;
             xhr.timeout = 120000;
+            var onAbort = function() { xhr.abort(); reject(new Error('已取消')); };
+            if (signal) signal.addEventListener('abort', onAbort);
+            var cleanup = function() { if (signal) signal.removeEventListener('abort', onAbort); };
             xhr.onload = function() {
+              cleanup();
               if (xhr.status === 200) { resolve(); return; }
               if (retry < MAX_RETRIES && xhr.status >= 500) {
                 setTimeout(function() { attempt(retry + 1); }, Math.pow(2, retry) * 1000);
@@ -354,11 +367,13 @@
               }
             };
             xhr.onerror = function() {
+              cleanup();
               if (retry < MAX_RETRIES) {
                 setTimeout(function() { attempt(retry + 1); }, Math.pow(2, retry) * 1000);
               } else { reject(new Error('Network error')); }
             };
             xhr.ontimeout = function() {
+              cleanup();
               if (retry < MAX_RETRIES) {
                 setTimeout(function() { attempt(retry + 1); }, Math.pow(2, retry) * 1000);
               } else { reject(new Error('Timeout')); }
@@ -371,74 +386,201 @@
         });
       }
 
+      // --- Step 1: check for existing chunks (resume / instant upload) ---
+      setProgress(0, file.name + ' 检查断点...');
+      var pending = [];
       try {
-        // --- Step 1: check for existing chunks (resume / instant upload) ---
-        setProgress(0, file.name + ' 检查断点...');
-        var pending = [];
-        try {
-          var cr = await fetch('/api/files/check?identifier=' + identifier, { credentials: 'same-origin' });
-          if (cr.ok) {
-            var cd = await cr.json();
-            if (cd.exists) { setProgress(100, '秒传成功'); return; }
-            var have = new Set(cd.uploaded_chunks || []);
-            uploadedCount = have.size;
-            for (var i = 0; i < totalChunks; i++) { if (!have.has(i)) pending.push(i); }
-          }
-        } catch (_) { /* check failed — upload all chunks */ }
-        if (!pending.length) {
-          for (var i = 0; i < totalChunks; i++) pending.push(i);
-          uploadedCount = 0;
+        var cr = await fetch('/api/files/check?identifier=' + identifier, { credentials: 'same-origin', signal: signal });
+        if (cr.ok) {
+          var cd = await cr.json();
+          if (cd.exists) { setProgress(100, '秒传成功'); return; }
+          var have = new Set(cd.uploaded_chunks || []);
+          uploadedCount = have.size;
+          for (var i = 0; i < totalChunks; i++) { if (!have.has(i)) pending.push(i); }
         }
+      } catch (_) { /* check failed — upload all chunks */ }
+      if (!pending.length) {
+        for (var i = 0; i < totalChunks; i++) pending.push(i);
+        uploadedCount = 0;
+      }
 
-        // --- Step 2: upload pending chunks with concurrency limiter ---
-        if (pending.length > 0) {
-          var totalPending = pending.length;
-          var completedSession = 0;
-          var cursor = 0;
-          var active = 0;
-          var firstError = null;
+      // --- Step 2: upload pending chunks with concurrency limiter ---
+      if (pending.length > 0) {
+        var totalPending = pending.length;
+        var completedSession = 0;
+        var cursor = 0;
+        var active = 0;
+        var firstError = null;
 
-          await new Promise(function(resolveAll, rejectAll) {
-            function launch() {
-              while (active < CONCURRENCY && cursor < pending.length && !firstError) {
-                var idx = pending[cursor++];
-                active++;
+        await new Promise(function(resolveAll, rejectAll) {
+          function launch() {
+            while (active < CONCURRENCY && cursor < pending.length && !firstError) {
+              var idx = pending[cursor++];
+              active++;
+              setProgress(Math.round((uploadedCount + completedSession) / totalChunks * 90),
+                file.name + ' ' + (uploadedCount + completedSession) + '/' + totalChunks);
+              sendChunk(idx).then(function() {
+                completedSession++;
+                active--;
                 setProgress(Math.round((uploadedCount + completedSession) / totalChunks * 90),
                   file.name + ' ' + (uploadedCount + completedSession) + '/' + totalChunks);
-                sendChunk(idx).then(function() {
-                  completedSession++;
-                  active--;
-                  setProgress(Math.round((uploadedCount + completedSession) / totalChunks * 90),
-                    file.name + ' ' + (uploadedCount + completedSession) + '/' + totalChunks);
-                  if (completedSession >= totalPending) resolveAll(); else launch();
-                }).catch(function(e) {
-                  firstError = e;
-                  rejectAll(e);
-                });
-              }
+                if (completedSession >= totalPending) resolveAll(); else launch();
+              }).catch(function(e) {
+                firstError = e;
+                rejectAll(e);
+              });
             }
-            launch();
-          });
-        }
-
-        // --- Step 3: merge chunks on server ---
-        var t0 = Date.now();
-        setProgress(95, '合并中...');
-        var mr = await fetch('/api/files/merge', {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ identifier: identifier, file_name: file.name, parent_path: parent })
+          }
+          launch();
         });
-        if (mr.ok) {
-          var secs = ((Date.now() - t0) / 1000).toFixed(1);
-          setProgress(100, '完成 (' + secs + 's)');
-        } else {
-          setProgress(0, '合并失败');
-          throw new Error('Merge failed');
+      }
+
+      // --- Step 3: merge chunks on server ---
+      setProgress(95, '合并中...');
+      var mr = await fetch('/api/files/merge', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: identifier, file_name: file.name, parent_path: parent })
+      });
+      if (mr.ok) {
+        setProgress(100, '完成');
+      } else {
+        setProgress(0, '合并失败');
+        throw new Error('Merge failed');
+      }
+    };
+
+    // 旧接口兼容层：单文件上传 + 旧模态进度条（新代码走 UploadQueue）
+    window.uploadFile = async function(file, path) {
+      var progress = document.getElementById('upload-progress');
+      var bar = document.getElementById('upload-bar');
+      var pct = document.getElementById('upload-pct');
+      var status = document.getElementById('upload-status');
+      if (progress) progress.classList.remove('hidden');
+      await window.uploadOneFile(file, path, function(p, m) {
+        if (bar) bar.style.width = p + '%';
+        if (pct) pct.textContent = p + '%';
+        if (status && m !== undefined) status.textContent = m;
+      });
+    };
+
+    // ====== 上传队列管理器（并发 3；支持文件夹上传与取消） ======
+    window.UploadQueue = {
+      items: [],
+      running: 0,
+      maxConcurrent: 3,
+      controllers: [],
+
+      // list: [{file, rel}]；rel 为相对路径(如 "子目录/a.txt"，纯文件时=文件名)
+      enqueue: function(list, targetPath) {
+        var self = this;
+        list.forEach(function(it) {
+          self.items.push({
+            file: it.file, rel: it.rel || it.file.name,
+            targetPath: targetPath, status: 'pending', pct: 0, msg: '', error: null
+          });
+        });
+        this.render();
+      },
+
+      start: function() { this.pump(); },
+
+      pump: function() {
+        var self = this;
+        while (this.running < this.maxConcurrent) {
+          var next = null;
+          for (var i = 0; i < this.items.length; i++) {
+            if (this.items[i].status === 'pending') { next = this.items[i]; break; }
+          }
+          if (!next) { if (this.running === 0) this.finishCheck(); return; }
+          this.runOne(next);
         }
-      } catch (e) {
-        setProgress(0, '上传失败');
-        throw e;
+      },
+
+      runOne: function(item) {
+        var self = this;
+        item.status = 'uploading';
+        this.running++;
+        var controller = new AbortController();
+        this.controllers.push(controller);
+        // 目标目录 = 面板目标 + rel 的目录部分
+        var path = item.targetPath;
+        if (item.rel.indexOf('/') >= 0) {
+          path = (path === '/' || path === '') ? '' : path.replace(/\/+$/, '');
+          path += '/' + item.rel.substring(0, item.rel.lastIndexOf('/'));
+        }
+        window.uploadOneFile(item.file, path, function(pct, msg) {
+          item.pct = pct; item.msg = msg || '';
+          self.render();
+        }, controller.signal).then(function() {
+          item.status = 'done'; item.pct = 100;
+        }).catch(function(e) {
+          if (e && e.message === '已取消') { item.status = 'canceled'; }
+          else { item.status = 'error'; item.error = e && e.message ? e.message : String(e); }
+        }).then(function() {
+          self.running--;
+          self.controllers = self.controllers.filter(function(c) { return c !== controller; });
+          self.render();
+          self.pump();
+        });
+      },
+
+      finishCheck: function() {
+        var total = this.items.length;
+        var finished = this.items.filter(function(i) {
+          return i.status === 'done' || i.status === 'error' || i.status === 'canceled';
+        }).length;
+        if (total > 0 && finished === total) {
+          var pathEl = document.getElementById('drive-current-path');
+          var cur = pathEl ? pathEl.value : '/';
+          htmx.ajax('GET', '/drive/list', { target: '#drive-file-list', values: { path: cur } });
+          htmx.trigger('body', 'quotaRefresh');
+          var panel = document.getElementById('upload-panel');
+          if (panel) {
+            var self = this;
+            setTimeout(function() {
+              panel.classList.add('hidden');
+              self.items = [];
+              self.render();
+            }, 4000);
+          }
+        }
+      },
+
+      cancel: function() {
+        this.controllers.forEach(function(c) { c.abort(); });
+        this.controllers = [];
+      },
+
+      render: function() {
+        var panel = document.getElementById('upload-panel');
+        var listEl = document.getElementById('upload-queue-list');
+        if (!panel || !listEl) return;
+        var total = this.items.length;
+        var doneCount = 0;
+        for (var i = 0; i < this.items.length; i++) if (this.items[i].status === 'done') doneCount++;
+        var pct = total ? Math.round(doneCount / total * 100) : 0;
+        panel.classList.remove('hidden');
+        document.getElementById('upload-panel-count').textContent = doneCount + '/' + total;
+        document.getElementById('upload-panel-pct').textContent = pct + '%';
+        document.getElementById('upload-panel-bar').style.width = pct + '%';
+        listEl.innerHTML = '';
+        var labels = { pending: '等待中', done: '✓ 完成', error: '失败', canceled: '已取消' };
+        for (var j = 0; j < this.items.length; j++) {
+          var it = this.items[j];
+          var row = document.createElement('div');
+          row.className = 'flex items-center gap-2 text-xs';
+          var nameEl = document.createElement('span');
+          nameEl.className = 'flex-1 truncate text-gray-700 dark:text-gray-300';
+          nameEl.textContent = it.rel;
+          var stEl = document.createElement('span');
+          stEl.className = it.status === 'done' ? 'text-emerald-500 shrink-0'
+            : (it.status === 'error' ? 'text-red-500 shrink-0' : 'text-gray-400 shrink-0');
+          stEl.textContent = labels[it.status] || ('上传中 ' + (it.pct || 0) + '%');
+          row.appendChild(nameEl);
+          row.appendChild(stEl);
+          listEl.appendChild(row);
+        }
       }
     };
   </script>

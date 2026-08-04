@@ -74,19 +74,20 @@ Browser                      Axum Server
 │       ├── conversations.rs # 对话管理 (CRUD + HTMX 片段)
 │       ├── settings.rs      # Agent 用户设置
 │       ├── minecraft.rs     # MC 服务器状态
+│       ├── dav.rs           # WebDAV 端点 (PROPFIND/PUT/MOVE/COPY 等, Basic 认证)
 │       ├── rate_limit.rs    # 异步速率限制器
 │       └── utils.rs         # 路径沙箱/MIME/审计/配额
-├── pinas-core/src/
-│   ├── lib.rs               # UserSession
+├── core/
+│   ├── mod.rs               # UserSession + 密码学重导出
 │   ├── auth.rs              # auth_middleware
 │   └── crypto.rs            # hash_token/password/verify/generate
 ├── templates/
 │   ├── base.html            # 根布局 (nav/toast/modal/PWA/JS namespace)
 │   ├── pages/               # 10 页面模板 (7 个 page_struct! + 3 独立页)
-│   ├── components/          # 可复用 HTMX 片段 (21 个)
+│   ├── components/          # 可复用 HTMX 片段 (22 个，含 upload_queue.html)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v10
+├── static/sw.js             # PWA Service Worker v11
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -146,7 +147,9 @@ Browser                      Axum Server
 | `GET/POST` | `/api/admin/*` | 用户管理 |
 | `GET/POST/PUT/DELETE` | `/api/links`, `/api/links/:id` | 链接 CRUD |
 | `GET/POST/PUT/DELETE` | `/api/todos`, `/api/todos/:id` | 待办 CRUD |
-| `POST` | `/api/agent/chat`, `/api/agent/briefing` | AI 对话 |
+| `POST` | `/api/agent/chat`, `/api/agent/chat/stream` | AI 对话（非流式 / SSE 流式 + 工具调用） |
+| `POST` | `/api/agent/briefing` | AI 简报 |
+| `*` | `/dav`, `/dav/`, `/dav/{*path}` | WebDAV（Basic 认证：PROPFIND/GET/PUT/MKCOL/MOVE/COPY/DELETE/LOCK） |
 | `GET/PUT` | `/api/agent/settings` | Agent 设置 |
 | `GET` | `/api/system/status` | 系统状态 (admin) |
 | `GET` | `/api/minecraft/status` | MC 状态 |
@@ -154,7 +157,7 @@ Browser                      Axum Server
 
 ## 数据库
 
-13 表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `schema_version`
+13 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `schema_version` + FTS5 `files_fts`（trigram，触发器同步）
 
 - **WAL 模式** (`Normal` synchronous)，连接池 16
 - **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
@@ -184,7 +187,9 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 - **模板内联 JS 零用户数据**：导航走 `data-nav-path`/`data-breadcrumb-path` 事件委托；`hx-vals` 一律 `|json` 过滤器
 - **限速可信源** `MaybePeer`：直连用真实对端 IP，回环(cloudflared)信任 CF-Connecting-IP，防伪造 XFF 绕过
 - **注册开关** `PINAS_ALLOW_REGISTRATION`（默认 false）；分片临时存储 5GB/用户上限；备份保留 7 份轮转
-- 密码学函数从 `pinas_core` 导入（`hash_password`, `verify_password`, `hash_token`）
+- **WebDAV** `/dav/*`：Basic 认证（60s 成功缓存防每请求 argon2）+ 全路径沙箱 + DELETE 进回收站；
+  路由级 5GiB body limit；dav.rs 文件操作统一 std::fs（测试环境 tokio::fs 相对路径有 ENOENT 竞态）
+- 密码学函数从 `src/core` 导入（`hash_password`, `verify_password`, `hash_token`）
 
 ### 错误处理
 - `AppError` 枚举（11 种 HTTP 状态） + `AppResult<T>` = `Result<T, AppError>`
@@ -209,12 +214,17 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 
 ### 前端
 - JS 命名空间 `window.App = { showToast, closeModal, navigateTo, goParent, handleUploadForm }`
-- 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传
+- 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传；
+  `window.UploadQueue` 队列面板（进度/取消/文件夹上传 webkitdirectory + 拖拽 webkitGetAsEntry 递归）
+- 全局搜索：drive 页"全局"checkbox（path 置空）→ 后端 ≥3 字符走 FTS5 trigram、≤2 字符 LIKE 兜底；结果跨目录显示路径
+- Markdown 渲染：`App.renderMarkdown` = DOMPurify.sanitize(marked.parse())；AI 回复 / .md 预览共用；
+  preview 的 markdown 原文经 serde_json 编码 + `<` 转义嵌入 script（防 </script> 逃逸）
+- AI 流式：`/api/agent/chat/stream` SSE；工具调用 5 轮循环（search_files/read_file/list_todos/create_todo/get_system_status(admin)）
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v10 预缓存全部本地资源（版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验），离线可用
-- 版本对齐：Cargo.toml（双 crate）→ `/health` version；CSS `?v=`（4 处）与 sw.js 预缓存 URL 严格一致
+- PWA：SW v11 预缓存全部本地资源（含 marked/purify；版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验），离线可用
+- 版本对齐：Cargo.toml → `/health` version；`?v=` 与 sw.js 预缓存 URL 严格一致（check-versions.sh 强制）
 
 ### UI 规范（v1.5 起）
 - **暗色层级**：页面底 `gray-950` → 卡片/导航/模态 `gray-900` → 输入/井面 `gray-800`；hover 恒比基底高一档；边框 `gray-700/800`
@@ -228,7 +238,8 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 19 个集成测试 + 11 个单元测试（含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/子树迁移/媒体 Range）
+- 33 个集成测试 + 11 个单元测试（含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
+  子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义、AI 流式 503）
 - 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署

@@ -139,6 +139,10 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/todos/form", get(handlers::todos_empty_form))
         .route("/todos/form/{id}", get(handlers::todos_edit_form))
         .route("/api/agent/chat", post(handlers::agent_chat))
+        .route(
+            "/api/agent/chat/stream",
+            post(handlers::agent_chat_stream),
+        )
         .route("/api/agent/briefing", post(handlers::generate_briefing))
         // HTMX Agent fragment routes
         .route("/agent/chat", post(handlers::agent_chat_fragment))
@@ -166,6 +170,24 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         )
         .layer(middleware::from_fn(crate::core::auth::auth_middleware));
 
+    // --- WebDAV 路由（独立 Basic 认证，不走 cookie auth_middleware） ---
+    // 路由级 body limit 覆盖全局 100MB：WebDAV PUT 大文件流式落盘
+    // {*path} 不匹配空尾段，需同时注册 /dav 与 /dav/（根 PROPFIND 与客户端 OPTIONS 探测）
+    let dav_body_limit = DefaultBodyLimit::max(5 * 1024 * 1024 * 1024);
+    let dav_router = Router::new()
+        .route(
+            "/dav",
+            axum::routing::any(handlers::dav_root_handler).layer(dav_body_limit),
+        )
+        .route(
+            "/dav/",
+            axum::routing::any(handlers::dav_root_handler).layer(dav_body_limit),
+        )
+        .route(
+            "/dav/{*path}",
+            axum::routing::any(handlers::dav_handler).layer(dav_body_limit),
+        );
+
     // --- 静态文件服务（24h 缓存） ---
     let assets_service = tower::ServiceBuilder::new()
         .layer(SetResponseHeaderLayer::overriding(
@@ -178,6 +200,7 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
     Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .merge(dav_router)
         .nest_service("/assets", assets_service)
         .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "404 — 页面不存在") })
         .layer(CompressionLayer::new().gzip(true))

@@ -1,14 +1,16 @@
-// ====== Antifield Cloud Service Worker v10 ======
-const CACHE_NAME = 'antifield-v10';
-const RUNTIME_CACHE = 'antifield-runtime-v10';
+// ====== Antifield Cloud Service Worker v11 ======
+const CACHE_NAME = 'antifield-v11';
+const RUNTIME_CACHE = 'antifield-runtime-v11';
 
-// 资源全部本地化（HTMX/Alpine 已从 unpkg 移入 assets/；marked/purify 无调用点已移除）
-// 注：版本号与 HTML 引用（base.html 等 4 处 ?v=）严格对齐，保证预缓存命中
+// 资源全部本地化（HTMX/Alpine/marked/DOMPurify 均在 assets/）
+// 注：版本号与 HTML 引用（base.html ?v=）严格对齐，保证预缓存命中
 const PRE_CACHE_URLS = [
   '/',
   '/assets/css/tailwind.min.css?v=16',
   '/assets/htmx.min.js?v=1',
   '/assets/alpine.min.js?v=1',
+  '/assets/marked.min.js?v=1',
+  '/assets/purify.min.js?v=1',
 ];
 
 // ====== Install ======

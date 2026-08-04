@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 6;
+const CURRENT_VERSION: i32 = 7;
 
 /// 执行所有待迁移的 schema 变更
 pub async fn run(pool: &SqlitePool) {
@@ -73,6 +73,15 @@ pub async fn run(pool: &SqlitePool) {
             .await
             .expect("记录 schema v6 失败");
         tracing::info!("[DB] Schema 迁移到 v6 完成");
+    }
+
+    if current < 7 {
+        apply_v7_migrations(pool).await;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (7)")
+            .execute(pool)
+            .await
+            .expect("记录 schema v7 失败");
+        tracing::info!("[DB] Schema 迁移到 v7 完成");
     }
 
     tracing::debug!(
@@ -172,6 +181,53 @@ async fn apply_v2_migrations(pool: &SqlitePool) {
     .map(|r| r.rows_affected())
     .unwrap_or(0);
     tracing::info!("[DB] v2 迁移: size_mb 列 {affected} 行 TEXT → REAL 已转换");
+}
+
+/// v7: 文件搜索索引 — FTS5 trigram 外部内容表(文件名为准,磁盘同步行由触发器维护)
+/// trigram tokenizer(SQLite 3.34+)支持中英文子串匹配;查询词 ≤2 字符不命中(trigram 限制),
+/// 由查询层降级 LIKE 兜底(见 file_ops.rs bind_list_where)
+async fn apply_v7_migrations(pool: &SqlitePool) {
+    sqlx::query(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            name, parent_path,
+            content='files', content_rowid='id',
+            tokenize='trigram'
+        )",
+    )
+    .execute(pool)
+    .await
+    .expect("创建 files_fts 虚拟表失败");
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, name, parent_path) VALUES (new.id, new.name, new.parent_path);
+        END",
+    )
+    .execute(pool)
+    .await
+    .expect("创建 files_fts INSERT 触发器失败");
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, name, parent_path) VALUES('delete', old.id, old.name, old.parent_path);
+        END",
+    )
+    .execute(pool)
+    .await
+    .expect("创建 files_fts DELETE 触发器失败");
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, name, parent_path) VALUES('delete', old.id, old.name, old.parent_path);
+            INSERT INTO files_fts(rowid, name, parent_path) VALUES (new.id, new.name, new.parent_path);
+        END",
+    )
+    .execute(pool)
+    .await
+    .expect("创建 files_fts UPDATE 触发器失败");
+    // 回填存量数据(不触发 files 表触发器,直接写入 FTS 表)
+    sqlx::query("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+        .execute(pool)
+        .await
+        .ok();
+    tracing::info!("[DB] v7 迁移: files_fts 全文索引(trigram)已建立");
 }
 
 /// v6: 重建 conversation_messages 表（AI 消息持久化：聊天历史随对话保存，跨会话可加载）

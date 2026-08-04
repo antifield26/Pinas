@@ -279,7 +279,7 @@ fn normalize_media_mime(
 
 /// 解析 Range 头，返回 (start, end)。仅支持单个范围 bytes=start-end。
 /// 如果 range 无效或超出文件范围，返回 None。
-fn parse_range(range_value: &str, file_size: u64) -> Option<(u64, u64)> {
+pub(crate) fn parse_range(range_value: &str, file_size: u64) -> Option<(u64, u64)> {
     if !range_value.starts_with("bytes=") {
         return None;
     }

@@ -196,3 +196,49 @@
 - `#[serde(default)]` 配置字段反序列化
 - `dotenvy` → 手动 `.env` 解析器
 - `separator("_")` 导致配置键被拆分
+
+## v1.6.0 (2026-08-04)
+
+### Added — AI 体验
+- **SSE 流式输出**:`POST /api/agent/chat/stream`(DeepSeek stream:true 透传,打字机效果;
+  reqwest 加 `stream` feature + 300s 单请求超时;流终结时持久化整轮对话,工具消息不入库)
+- **工具调用(function calling)**:5 个工具(搜索文件/读文件(≤1MB,提示注入防护标注)/查待办/建待办/系统状态(仅管理员)),
+  最多 5 轮工具循环,工具错误回传模型可修正;`DeepSeekMessage` 扩展 tool_calls/tool_call_id/name,
+  OpenAI 兼容 tools schema
+- **AI 回复 markdown 渲染**:marked v15 + DOMPurify 重新接入(本地资源,sw.js 预缓存三方对齐),
+  历史消息与流式回复统一渲染(DOMPurify 消毒防 XSS)
+- agent.html 表单改 fetch + ReadableStream 流式解析(HTMX 不支持 POST SSE);发送中禁用按钮 + "思考中…"指示
+
+### Added — 文件体验
+- **全局搜索(FTS5 trigram)**:迁移 v7 建 `files_fts` 外部内容表 + 3 同步触发器(INSERT/UPDATE/DELETE)+ rebuild;
+  搜索词 ≥3 字符走 FTS 子串匹配(中英文),≤2 字符降级 LIKE 兜底(trigram 限制,实测验证);
+  drive 页"全局"checkbox,结果跨目录显示路径,点击跳转退出搜索态
+- **上传队列 + 文件夹上传**:`window.UploadQueue` 并发 3 调度 + 右下角进度面板(单文件状态/总进度/取消);
+  拖拽 `webkitGetAsEntry` 递归遍历目录(保留相对路径)、"上传文件夹"按钮(webkitdirectory);
+  上传到未登记子目录自动补插目录行(`ensure_dir_rows`,幂等)
+- **预览补强**:markdown 渲染分支(`serde_json` 编码 + `<` 转义防 `</script>` 逃逸);
+  视频续播(localStorage 记忆进度,5s 节流,结尾不恢复);图片画廊上下翻页(同目录相邻)
+
+### Added — WebDAV (`/dav/`)
+- 全平台同步客户端入口(Rclone/RaiDrive/手机文件管理器/Windows 映射):PROPFIND(Depth 0/1, infinity→403,
+  手写 XML + RFC 4331 配额属性)/GET+Range(无 Range 全量)/PUT(流式落盘 temp + 原子覆盖 + 配额预检复核)/
+  MKCOL(父目录须存在,重复 405)/MOVE(Destination 解析,改名+跨目录,Overwrite:F→412)/
+  COPY(深树递归 + 配额累加)/DELETE(进回收站可还原)/LOCK 伪实现(单写者场景)/OPTIONS 免认证
+- Basic 认证(60s 成功缓存防每请求 argon2,角色实时查;`must_change_pwd` 拒绝);
+  路由级 5GiB body limit 覆盖全局 100MB;文件名 URL 编码 href
+- 注:dav.rs 文件操作统一 std::fs(测试环境 tokio::fs 相对路径 ENOENT 竞态,同步调用稳定)
+
+### Changed
+- 依赖:reqwest 加 `stream` feature,新增 `futures-util`/`base64`
+- `move_core`/`rename_core`/`delete_to_trash`/`parse_range` 提 `pub(crate)`(WebDAV 复用)
+- `bind_list_where`/`query_files` 全局搜索分支;`list_files` 全局搜索按行内 parent_path 校验磁盘
+- system.rs 抽 `collect_system_metrics`(状态接口与 AI 工具共用)
+- sw.js v11(precache 加 marked/purify),模板 `?v=` 三方对齐(check-versions.sh 通过)
+
+### Tests
+- 新增 13 个集成测试(44 总):WebDAV 全链路(401/回读/覆盖/目录行/MOVE+Overwrite/COPY/DELETE 回收站/
+  Range/MKCOL/配额 507)、全局搜索(中文 3 字 FTS/2 字 LIKE/ASCII)、嵌套目录 merge 补插、
+  markdown 预览转义、AI 流式未配置 503
+
+### 遗留
+- 离机备份(挂起事项)与文件历史版本未纳入本期

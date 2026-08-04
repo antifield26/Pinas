@@ -31,22 +31,17 @@
   </div>
 </div>
 <script>
-App.handleUploadForm = async function(e) {
+App.handleUploadForm = function(e) {
   e.preventDefault();
   const files = document.getElementById('upload-file-input').files;
   if (!files.length) return false;
   const path = (document.getElementById('upload-target-path')?.value || '/').replace(/\/+/g, '/');
-  const btn = document.getElementById('upload-btn');
-  btn.disabled = true;
-  btn.textContent = '上传中...';
-  for (let i = 0; i < files.length; i++) {
-    await window.uploadFile(files[i], path);
-  }
-  htmx.ajax('GET', '/drive/list', { target: '#drive-file-list', values: { path: path } });
-  htmx.trigger('body', 'quotaRefresh');
-  btn.disabled = false;
-  btn.textContent = '上传';
-  setTimeout(function() { App.closeModal(); }, 500);
+  // 入队上传（并发 3 + 进度面板由 UploadQueue 统一驱动），完成后面板自动刷新列表
+  const list = [];
+  for (let i = 0; i < files.length; i++) list.push({ file: files[i], rel: files[i].name });
+  window.UploadQueue.enqueue(list, path);
+  window.UploadQueue.start();
+  App.closeModal();
   return false;
 };
 </script>

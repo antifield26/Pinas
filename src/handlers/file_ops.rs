@@ -180,14 +180,29 @@ async fn query_files(
     sort_by: Option<&str>,
 ) -> Vec<FileRowData> {
     let parent_path = path.trim_start_matches('/');
-    let mut qb =
-        sqlx::QueryBuilder::new("SELECT name, size_mb, is_dir FROM files WHERE username = ");
+    let search = search.map(str::trim).filter(|s| !s.is_empty());
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT name, size_mb, is_dir, parent_path FROM files WHERE username = ",
+    );
     qb.push_bind(username);
-    qb.push(" AND parent_path = ").push_bind(parent_path);
-    if let Some(s) = search
-        && !s.is_empty()
-    {
-        qb.push(" AND name LIKE ").push_bind(format!("%{}%", s));
+    if let Some(s) = &search {
+        if parent_path.is_empty() {
+            // 全局搜索（path 为空）：≥3 字符走 FTS5 trigram（子串匹配含中文），≤2 字符降级 LIKE 兜底
+            if s.chars().count() >= 3 {
+                qb.push(" AND id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ");
+                qb.push_bind(format!("\"{}\"", s.replace('"', "\"\"")));
+                qb.push(")");
+            } else {
+                qb.push(" AND (name LIKE ").push_bind(format!("%{}%", s));
+                qb.push(" OR parent_path LIKE ").push_bind(format!("%{}%", s));
+                qb.push(")");
+            }
+        } else {
+            qb.push(" AND parent_path = ").push_bind(parent_path);
+            qb.push(" AND name LIKE ").push_bind(format!("%{}%", s));
+        }
+    } else {
+        qb.push(" AND parent_path = ").push_bind(parent_path);
     }
     let order = match sort_by.unwrap_or("") {
         "name_desc" => " ORDER BY is_dir DESC, name DESC",
@@ -204,19 +219,21 @@ async fn query_files(
         name: String,
         size_mb: Option<f64>,
         is_dir: i64,
+        parent_path: String,
     }
     match qb.build_query_as::<FileRowRaw>().fetch_all(pool).await {
         Ok(rows) => {
             let mut files = Vec::with_capacity(rows.len());
             for r in rows {
                 let is_dir = r.is_dir != 0;
-                if !ensure_file_on_disk(pool, username, parent_path, &r.name, is_dir).await {
+                if !ensure_file_on_disk(pool, username, &r.parent_path, &r.name, is_dir).await {
                     continue;
                 }
                 files.push(FileRowData {
                     name: r.name,
                     is_dir,
                     size_display: fmt_size(r.size_mb.unwrap_or(0.0), is_dir),
+                    parent_path: r.parent_path,
                 });
             }
             files
@@ -238,6 +255,7 @@ async fn fallback_file_list(
     let mut resp = AppTemplate(FileTableFragment {
         files,
         current_path: path,
+        has_global_search: false,
     })
     .into_response();
     resp.headers_mut().insert(
@@ -254,13 +272,23 @@ fn bind_list_where(
     username: &str,
     current_path: &str,
     has_search: bool,
+    search_raw: &str,
     search_pattern: &str,
     like_pattern: &Option<String>,
 ) {
     qb.push(" WHERE username = ").push_bind(username);
     if has_search {
         if current_path.is_empty() {
-            qb.push(" AND name LIKE ").push_bind(search_pattern);
+            // 全局搜索：≥3 字符走 FTS5 trigram（子串匹配含中文），≤2 字符降级 LIKE 兜底（trigram 限制）
+            if search_raw.chars().count() >= 3 {
+                qb.push(" AND id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ");
+                qb.push_bind(format!("\"{}\"", search_raw.replace('"', "\"\"")));
+                qb.push(")");
+            } else {
+                qb.push(" AND (name LIKE ").push_bind(search_pattern);
+                qb.push(" OR parent_path LIKE ").push_bind(search_pattern);
+                qb.push(")");
+            }
         } else {
             qb.push(" AND (parent_path = ").push_bind(current_path);
             qb.push(" OR parent_path LIKE ")
@@ -284,8 +312,9 @@ pub async fn list_files(
         .as_ref()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    let search_raw = query.search.as_deref().unwrap_or("");
     let search_pattern = if has_search {
-        format!("%{}%", query.search.as_deref().unwrap_or(""))
+        format!("%{}%", search_raw)
     } else {
         String::new()
     };
@@ -316,6 +345,7 @@ pub async fn list_files(
             &session.username,
             &current_path,
             has_search,
+            search_raw,
             &search_pattern,
             &like_pattern,
         );
@@ -330,6 +360,7 @@ pub async fn list_files(
         &session.username,
         &current_path,
         has_search,
+        search_raw,
         &search_pattern,
         &like_pattern,
     );
@@ -343,14 +374,14 @@ pub async fn list_files(
         Ok(files) => {
             let mut valid = Vec::with_capacity(files.len());
             for f in files {
-                if ensure_file_on_disk(
-                    &pool,
-                    &session.username,
-                    &current_path,
-                    &f.name,
-                    f.is_dir != 0,
-                )
-                .await
+                // 全局搜索时每行 parent_path 不同，按行内路径校验磁盘存在
+                let row_path = if current_path.is_empty() {
+                    &f.parent_path
+                } else {
+                    &current_path
+                };
+                if ensure_file_on_disk(&pool, &session.username, row_path, &f.name, f.is_dir != 0)
+                    .await
                 {
                     valid.push(f);
                 }
@@ -421,10 +452,37 @@ pub async fn create_folder(
     Ok((StatusCode::OK, "文件夹创建成功"))
 }
 
+/// 幂等补插逻辑目录行：当写入目标位于尚未登记的目录(如文件夹上传/WebDAV PUT 到新子目录)时，
+/// 物理目录由调用方 create_dir_all 创建，此处逐级补插 files 目录行，保证"文件即真相"同步基准一致。
+/// parent_path 为规范化逻辑路径(不含用户名,空串=根)；每级 INSERT OR IGNORE,重复调用无副作用。
+pub(crate) async fn ensure_dir_rows(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    parent_path: &str,
+) -> Result<(), AppError> {
+    let mut prefix = String::new();
+    for seg in parent_path.split('/').filter(|s| !s.is_empty()) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)",
+        )
+        .bind(username)
+        .bind(seg)
+        .bind(&prefix)
+        .execute(pool)
+        .await?;
+        if prefix.is_empty() {
+            prefix = seg.to_string();
+        } else {
+            prefix = format!("{}/{}", prefix, seg);
+        }
+    }
+    Ok(())
+}
+
 // ====== 3. 重命名（共享核心逻辑） ======
 
 /// 核心重命名逻辑：文件系统 + 事务内数据库更新 + 子路径更新 + 失败回滚
-async fn rename_core(
+pub(crate) async fn rename_core(
     pool: &sqlx::SqlitePool,
     username: &str,
     parent: &str,
@@ -437,7 +495,6 @@ async fn rename_core(
         .map_err(|e| e.to_string())?;
     let new_p = safe_join_sandbox(base, &user_file_path(username, parent, new_name))
         .map_err(|e| e.to_string())?;
-
     tokio::fs::rename(&old_p, &new_p)
         .await
         .map_err(|e| format!("文件系统重命名失败: {}", e))?;
@@ -520,7 +577,7 @@ pub async fn rename_item(
 
 // ====== 4. 移动（共享核心逻辑） ======
 
-async fn move_core(
+pub(crate) async fn move_core(
     pool: &sqlx::SqlitePool,
     username: &str,
     src_parent: &str,
@@ -715,7 +772,7 @@ pub async fn move_batch(
 
 // ====== 6. 回收站操作（共享核心逻辑） ======
 
-async fn delete_to_trash(
+pub(crate) async fn delete_to_trash(
     pool: &sqlx::SqlitePool,
     username: &str,
     parent_path: &str,
@@ -831,12 +888,16 @@ pub async fn delete_batch(
 struct FileTableFragment {
     files: Vec<FileRowData>,
     current_path: String,
+    /// 全局搜索模式（path 为空 + 有搜索词）：结果跨目录，显示所在路径
+    has_global_search: bool,
 }
 
 struct FileRowData {
     name: String,
     size_display: String,
     is_dir: bool,
+    /// 所在逻辑路径（正常浏览 = 当前目录；全局搜索 = 各自所在目录）
+    parent_path: String,
 }
 
 struct BreadcrumbPart {
@@ -896,6 +957,22 @@ pub struct PreviewFragment {
     is_pdf: bool,
     is_text: bool,
     content: String,
+    /// 用户(视频续播 localStorage key)
+    username: String,
+    /// Markdown 渲染模式：原始内容 JSON 编码（< 转义防 </script> 逃逸）
+    is_markdown: bool,
+    markdown_json: String,
+    /// 画廊相邻文件（图片模式翻页；空串 = 无）
+    prev_path: String,
+    prev_name: String,
+    next_path: String,
+    next_name: String,
+}
+
+/// 画廊导航项（同目录相邻文件）
+struct PreviewNav {
+    path: String,
+    name: String,
 }
 
 // ====== HTMX Fragment Handlers ======
@@ -912,6 +989,12 @@ pub async fn drive_list_fragment(
         .cloned()
         .unwrap_or_else(|| "/".to_string());
     let path = normalize_display_path(&raw);
+    // 全局搜索：path 为空 + 有搜索词 → 全库跨目录搜索（显示所在路径列）
+    let has_global_search = raw.trim().is_empty()
+        && params
+            .get("search")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
     let files = query_files(
         &pool,
         &session.username,
@@ -923,6 +1006,7 @@ pub async fn drive_list_fragment(
     AppTemplate(FileTableFragment {
         files,
         current_path: path,
+        has_global_search,
     })
 }
 
@@ -1217,6 +1301,7 @@ const MAX_PREVIEW_TEXT_SIZE: u64 = 1024 * 1024;
 /// GET /drive/preview
 #[tracing::instrument(skip_all)]
 pub async fn drive_preview(
+    Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> AppResult<AppTemplate<PreviewFragment>> {
@@ -1243,6 +1328,9 @@ pub async fn drive_preview(
     let is_video = mime.type_().as_str() == "video";
     let is_audio = mime.type_().as_str() == "audio";
     let is_pdf = mime.subtype().as_str() == "pdf" || name.to_lowercase().ends_with(".pdf");
+    let is_markdown = ["md", "markdown", "mdx"]
+        .iter()
+        .any(|e| name.to_lowercase().ends_with(&format!(".{}", e)));
 
     let text_mimes = [
         "text",
@@ -1299,7 +1387,7 @@ pub async fn drive_preview(
             name.to_lowercase().ends_with(&format!(".{}", e)) || name.to_lowercase() == *e
         });
 
-    let content = if is_text {
+    let content = if is_text || is_markdown {
         tokio::fs::read_to_string(&full_path)
             .await
             .map(|s| {
@@ -1319,6 +1407,29 @@ pub async fn drive_preview(
         String::new()
     };
 
+    // Markdown 原文 JSON 编码后嵌入 script 数据块（< → < 防 </script> 逃逸；前端 marked+DOMPurify 渲染）
+    let markdown_json = if is_markdown {
+        serde_json::to_string(&content)
+            .unwrap_or_default()
+            .replace('<', "\\u003c")
+    } else {
+        String::new()
+    };
+    // 图片画廊：同目录相邻文件（按文件名排序）
+    let (prev, next) = if is_image {
+        gallery_neighbors(&pool, &session.username, parent, &name).await
+    } else {
+        (None, None)
+    };
+    let (prev_path, prev_name) = match prev {
+        Some(p) => (p.path, p.name),
+        None => (String::new(), String::new()),
+    };
+    let (next_path, next_name) = match next {
+        Some(p) => (p.path, p.name),
+        None => (String::new(), String::new()),
+    };
+
     Ok(AppTemplate(PreviewFragment {
         file_name: name,
         file_path,
@@ -1330,5 +1441,42 @@ pub async fn drive_preview(
         is_pdf,
         is_text,
         content,
+        username: session.username,
+        is_markdown,
+        markdown_json,
+        prev_path,
+        prev_name,
+        next_path,
+        next_name,
     }))
+}
+
+/// 同目录相邻文件（忽略目录，按文件名 NOCASE 排序）——图片画廊翻页
+async fn gallery_neighbors(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    parent_path: &str,
+    name: &str,
+) -> (Option<PreviewNav>, Option<PreviewNav>) {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, parent_path FROM files WHERE username = ? AND parent_path = ? AND is_dir = 0 \
+         ORDER BY name COLLATE NOCASE",
+    )
+    .bind(username)
+    .bind(parent_path)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let Some(i) = rows.iter().position(|(n, _)| n == name) else {
+        return (None, None);
+    };
+    let prev = rows.get(i.wrapping_sub(1)).filter(|_| i > 0).map(|(n, p)| PreviewNav {
+        path: p.clone(),
+        name: n.clone(),
+    });
+    let next = rows.get(i + 1).map(|(n, p)| PreviewNav {
+        path: p.clone(),
+        name: n.clone(),
+    });
+    (prev, next)
 }

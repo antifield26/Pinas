@@ -105,6 +105,20 @@ pub async fn health_check(
     }
 }
 
+/// 采集系统指标（CPU 使用率/温度/内存）——供状态接口与 AI 工具共用
+pub(crate) async fn collect_system_metrics() -> serde_json::Value {
+    let cpu_temp = read_cpu_temp().await;
+    let cpu_usage = calc_cpu_usage().await;
+    let (mem_total_mb, mem_avail_mb) = read_memory().await;
+    let memory_used_mb = mem_total_mb.saturating_sub(mem_avail_mb);
+    serde_json::json!({
+        "cpu_usage": cpu_usage,
+        "cpu_temp": cpu_temp,
+        "memory_used_mb": memory_used_mb,
+        "memory_total_mb": mem_total_mb,
+    })
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn get_system_status(
     Extension(session): Extension<UserSession>,
@@ -113,17 +127,7 @@ pub async fn get_system_status(
         return Err(AppError::forbidden("管理员权限不足"));
     }
 
-    let cpu_temp = read_cpu_temp().await;
-    let cpu_usage = calc_cpu_usage().await;
-    let (mem_total_mb, mem_avail_mb) = read_memory().await;
-    let memory_used_mb = mem_total_mb.saturating_sub(mem_avail_mb);
-
-    Ok(Json(serde_json::json!({
-        "cpu_usage": cpu_usage,
-        "cpu_temp": cpu_temp,
-        "memory_used_mb": memory_used_mb,
-        "memory_total_mb": mem_total_mb,
-    })))
+    Ok(Json(collect_system_metrics().await))
 }
 
 // ====== HTMX Fragment ======

@@ -308,6 +308,8 @@ pub async fn merge_chunks(
     }
 
     let parent_path = user_dir_path(Some(payload.parent_path));
+    // 目标目录可能尚未登记(文件夹上传到新子目录)：物理目录随后 create_dir_all,这里先补插目录行
+    crate::handlers::file_ops::ensure_dir_rows(&pool, username, &parent_path).await?;
     let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let user_dir = safe_join_sandbox(base_path, &format!("{}/{}", username, parent_path))?;
     let _ = tokio::fs::create_dir_all(&user_dir).await;

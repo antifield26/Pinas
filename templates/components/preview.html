@@ -15,7 +15,8 @@
     </div>
     {% else if is_video %}
     <div class="flex items-center justify-center bg-black rounded-lg overflow-hidden">
-      <video controls autoplay muted playsinline class="max-w-full max-h-[70vh] rounded-lg" preload="metadata"
+      <video id="video-player" data-key="{{ username }}:{{ file_path }}" controls autoplay muted playsinline
+             class="max-w-full max-h-[70vh] rounded-lg" preload="metadata"
              onerror="showMediaError(this)">
         <source src="/api/media/{{ file_path }}" type="{{ mime_type }}">
         <p class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
@@ -26,6 +27,28 @@
         </p>
       </video>
     </div>
+    {% else if is_markdown %}
+    <div class="relative">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs text-gray-400 font-mono">markdown</span>
+        <button onclick="var d=document.getElementById('markdown-data');if(d){navigator.clipboard.writeText(JSON.parse(d.textContent));App.showToast('已复制到剪贴板','info')}"
+                class="text-xs bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-2 py-1 rounded transition">
+          复制
+        </button>
+      </div>
+      {# 原文经 serde_json 编码 + < 转义，杜绝 </script> 逃逸；前端 marked + DOMPurify 消毒渲染 #}
+      <div id="markdown-body" class="prose prose-sm dark:prose-invert max-w-none bg-gray-100 dark:bg-gray-800 rounded-lg p-4 overflow-auto max-h-[65vh]"></div>
+      <script type="application/json" id="markdown-data">{{ markdown_json | safe }}</script>
+    </div>
+    <script>
+      (function() {
+        var data = document.getElementById('markdown-data');
+        var body = document.getElementById('markdown-body');
+        if (!data || !body) return;
+        try { window.App.renderMarkdown(body, JSON.parse(data.textContent)); }
+        catch (_) { body.textContent = '（渲染失败）'; }
+      })();
+    </script>
     {% else if is_audio %}
     <div class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-4">
       <span class="text-6xl">♪</span>
@@ -72,12 +95,43 @@
          class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3">↓ 下载文件</a>
     </div>
   </div>
-  {% if is_image || is_video || is_audio || is_pdf || is_text %}
+  {% if is_image || is_video || is_audio || is_pdf || is_text || is_markdown %}
   <div class="px-5 py-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex items-center gap-2 shrink-0">
     <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
        class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-3 py-1.5 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">↓ 下载</a>
+    {% if is_image %}
+    {% if !prev_name.is_empty() %}
+    <button hx-get="/drive/preview" hx-vals='{"path":{{ prev_path | json }},"name":{{ prev_name | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
+            class="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 px-3 py-1.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 transition">← 上一张</button>
+    {% endif %}
+    {% if !next_name.is_empty() %}
+    <button hx-get="/drive/preview" hx-vals='{"path":{{ next_path | json }},"name":{{ next_name | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
+            class="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 px-3 py-1.5 rounded hover:bg-gray-200 dark:hover:bg-gray-700 transition">下一张 →</button>
+    {% endif %}
+    {% endif %}
     <span class="flex-1"></span>
     <span class="text-xs text-gray-400">{{ file_size }}</span>
   </div>
   {% endif %}
+
+  {# 视频续播：localStorage 记忆播放位置（>5s 且距结尾 >10s 恢复；5s 节流保存；播完清除） #}
+  <script>
+    (function() {
+      var v = document.getElementById('video-player');
+      if (!v) return;
+      var key = 'pinas:pos:' + v.getAttribute('data-key');
+      var saved = parseFloat(localStorage.getItem(key) || '0');
+      if (saved > 0) {
+        v.addEventListener('loadedmetadata', function() {
+          if (saved > 5 && v.duration - saved > 10) v.currentTime = saved;
+        }, { once: true });
+      }
+      var lastSave = 0;
+      v.addEventListener('timeupdate', function() {
+        var now = Date.now();
+        if (now - lastSave > 5000) { lastSave = now; localStorage.setItem(key, String(v.currentTime)); }
+      });
+      v.addEventListener('ended', function() { localStorage.removeItem(key); });
+    })();
+  </script>
 </div>
