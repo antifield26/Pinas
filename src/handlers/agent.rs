@@ -832,6 +832,40 @@ async fn execute_tool(name: &str, args_json: &str, ctx: &ToolContext<'_>) -> Res
     }
 }
 
+/// 解析 DeepSeek 文本工具调用格式（V3.2+/V4 系列默认输出，非 OpenAI 结构化 tool_calls）：
+/// `<invoke name="工具名">\n{"参数":…}\n</invoke>` 或 `<invoke name="工具名" args='{"…}'/>`
+fn parse_text_invokes(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("<invoke") {
+        rest = &rest[start..];
+        let Some(name_marker) = rest.find("name=") else { break };
+        let after = &rest[name_marker + 5..];
+        let Some(open) = after.find('"') else { break };
+        let Some(name_end) = after[open + 1..].find('"') else { break };
+        let name_end = open + 1 + name_end;
+        let name = &after[open + 1..name_end];
+        let tail = &after[name_end + 1..];
+
+        // 带 args 属性：<invoke name="x" args='{"k":"v"}'/>
+        if let Some(a) = tail.trim_start().strip_prefix("args=") {
+            let quote = a.chars().next().unwrap_or('"');
+            let a = &a[quote.len_utf8()..];
+            let Some(end) = a.find(quote) else { break };
+            out.push((name.to_string(), a[..end].to_string()));
+            rest = &a[end..];
+            continue;
+        }
+        // 块体形式：<invoke name="x">\n{…}\n</invoke>
+        let Some(body_start) = tail.find('>') else { break };
+        let body = &tail[body_start + 1..];
+        let Some(body_end) = body.find("</invoke>") else { break };
+        out.push((name.to_string(), body[..body_end].trim().to_string()));
+        rest = &body[body_end..];
+    }
+    out
+}
+
 /// 工具调用循环：最多 5 轮「请求 → 执行工具 → 回传结果」，直到模型不再请求工具。
 /// 结束后 messages 携带完整上下文，供最终回复（流式）使用。
 async fn run_tool_loop(
@@ -862,8 +896,32 @@ async fn run_tool_loop(
             .clone()
             .filter(|c| !c.is_empty())
         else {
-            // 无工具调用：保留 assistant 回复供流式段继续（避免模型重复生成）
+            // 无结构化 tool_calls：检查 DeepSeek 文本调用格式（<invoke name="...">…</invoke>，
+            // V3.2+/V4 系列模型默认输出该格式而非 OpenAI 结构化调用）
             if let Some(content) = &choice.message.content {
+                let invokes = parse_text_invokes(content);
+                if !invokes.is_empty() {
+                    let ctx = ToolContext {
+                        pool,
+                        username,
+                        is_admin,
+                    };
+                    let mut results = String::new();
+                    for (tname, targs) in invokes {
+                        let result =
+                            execute_tool(&tname, &targs, &ctx).await.unwrap_or_else(|e| e);
+                        results.push_str(&format!(
+                            "<invoke-result name=\"{tname}\">\n{result}\n</invoke-result>\n"
+                        ));
+                    }
+                    messages.push(DeepSeekMessage {
+                        role: "user".to_string(),
+                        content: Some(results),
+                        ..Default::default()
+                    });
+                    continue; // 继续工具循环
+                }
+                // 普通回复：保留供流式段继续（避免模型重复生成）
                 messages.push(DeepSeekMessage {
                     role: "assistant".to_string(),
                     content: Some(content.clone()),
@@ -1657,4 +1715,35 @@ pub async fn agent_settings_form(
         temperature,
         max_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_text_invokes;
+
+    #[test]
+    fn test_parse_text_invokes_block_form() {
+        let content = "我来查询一下\n<invoke name=\"list_todos\">\n{\"status\": \"pending\"}\n</invoke>\n请稍等";
+        let invokes = parse_text_invokes(content);
+        assert_eq!(invokes.len(), 1);
+        assert_eq!(invokes[0].0, "list_todos");
+        assert!(invokes[0].1.contains("pending"));
+    }
+
+    #[test]
+    fn test_parse_text_invokes_args_attr() {
+        let content = "<invoke name=\"search_files\" args='{\"query\": \"报告\"}'/>";
+        let invokes = parse_text_invokes(content);
+        assert_eq!(invokes.len(), 1);
+        assert_eq!(invokes[0].0, "search_files");
+        assert!(invokes[0].1.contains("报告"));
+    }
+
+    #[test]
+    fn test_parse_text_invokes_multiple_and_none() {
+        let multi = "<invoke name=\"a\">1</invoke> 然后 <invoke name=\"b\">2</invoke>";
+        assert_eq!(parse_text_invokes(multi).len(), 2);
+        assert!(parse_text_invokes("没有工具调用的普通回复").is_empty());
+        assert!(parse_text_invokes("<invoke>缺名字</invoke>").is_empty());
+    }
 }
