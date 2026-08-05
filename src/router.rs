@@ -6,7 +6,41 @@ use axum::{
     middleware,
     routing::{delete, get, post, put},
 };
-use tower_http::{compression::CompressionLayer, set_header::SetResponseHeaderLayer};
+use tower_http::{
+    compression::{
+        predicate::{DefaultPredicate, Predicate},
+        CompressionLayer,
+    },
+    set_header::SetResponseHeaderLayer,
+};
+
+/// 压缩谓词：跳过 206 部分响应与媒体 MIME（压缩会破坏 Range 字节语义；
+/// 且 Chromium 媒体管线拒绝任何带 Content-Encoding 的响应——SRC_NOT_SUPPORTED）
+#[derive(Clone, Default)]
+struct SkipStreamingCompression;
+
+impl Predicate for SkipStreamingCompression {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        if response
+            .headers()
+            .contains_key(axum::http::header::CONTENT_RANGE)
+        {
+            return false;
+        }
+        if let Some(ct) = response.headers().get(axum::http::header::CONTENT_TYPE)
+            && let Ok(ct) = ct.to_str()
+        {
+            let ct = ct.to_ascii_lowercase();
+            if ct.starts_with("video/") || ct.starts_with("audio/") {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 use crate::config::Config;
 use crate::constants::*;
@@ -203,7 +237,11 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .merge(dav_router)
         .nest_service("/assets", assets_service)
         .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "404 — 页面不存在") })
-        .layer(CompressionLayer::new().gzip(true))
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .compress_when(DefaultPredicate::new().and(SkipStreamingCompression)),
+        )
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         .layer(Extension(pool))
         .layer(Extension(config))

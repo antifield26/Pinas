@@ -1574,6 +1574,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "http-body",
  "infer",
  "mime_guess",
  "password-hash",

@@ -60,6 +60,9 @@
 </div>
 
 <script>
+  // 注意：base.html 的 window.App 在 body 末尾定义，本脚本位于 main 内(解析更早)——
+  // 全部逻辑必须等 DOMContentLoaded(App 已定义)后执行，否则 ReferenceError 导致整块失效
+  document.addEventListener('DOMContentLoaded', function() {
   // 全局搜索切换：勾选时 path 置空（后端 path 空 + 有搜索词 = 全库 FTS 搜索），取消时还原目录浏览
   document.getElementById('global-search')?.addEventListener('change', function() {
     var pathEl = document.getElementById('drive-current-path');
@@ -149,6 +152,7 @@
     window.UploadQueue.enqueue(list, path);
     window.UploadQueue.start();
   };
+  });
 </script>
 {% include "components/upload_queue.html" %}
 {% endblock %}

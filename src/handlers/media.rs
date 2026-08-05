@@ -237,11 +237,9 @@ pub async fn media_proxy(
     }
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-    // 禁用 gzip 压缩 — 视频/音频已是压缩格式，再压缩会缓冲整个响应导致无法 seek
-    headers.insert(
-        header::CONTENT_ENCODING,
-        HeaderValue::from_static("identity"),
-    );
+    // 注意：不得设置 Content-Encoding(含 identity)——Chromium 媒体管线对带该头的 206
+    // 响应判定为"需解码"直接拒绝(SRC_NOT_SUPPORTED)。防 gzip 压缩改由 CompressionLayer
+    // 谓词跳过 /api/media/ 路径(见 router.rs)。
 
     if status == StatusCode::PARTIAL_CONTENT {
         let content_range = format!("bytes {}-{}/{}", start, end, file_size);
