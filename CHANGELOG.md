@@ -228,6 +228,11 @@
   路由级 5GiB body limit 覆盖全局 100MB;文件名 URL 编码 href
 - 注:dav.rs 文件操作统一 std::fs(测试环境 tokio::fs 相对路径 ENOENT 竞态,同步调用稳定)
 
+### Fixed (生产冒烟发现)
+- 工具调用文本格式兼容:DeepSeek V4 系列默认输出 `<invoke name="...">` 文本调用(非 OpenAI
+  结构化 tool_calls)→ 新增 `parse_text_invokes`(块体 + args 属性两种形式),执行结果以
+  `<invoke-result>` 包裹回传,继续工具循环(3 个单元测试)
+
 ### Changed
 - 依赖:reqwest 加 `stream` feature,新增 `futures-util`/`base64`
 - `move_core`/`rename_core`/`delete_to_trash`/`parse_range` 提 `pub(crate)`(WebDAV 复用)
