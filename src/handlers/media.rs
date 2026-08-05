@@ -210,13 +210,10 @@ pub async fn media_proxy(
             return (StatusCode::RANGE_NOT_SATISFIABLE, HeaderMap::new()).into_response();
         }
     } else {
-        // 无 Range 头时仅返回前 2 MB，避免一次性流式传输整个大文件
-        // 浏览器获取元数据后会自动发送 Range 请求获取更多数据
-        (
-            0,
-            (file_size - 1).min(2 * 1024 * 1024 - 1),
-            StatusCode::PARTIAL_CONTENT,
-        )
+        // 无 Range 头时返回 200 全量（标准服务器行为）。
+        // 修复:此前只返前 2MB 导致音频播放中断(部分播放器只发一次请求)与
+        // moov 不在文件头部的视频无法解析(浏览器 preload=metadata 探测拿不到 moov)。
+        (0, file_size - 1, StatusCode::OK)
     };
 
     let length = end - start + 1;

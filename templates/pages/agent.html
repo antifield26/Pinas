@@ -4,11 +4,16 @@
 {% block head_extra %}{% endblock %}
 
 {% block content %}
-<div class="space-y-6 h-[calc(100vh-120px)] min-h-[500px]">
+<div class="flex flex-col h-[calc(100vh-120px)] min-h-[500px]">
   <!-- 顶栏 -->
-  <div class="flex items-center gap-2 flex-wrap shrink-0">
+  <div class="flex items-center gap-2 flex-wrap shrink-0 pb-4">
+    <button onclick="AppAgent.toggleDrawer(true)"
+            class="sm:hidden text-xs font-medium px-2.5 py-1.5 rounded-lg border border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300" aria-label="展开会话列表">☰ 对话</button>
     <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">AI Chat</h2>
     <div class="flex-1"></div>
+    <label class="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 select-none cursor-pointer" title="流式输出开关">
+      <input type="checkbox" id="agent-stream-toggle" checked class="rounded cursor-pointer"> 流式
+    </label>
     <select id="agent-model-select" name="model"
             class="text-xs px-2 py-1.5 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500">
       <option value="">默认模型</option>
@@ -20,8 +25,8 @@
   </div>
 
   <!-- 主体：侧边栏 + 对话区 -->
-  <div class="flex gap-4 flex-1 min-h-0">
-    <!-- 对话侧边栏 -->
+  <div class="flex gap-4 flex-1 min-h-0 relative">
+    <!-- 会话侧边栏（桌面） -->
     <div class="w-48 shrink-0 hidden sm:flex flex-col card p-3 gap-1 overflow-hidden">
       <div class="flex items-center gap-1 mb-1">
         <span class="text-xs font-semibold text-gray-500 dark:text-gray-400 flex-1">对话</span>
@@ -33,7 +38,23 @@
       </div>
     </div>
 
-    <!-- 对话主区域 -->
+    <!-- 移动端会话抽屉（默认折叠） -->
+    <div id="conv-drawer" class="hidden fixed inset-0 z-40 sm:hidden" aria-hidden="true">
+      <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" onclick="AppAgent.toggleDrawer(false)"></div>
+      <div class="absolute left-0 top-0 bottom-0 w-64 bg-white dark:bg-gray-900 shadow-2xl p-3 flex flex-col animate-slide-up">
+        <div class="flex items-center gap-1 mb-1 shrink-0">
+          <span class="text-xs font-semibold text-gray-500 dark:text-gray-400 flex-1">对话</span>
+          <button onclick="AppAgent.newConversation()"
+                  class="text-indigo-600 hover:text-indigo-800 text-lg leading-none" aria-label="新建对话" title="新建对话">+</button>
+          <button onclick="AppAgent.toggleDrawer(false)" class="text-gray-400 hover:text-gray-600 text-sm px-1" aria-label="关闭">✕</button>
+        </div>
+        <div id="conv-list-m" hx-get="/agent/conversations" hx-trigger="load" class="fade-me flex-1 overflow-y-auto space-y-0.5">
+          <div class="text-xs text-gray-400 text-center py-4">加载中...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 对话主区域（输入框保持在底部） -->
     <div class="flex-1 card flex flex-col min-h-0 min-w-0">
       <div id="agent-chat-messages" class="flex-1 overflow-y-auto p-4 space-y-4">
         <div class="text-center py-10 space-y-4">
@@ -45,8 +66,8 @@
           </div>
         </div>
       </div>
-      <div class="p-4 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50">
-        <form id="agent-chat-form" class="flex gap-2">
+      <div class="p-4 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 shrink-0">
+        <form id="agent-chat-form" class="flex gap-2 items-end">
           <input type="hidden" name="model" value="" id="agent-model-hidden">
           <input type="hidden" name="conversation_id" value="" id="agent-conversation-id">
           <textarea id="agent-input" name="message" placeholder="输入消息... (Enter 发送)"
@@ -60,7 +81,7 @@
 </div>
 
 <script>
-  // ====== AI 对话持久化 + SSE 流式交互 ======
+  // ====== AI 对话（ChatGPT 风格：底部输入框 / 会话 hover 菜单 / 移动端折叠列表 / 流式开关） ======
   window.AppAgent = {
     currentConvId: null,
     streaming: false,
@@ -134,7 +155,6 @@
         finish: function() {
           thinking.remove();
           if (full.trim()) {
-            // 流结束后整体渲染 markdown（DOMPurify 消毒）
             window.App.renderMarkdown(p, full);
           }
           box.scrollTop = box.scrollHeight;
@@ -142,15 +162,17 @@
       };
     },
 
-    // 新建对话：创建后清空消息区并记 id
+    // 新建对话：创建后清空消息区并记 id（同时刷新桌面/移动端双列表）
     newConversation: function() {
       fetch('/api/conversations', { method: 'POST', credentials: 'same-origin' })
         .then(function(r) { return r.json(); })
         .then(function(conv) {
           AppAgent.currentConvId = conv.id;
+          document.getElementById('agent-conversation-id').value = conv.id;
           var box = document.getElementById('agent-chat-messages');
           if (box) box.innerHTML = '';
-          htmx.ajax('GET', '/agent/conversations', { target: '#conv-list', swap: 'innerHTML', values: { active: AppAgent.currentConvId || '' } });
+          AppAgent.refreshConvList();
+          AppAgent.toggleDrawer(false);
         })
         .catch(function() { App.showToast('创建对话失败', 'error'); });
     },
@@ -161,92 +183,235 @@
         .then(function(r) { return r.json(); })
         .then(function(messages) {
           AppAgent.currentConvId = id;
+          document.getElementById('agent-conversation-id').value = id;
           var box = document.getElementById('agent-chat-messages');
           if (box) box.innerHTML = '';
           messages.forEach(function(m) {
             AppAgent.appendMessage(m.role, m.content, m.role === 'assistant');
           });
+          AppAgent.toggleDrawer(false);
         })
         .catch(function() { App.showToast('加载对话失败', 'error'); });
     },
 
-    // 提交后：刷新会话列表标题（后端持久化后标题可能已更新）
-    onSent: function() {
-      htmx.ajax('GET', '/agent/conversations', { target: '#conv-list', swap: 'innerHTML', values: { active: AppAgent.currentConvId || '' } });
+    // 刷新会话列表（桌面 #conv-list + 移动端 #conv-list-m）
+    refreshConvList: function() {
+      var active = AppAgent.currentConvId || '';
+      htmx.ajax('GET', '/agent/conversations', { target: '#conv-list', swap: 'innerHTML', values: { active: active } });
+      htmx.ajax('GET', '/agent/conversations', { target: '#conv-list-m', swap: 'innerHTML', values: { active: active } });
     },
 
-    // 发送消息：SSE 流式拉取，增量渲染
+    // 移动端会话抽屉
+    toggleDrawer: function(open) {
+      var drawer = document.getElementById('conv-drawer');
+      if (!drawer) return;
+      drawer.classList.toggle('hidden', !open);
+      drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
+    },
+
+    // 会话 "..." 菜单（重命名 / 删除）
+    openMenu: function(event, id, btn) {
+      event.stopPropagation();
+      AppAgent.closeMenu();
+      var menu = document.createElement('div');
+      menu.className = 'conv-menu fixed z-50 bg-white dark:bg-gray-800 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 py-1 text-xs min-w-32';
+      var rename = document.createElement('button');
+      rename.className = 'block w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200';
+      rename.textContent = '重命名';
+      rename.onclick = function(e) { e.stopPropagation(); AppAgent.closeMenu(); AppAgent.renameConversation(id); };
+      var del = document.createElement('button');
+      del.className = 'block w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 text-red-500';
+      del.textContent = '删除';
+      del.onclick = function(e) { e.stopPropagation(); AppAgent.closeMenu(); AppAgent.deleteConversation(id); };
+      menu.appendChild(rename);
+      menu.appendChild(del);
+      document.body.appendChild(menu);
+      var rect = btn.getBoundingClientRect();
+      menu.style.top = Math.max(8, rect.bottom + 4) + 'px';
+      menu.style.left = Math.min(rect.left, window.innerWidth - 140) + 'px';
+      AppAgent._menu = menu;
+      setTimeout(function() {
+        document.addEventListener('click', AppAgent.closeMenu, { once: true });
+      }, 0);
+    },
+    closeMenu: function() {
+      if (AppAgent._menu) { AppAgent._menu.remove(); AppAgent._menu = null; }
+    },
+
+    // 重命名（内联编辑，PUT /api/conversations/{id}）
+    renameConversation: function(id) {
+      var item = document.querySelector('#conv-list [data-conv-id="' + id + '"] .conv-title')
+              || document.querySelector('#conv-list-m [data-conv-id="' + id + '"] .conv-title');
+      if (!item) return;
+      var old = item.textContent;
+      var input = document.createElement('input');
+      input.value = old;
+      input.className = 'w-full text-xs px-1 py-0.5 border border-indigo-400 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none';
+      item.replaceWith(input);
+      input.focus();
+      input.select();
+      var done = function() {
+        var t = input.value.trim();
+        if (t && t !== old) {
+          fetch('/api/conversations/' + id, {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: t })
+          }).then(function(r) {
+            if (r.ok) { AppAgent.refreshConvList(); }
+            else { App.showToast('重命名失败', 'error'); AppAgent.refreshConvList(); }
+          }).catch(function() { App.showToast('重命名失败', 'error'); AppAgent.refreshConvList(); });
+        } else {
+          AppAgent.refreshConvList();
+        }
+      };
+      input.onblur = done;
+      input.onkeydown = function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+        if (e.key === 'Escape') { input.value = old; input.blur(); }
+      };
+    },
+
+    // 删除对话（DELETE /api/conversations/{id}）
+    deleteConversation: function(id) {
+      if (!confirm('删除该对话？')) return;
+      fetch('/api/conversations/' + id, { method: 'DELETE', credentials: 'same-origin' })
+        .then(function(r) {
+          if (r.ok) {
+            if (AppAgent.currentConvId === id) {
+              AppAgent.currentConvId = null;
+              document.getElementById('agent-conversation-id').value = '';
+              var box = document.getElementById('agent-chat-messages');
+              if (box) box.innerHTML = '';
+            }
+            AppAgent.refreshConvList();
+          } else {
+            App.showToast('删除失败', 'error');
+          }
+        })
+        .catch(function() { App.showToast('删除失败', 'error'); });
+    },
+
+    // 提交后：刷新会话列表标题
+    onSent: function() {
+      AppAgent.refreshConvList();
+    },
+
+    // 发送消息：按流式开关走 SSE 流式 或 一次性 JSON
     send: function() {
       if (AppAgent.streaming) return;
       var input = document.getElementById('agent-input');
       var text = input.value.trim();
       if (!text) return;
       var hidden = document.getElementById('agent-conversation-id');
+      var useStream = document.getElementById('agent-stream-toggle').checked;
 
       var doSend = function() {
         AppAgent.appendMessage('user', text);
         input.value = '';
         input.style.height = 'auto';
-        var bubble = AppAgent.startStreamBubble();
         var btn = document.getElementById('agent-send-btn');
-        AppAgent.streaming = true;
-        btn.disabled = true;
-        btn.textContent = '生成中...';
-        var finishOnce = function() {
-          if (!AppAgent.streaming) return;
+        var finish = function() {
           AppAgent.streaming = false;
-          bubble.finish();
           btn.disabled = false;
           btn.textContent = '发送';
           AppAgent.onSent();
           document.getElementById('agent-input').focus();
         };
-        fetch('/api/agent/chat/stream', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: [{ role: 'user', content: text }],
-            model: document.getElementById('agent-model-hidden').value,
-            conversation_id: AppAgent.currentConvId
-          })
-        }).then(function(r) {
-          if (!r.ok) {
-            return r.json().catch(function() { return {}; }).then(function(e) {
-              throw new Error(e.error || ('请求失败 (' + r.status + ')'));
-            });
-          }
-          var reader = r.body.getReader();
-          var decoder = new TextDecoder();
-          var buffer = '';
-          var read = function() {
-            reader.read().then(function(res) {
-              if (res.done) { finishOnce(); return; }
-              buffer += decoder.decode(res.value, { stream: true });
-              var idx;
-              while ((idx = buffer.indexOf('\n\n')) >= 0) {
-                var frame = buffer.slice(0, idx);
-                buffer = buffer.slice(idx + 2);
-                frame.split('\n').forEach(function(line) {
-                  if (line.indexOf('data:') !== 0) return;
-                  var data = line.slice(5).trim();
-                  if (!data) return;
-                  if (data === '[DONE]') { finishOnce(); reader.cancel(); return; }
-                  bubble.append(data);
-                });
-                if (!AppAgent.streaming) return; // [DONE] 后停止继续读
-              }
-              if (AppAgent.streaming) read();
-            }).catch(function(e) {
-              finishOnce();
-              App.showToast('流式中断: ' + e.message, 'error');
-            });
+
+        if (useStream) {
+          // ---- SSE 流式 ----
+          var bubble = AppAgent.startStreamBubble();
+          AppAgent.streaming = true;
+          btn.disabled = true;
+          btn.textContent = '生成中...';
+          var finishOnce = function() {
+            if (!AppAgent.streaming) return;
+            AppAgent.streaming = false;
+            bubble.finish();
+            btn.disabled = false;
+            btn.textContent = '发送';
+            AppAgent.onSent();
+            document.getElementById('agent-input').focus();
           };
-          read();
-        }).catch(function(e) {
-          finishOnce();
-          App.showToast(e.message, 'error');
-        });
+          fetch('/api/agent/chat/stream', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: [{ role: 'user', content: text }],
+              model: document.getElementById('agent-model-hidden').value,
+              conversation_id: AppAgent.currentConvId
+            })
+          }).then(function(r) {
+            if (!r.ok) {
+              return r.json().catch(function() { return {}; }).then(function(e) {
+                throw new Error(e.error || ('请求失败 (' + r.status + ')'));
+              });
+            }
+            var reader = r.body.getReader();
+            var decoder = new TextDecoder();
+            var buffer = '';
+            var read = function() {
+              reader.read().then(function(res) {
+                if (res.done) { finishOnce(); return; }
+                buffer += decoder.decode(res.value, { stream: true });
+                var idx;
+                while ((idx = buffer.indexOf('\n\n')) >= 0) {
+                  var frame = buffer.slice(0, idx);
+                  buffer = buffer.slice(idx + 2);
+                  frame.split('\n').forEach(function(line) {
+                    if (line.indexOf('data:') !== 0) return;
+                    var data = line.slice(5).trim();
+                    if (!data) return;
+                    if (data === '[DONE]') { finishOnce(); reader.cancel(); return; }
+                    bubble.append(data);
+                  });
+                  if (!AppAgent.streaming) return;
+                }
+                if (AppAgent.streaming) read();
+              }).catch(function(e) {
+                finishOnce();
+                App.showToast('流式中断: ' + e.message, 'error');
+              });
+            };
+            read();
+          }).catch(function(e) {
+            finishOnce();
+            App.showToast(e.message, 'error');
+          });
+        } else {
+          // ---- 非流式（一次性 JSON）----
+          AppAgent.streaming = true;
+          btn.disabled = true;
+          btn.textContent = '生成中...';
+          fetch('/api/agent/chat', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: [{ role: 'user', content: text }],
+              model: document.getElementById('agent-model-hidden').value,
+              conversation_id: AppAgent.currentConvId
+            })
+          }).then(function(r) {
+            return r.json().catch(function() { return {}; }).then(function(data) {
+              if (!r.ok) throw new Error(data.error || ('请求失败 (' + r.status + ')'));
+              return data;
+            });
+          }).then(function(data) {
+            if (data.conversation_id) {
+              AppAgent.currentConvId = data.conversation_id;
+              hidden.value = data.conversation_id;
+            }
+            AppAgent.appendMessage('assistant', data.reply || '（AI 未返回内容）', true);
+          }).catch(function(e) {
+            App.showToast(e.message, 'error');
+          }).then(function() {
+            finish();
+          });
+        }
       };
 
       if (AppAgent.currentConvId) {
@@ -266,18 +431,22 @@
     }
   };
 
-  // 表单提交拦截：JS fetch + SSE（HTMX 不支持 POST 流式）
+  // 表单提交拦截：JS fetch + SSE / JSON（HTMX 不支持 POST 流式）
   document.getElementById('agent-chat-form')?.addEventListener('submit', function(e) {
     e.preventDefault();
     AppAgent.send();
   });
 
-  // 对话条目点击：加载消息历史（hx-get 负责列表高亮）
+  // 会话条目点击：加载消息历史（菜单按钮除外）
   document.body.addEventListener('click', function(e) {
     var item = e.target.closest('[data-conv-id]');
     if (!item) return;
+    if (e.target.closest('.conv-menu-btn')) return;
     AppAgent.loadConversation(parseInt(item.getAttribute('data-conv-id'), 10));
   });
+
+  // 菜单点击外部关闭（含滚动）
+  document.addEventListener('scroll', function() { AppAgent.closeMenu(); }, true);
 
   document.getElementById('agent-model-select')?.addEventListener('change', function() {
     document.getElementById('agent-model-hidden').value = this.value;
