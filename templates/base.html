@@ -16,7 +16,7 @@
   <meta name="format-detection" content="telephone=no">
 
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
-  <link rel="manifest" href="/assets/manifest.json">
+  <link rel="manifest" href="/assets/manifest.json?v=1">
   <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=16">
 
   <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
@@ -146,9 +146,10 @@
         el.innerHTML = DOMPurify.sanitize(marked.parse(raw));
       }
     };
-    // 向后兼容别名
+    // 向后兼容别名（preview.html 的 onerror="showMediaError(this)" 在全局作用域解析，必须有此别名）
     window.showToast = App.showToast;
     window.closeModal = App.closeModal;
+    window.showMediaError = App.showMediaError;
 
     // 云盘导航委托：目录行 / 打开按钮 (data-nav-path) 与面包屑 (data-breadcrumb-path) 统一入口。
     // 用户数据不进入内联 JS 字符串（防存储型 XSS），统一从 data-* 属性读取。
@@ -171,7 +172,7 @@
 
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=11', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=12', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;

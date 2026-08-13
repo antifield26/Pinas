@@ -33,6 +33,17 @@ pub struct Config {
     /// 注册开关：serde 默认 false（生产未配置即关闭）；Config::default() 为 true（测试/开发便利）
     #[serde(default = "default_allow_registration")]
     pub allow_registration: bool,
+    /// Cookie Secure 标志：None=默认强制 Secure（部署在 CF 隧道后）。
+    /// 仅纯 HTTP 局域网场景需显式设 PINAS_COOKIE_SECURE=false
+    #[serde(default)]
+    pub cookie_secure: Option<bool>,
+    /// 密码同步开关：true 时每次启动用 PINAS_*_PASSWORD 覆盖 DB 密码。
+    /// 默认 false——否则用户在 UI 改密后会被环境变量在下次重启时悄悄重置
+    #[serde(default)]
+    pub sync_passwords: bool,
+    /// AI 每日配额：每用户每日最多 AI 请求次数（防 guest 等账户烧光全局 API 额度）
+    #[serde(default = "default_agent_daily_quota")]
+    pub agent_daily_quota: u32,
 }
 
 // serde default 函数
@@ -72,6 +83,9 @@ fn default_deepseek_model() -> String {
 fn default_allow_registration() -> bool {
     false
 }
+fn default_agent_daily_quota() -> u32 {
+    200
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -92,6 +106,9 @@ impl Default for Config {
             deepseek_api_key: None,
             // 测试/开发便利：Config::default() 开放注册（生产走 from_env，serde 默认关闭）
             allow_registration: true,
+            cookie_secure: None,
+            sync_passwords: false,
+            agent_daily_quota: default_agent_daily_quota(),
         }
     }
 }
@@ -130,13 +147,17 @@ fn load_dotenv_manual() {
             unsafe {
                 std::env::set_var(key, value);
             }
-            if key == "PINAS_ADMIN_PASSWORD" {
-                let masked = if value.len() > 3 {
-                    format!("{}***{}", &value[..3], &value[value.len() - 1..])
-                } else {
-                    "***".into()
-                };
-                eprintln!("[Config]   PINAS_ADMIN_PASSWORD={}", masked);
+            if key == "PINAS_ADMIN_PASSWORD" || key == "PINAS_GUEST_PASSWORD" {
+                // 安全：绝不打印密码值的任何部分（systemd 下会进 journald，可被离线猜测）
+                eprintln!(
+                    "[Config]   {}={}",
+                    key,
+                    if value.is_empty() {
+                        "（空）"
+                    } else {
+                        "✓ 已设置"
+                    }
+                );
             }
         }
     }

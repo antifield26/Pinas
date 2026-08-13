@@ -145,8 +145,9 @@ pub async fn admin_users_fragment(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
 ) -> impl axum::response::IntoResponse {
+    // 非管理员 403：与 JSON admin 端点一致（此前 200 空数据掩盖未授权状态）
     if session.role != crate::constants::ROLE_ADMIN {
-        return AppTemplate(AdminUsersFragment { users: vec![] }).into_response();
+        return StatusCode::FORBIDDEN.into_response();
     }
     let users = sqlx::query_as::<_, (String, String, i64, i64)>(
         "SELECT username, role, used_mb, quota_mb FROM users ORDER BY username",

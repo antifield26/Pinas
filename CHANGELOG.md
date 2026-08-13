@@ -1,5 +1,93 @@
 # Changelog
 
+## v1.7.1 (2026-08-13)
+
+### Performance
+- **WebDAV 阻塞 IO 治理**:PUT 流式写盘循环用 std::fs 占死 async worker(1GB 慢速上行可冻结全站)
+  → tokio::fs + 绝对路径基准(根治历史 ENOENT 竞态);PROPFIND 元数据查询同改异步
+- **列表热路径去 N+1**:逐行 stat+DELETE(每行一个 WAL 写事务) → 并发 join_all + 单条批量 DELETE;
+  HTMX 片段列表补 1000 行防御上限
+- **配额增量调整**:update_user_used_mb 全表 SUM 扫描 → adjust_user_used_mb(_tx) 增量助手,
+  编辑器保存/merge 提交路径接入(对账保留)
+- **FTS5 大小写不敏感**(迁移 v9):搜 report 命中 Report.pdf(重建虚拟表 + 触发器 + rebuild)
+
+### Fixed / Hardening
+- **迁移体系加固**:25+ `.expect()` + panic=abort 意味着一次 DDL 失败整站启动崩溃
+  → 全部 Result 化 + 整批迁移单事务(失败整体回滚,main 日志报错退出)
+- **interval(0) 启动崩溃**:临时分片/回收站清理间隔为 0 时 panic → 钳位 ≥1
+- **限速 map 满时驱逐受害者**:攻击者可挤掉目标计数重置窗口绕过爆破防护 → 满时拒绝新键
+- **Mutex 中毒炸站**:dav AUTH_CACHE 中毒 unwrap → panic=abort → into_inner 恢复
+- **HSTS 误伤局域网**:无条件下发使纯 HTTP 直连被浏览器永久升级 → 仅 X-Forwarded-Proto:https 时下发
+- **配额缺口补齐**:回收站恢复超配额拒绝、编辑器保存按增量检查、WebDAV COPY 配额进写事务
+- **对话历史无界增长**:读取 LIMIT 500 + 每小时保留任务
+- 小修批量:create_folder 重复 409(不再孤儿目录+误导 500)、LIKE 通配符转义(ESCAPE '\')、
+  416 补 Content-Range、delete_batch 如实报告部分失败、bytes_received 重传重复计数修正、
+  rename_conversation 越权 404、WebDAV PUT 内容策略(扩展名黑名单+MIME 检测)、
+  admin 片段 403(不再 200 空数据)、日历时区统一 Local、credentials.txt 兜底清理、
+  agent model 白名单校验、todo_form Alpine 值迁移 data-* 属性、page_context 去闭包
+- **Service Worker v12**:/api/ 响应不再缓存(敏感 JSON 滞留 CacheStorage + 离线静默陈旧数据)、
+  activate 清空运行时缓存、manifest 入预缓存清单(?v=1)、日志串 v9→v12 修正
+
+### Deployment
+- 清理 ~/pinas 旧 SPA 遗留文件(app.js、js/、tailwind.js、static/index.html)
+- systemd unit Description 同步 v1.7.1
+
+## v1.7.0 (2026-08-13)
+
+### Security（审计驱动的关键修复）
+- **媒体令牌替代 URL 会话凭证**:`/api/media/?token=` 携带完整会话凭证(进日志/历史/分享链接即泄露账号)
+  → 新增 media_tokens 表(迁移 v8),预览页签发 30 分钟短时效、目录路径限定的 `mt` 令牌;旧 `?token=` 一律拒绝
+- **对话越权写入修复**:save_chat_round 无归属校验,任何登录用户(含 guest)可向他人对话注入消息
+  (历史进入 LLM 上下文即提示注入)→ 新增 assert_conv_owned,写路径强制校验
+- **AI 端点双重限速**:agent 全部端点无限制(guest 可烧光全局 DeepSeek 额度)
+  → 每用户 5 分钟窗口限速 + 每日配额(PINAS_AGENT_DAILY_QUOTA,默认 200)
+- **分享端点匿名防护**:分享页/下载/子文件无认证无限制(Argon2 CPU DoS + 无限速爆破)
+  → 每 IP 限速 + 每分享 5 次失败锁定 15 分钟
+- **Cookie 默认强制 Secure**:原仅在 X-Forwarded-Proto:https 时设置,直连 HTTP 凭证明文传输
+  → 默认 Secure(纯 HTTP 局域网场景显式 PINAS_COOKIE_SECURE=false)
+- **用户枚举时序侧信道**:未知用户立即返回 vs 已知用户 Argon2(~100ms)→ 登录与 WebDAV 均哑哈希等时校验
+- **链接收藏 scheme 校验缺口**:HTMX 片段路径可存 `javascript:` URL(点击即执行,存储型 XSS)
+  → 共享 validate_url(http/https + 主机名),四条写路径统一
+- **密码不再打印**:PINAS_ADMIN_PASSWORD 掩码前缀曾进 journald → 只打印已设置/未设置
+- **环境变量密码不再每启重置**:sync_user_password 每次重启用 .env 覆盖 DB 密码(UI 改密被悄悄回滚)
+  → PINAS_SYNC_PASSWORDS=true 显式开启(默认关,首次运行不受影响)
+
+### Fixed（数据完整性）
+- **分片空洞产出损坏文件**:完整性检查只数数量,{0,1,2,4} 能通过 → 严格集合相等 + DB 错误传播
+- **WebDAV MOVE 覆盖失败目标隐身**:位移目标 DB 行先删、失败只还原物理文件 → 行暂存,失败完整回滚
+- **回收站清空只删行不删文件**(HTMX 片段路径)→ 与 JSON API 共用物理删除
+- **带时间日程在日历/日期筛选隐身**:`2026-08-13T10:00:00` 与 `2026-08-31` 字符串比较失败
+  → 统一 substr(due_date,1,10) 比较与计数
+- **SSE 多行 delta 帧损坏**:含 \n 的 Markdown 内容静默丢失 → json_data 编码 + 客户端 JSON 解码兜底
+- **对话断连丢历史**:持久化依赖流尾元素,客户端断开即取消 → detached task 独立跑完上游并持久化
+- **AI 截断输出炸站**:模型输出尾部 `args=` 时切片越界 panic(panic=abort 整站宕机)→ get() 安全切片
+- **登录 ?redirect= 开放重定向**:javascript:/https:// 站外跳转 → 客户端仅允许 `/` 开头路径
+- **媒体加载失败 fallback 死代码**:showMediaError 未挂全局 → 补 window 别名
+- **全局搜索排序丢搜索词**:排序表头 hx-vals 缺 search → 表头携带当前搜索词
+- **page_size 非正数无界返回**:负 LIMIT 在 SQLite 意为无限制 → clamp(1, MAX)
+- **WebDAV 认证阻塞 async 运行时**:Argon2 直接跑在 worker → spawn_blocking
+- Dockerfile 修复(pinas-core 已合并、缺 templates/ 编译期必需);deploy.sh 补拷 JS 库;
+  CI 增加 check-versions/aarch64 检查/docker 冒烟
+
+### Tests
+- 集成测试 33 → 48(+15),单元测试 12 → 17(+5):同名重传 409、重命名覆盖保护、
+  中文多字节子树迁移、回收站清扫豁免、FK 全连接强制、媒体令牌作用域/过期、
+  分享爆破锁定、AI 配额、SSE 截断解析、对话归属、带时间日程日历等
+
+## v1.6.1 (2026-08-13)
+
+### Fixed（P0 数据丢失与关键安全）
+- **回收站被 24h 临时清扫销毁**(生产已发生 1 例):TRASH_DIR 位于 uploads/tmp 内
+  → 迁至 uploads/.trash(启动迁移,先于清扫任务)+ 清扫器白名单(仅分片/dav 临时条目)
+- **重传同名文件销毁旧文件**:merge File::create 先截断,INSERT 冲突后清理守卫连旧文件一起删
+  → 同名预检 409
+- **重命名/移动覆盖销毁目标**:fs rename 原子替换,DB UNIQUE 冲突回滚后目标内容已丢
+  → rename_core/move_core 目标存在预检 409(AppResult 化,6 调用点传播)
+- **中文目录深层子路径损坏**:SUBSTR 偏移用字节长度(字符语义)+ LIKE 未转义 %/_
+  → SQLite length(?) + escape_like
+- **模型截断输出触发 panic=abort 整站宕机**(parse_text_invokes)→ 安全切片
+- **PRAGMA foreign_keys 仅单连接生效**:per-connection 设置 → SqliteConnectOptions::foreign_keys(true)
+
 ## v1.5.1 (2026-08-04)
 
 ### Security（全面评估驱动,3 项 Critical 修复）

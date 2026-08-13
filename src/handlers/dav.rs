@@ -6,10 +6,10 @@
 // DELETE 进回收站（可还原）；配额沿用 upload.rs 预检模式；大请求路由级 5GiB 上限（router.rs）。
 
 use axum::{
-    extract::Request,
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
     Extension,
+    extract::Request,
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
@@ -64,8 +64,9 @@ async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Res
     let (user, pass) = creds.split_once(':').ok_or_else(unauthorized)?;
 
     // 命中缓存（60s）时跳过 argon2 验证；角色实时查。锁不得跨越 await（MutexGuard 非 Send）
+    // 中毒恢复：panic=abort 下 Mutex 中毒的 unwrap 会把整站打死，必须 into_inner 恢复
     let cached_ok = {
-        let cache = AUTH_CACHE.lock().unwrap();
+        let cache = AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache
             .get(user)
             .map(|(ok, t)| *ok && t.elapsed() < std::time::Duration::from_secs(60))
@@ -83,10 +84,30 @@ async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Res
         });
     }
 
-    let Ok(Some(auth_row)) = crate::db::queries::get_user_auth(pool, user).await else {
-        return Err(unauthorized());
+    // 用户不存在时用哑哈希等时校验（抹平用户枚举时序侧信道）
+    let auth_row = match crate::db::queries::get_user_auth(pool, user).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let dummy_pass = pass.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::core::verify_password(
+                    crate::handlers::auth::dummy_hash_for_timing(),
+                    &dummy_pass,
+                )
+            })
+            .await
+            .unwrap_or(false);
+            return Err(unauthorized());
+        }
+        Err(_) => return Err(unauthorized()),
     };
-    if !crate::core::verify_password(&auth_row.0, pass) {
+    // Argon2 为阻塞 CPU 操作，必须移出 async 运行时（同 auth.rs 登录路径）
+    let pass2 = pass.to_string();
+    let hash2 = auth_row.0.clone();
+    let ok = tokio::task::spawn_blocking(move || crate::core::verify_password(&hash2, &pass2))
+        .await
+        .unwrap_or(false);
+    if !ok {
         return Err(unauthorized());
     }
     if auth_row.2 {
@@ -99,7 +120,7 @@ async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Res
     }
     AUTH_CACHE
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(user.to_string(), (true, Instant::now()));
     Ok(DavUser {
         username: user.to_string(),
@@ -149,6 +170,12 @@ pub async fn dav_handler(
 }
 
 // ====== 工具函数 ======
+
+/// 绝对路径解析：tokio::fs 在阻塞池线程执行，相对路径依赖池线程 CWD
+/// （历史 ENOENT 竞态根源）。统一在 async 上下文解析绝对路径后再交给 tokio::fs
+fn absolute_uploads_path(rel: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(rel).unwrap_or_else(|_| rel.to_path_buf())
+}
 
 /// 拆分相对路径为 (父目录, 名称)；根为空串
 fn split_last(rel: &str) -> (String, String) {
@@ -247,7 +274,10 @@ fn options_response() -> Response {
     (
         StatusCode::OK,
         [
-            ("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK"),
+            (
+                "Allow",
+                "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK",
+            ),
             ("DAV", "1, 2"),
             ("Content-Length", "0"),
         ],
@@ -277,7 +307,10 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             Ok(p) => p,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
-        if !full.exists() {
+        if !tokio::fs::try_exists(&absolute_uploads_path(&full))
+            .await
+            .unwrap_or(false)
+        {
             return StatusCode::NOT_FOUND.into_response();
         }
     }
@@ -303,17 +336,18 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             .await
             .unwrap_or_default();
             for (name, parent_path, is_dir, size_mb, created_at) in rows {
-                let full = match physical_path(
-                    &user.username,
-                    &logical_path(&parent_path, &name),
-                ) {
+                let full = match physical_path(&user.username, &logical_path(&parent_path, &name)) {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                if !full.exists() {
+                if !tokio::fs::try_exists(&absolute_uploads_path(&full))
+                    .await
+                    .unwrap_or(false)
+                {
                     continue;
                 }
-                let mtime = std::fs::metadata(&full)
+                let mtime = tokio::fs::metadata(&absolute_uploads_path(&full))
+                    .await
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -336,7 +370,7 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
     } else {
         let (parent, name) = split_last(rel);
         let full = physical_path(&user.username, rel).unwrap();
-        let meta = match std::fs::metadata(&full) {
+        let meta = match tokio::fs::metadata(&absolute_uploads_path(&full)).await {
             Ok(m) => m,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
@@ -346,14 +380,15 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let created_at: Option<String> =
-            sqlx::query_scalar("SELECT created_at FROM files WHERE username = ? AND name = ? AND parent_path = ?")
-                .bind(&user.username)
-                .bind(&name)
-                .bind(&parent)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
+        let created_at: Option<String> = sqlx::query_scalar(
+            "SELECT created_at FROM files WHERE username = ? AND name = ? AND parent_path = ?",
+        )
+        .bind(&user.username)
+        .bind(&name)
+        .bind(&parent)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
         entries.push((
             format!("/dav/{}", encode_path(rel)),
             name,
@@ -377,10 +412,14 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                if !full.exists() {
+                if !tokio::fs::try_exists(&absolute_uploads_path(&full))
+                    .await
+                    .unwrap_or(false)
+                {
                     continue;
                 }
-                let mtime = std::fs::metadata(&full)
+                let mtime = tokio::fs::metadata(&absolute_uploads_path(&full))
+                    .await
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -404,10 +443,11 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
 
     let (used_mb, quota_mb) = quota_info(pool, &user.username).await;
     let used_bytes = (used_mb as u64).saturating_mul(1024 * 1024);
-    let avail_bytes = (quota_mb.saturating_sub(used_mb).max(0) as u64)
-        .saturating_mul(1024 * 1024);
+    let avail_bytes = (quota_mb.saturating_sub(used_mb).max(0) as u64).saturating_mul(1024 * 1024);
 
-    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n");
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n",
+    );
     for (href, name, is_dir, size, mtime, created_at) in &entries {
         let res_type = if *is_dir {
             "<D:collection/>".to_string()
@@ -444,8 +484,13 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             "        <D:creationdate>{}</D:creationdate>\n",
             creation_date(created_at)
         ));
-        xml.push_str(&format!("        <D:resourcetype>{}</D:resourcetype>\n", res_type));
-        xml.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n");
+        xml.push_str(&format!(
+            "        <D:resourcetype>{}</D:resourcetype>\n",
+            res_type
+        ));
+        xml.push_str(
+            "      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n",
+        );
         xml.push_str("    <D:propstat>\n      <D:prop>\n");
         xml.push_str(&format!(
             "        <D:quota-used-bytes>{}</D:quota-used-bytes>\n",
@@ -455,7 +500,9 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             "        <D:quota-available-bytes>{}</D:quota-available-bytes>\n",
             avail_bytes
         ));
-        xml.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n");
+        xml.push_str(
+            "      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n",
+        );
         xml.push_str("  </D:response>\n");
     }
     xml.push_str("</D:multistatus>");
@@ -509,9 +556,7 @@ async fn get_file(user: &DavUser, path: &str, headers: &HeaderMap, method: &Meth
         return (StatusCode::OK, headers).into_response();
     }
 
-    let range_header = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok());
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let (start, end, status) = if let Some(range_value) = range_header {
         if let Some((s, e)) = crate::handlers::media::parse_range(range_value, file_size) {
             (s, e, StatusCode::PARTIAL_CONTENT)
@@ -542,9 +587,7 @@ async fn get_file(user: &DavUser, path: &str, headers: &HeaderMap, method: &Meth
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type);
-    if force_download
-        && let Ok(d) = "attachment".parse::<HeaderValue>()
-    {
+    if force_download && let Ok(d) = "attachment".parse::<HeaderValue>() {
         headers.insert(header::CONTENT_DISPOSITION, d);
     }
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -574,12 +617,7 @@ async fn get_file(user: &DavUser, path: &str, headers: &HeaderMap, method: &Meth
 // ====== PUT ======
 
 /// PUT：流式落盘 uploads/tmp/dav_{uuid} → 配额预检+复核 → 原子 rename 覆盖 → 登记 files 表
-async fn put_file(
-    pool: &SqlitePool,
-    user: &DavUser,
-    path: &str,
-    req: Request,
-) -> Response {
+async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -> Response {
     let rel = path.trim_start_matches('/');
     let (parent, name) = split_last(rel);
     if validate_name(&name).is_err() {
@@ -597,7 +635,10 @@ async fn put_file(
     if std::fs::create_dir_all(&parent_full).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &parent).await.is_err() {
+    if crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &parent)
+        .await
+        .is_err()
+    {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -613,9 +654,14 @@ async fn put_file(
     }
 
     // 流式写入 temp（先确保 tmp 目录存在，防御性创建）
+    // 全程 tokio::fs + 绝对路径：std::fs 阻塞写会在 async worker 上卡住整条上传
+    // （1GB 慢速上行可占死一个 worker，3-4 并发冻结全站）
     let _ = std::fs::create_dir_all(TMP_DIR);
-    let tmp = format!("{TMP_DIR}/dav_{}", uuid::Uuid::new_v4());
-    let mut file = match std::fs::File::create(&tmp) {
+    let tmp = absolute_uploads_path(std::path::Path::new(&format!(
+        "{TMP_DIR}/dav_{}",
+        uuid::Uuid::new_v4()
+    )));
+    let mut file = match tokio::fs::File::create(&tmp).await {
         Ok(f) => f,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -625,22 +671,24 @@ async fn put_file(
         let chunk = match chunk {
             Ok(c) => c,
             Err(_) => {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = tokio::fs::remove_file(&tmp).await;
                 return StatusCode::BAD_REQUEST.into_response();
             }
         };
         written += chunk.len() as u64;
         if written > DAV_MAX_BODY_BYTES {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = tokio::fs::remove_file(&tmp).await;
             return StatusCode::INSUFFICIENT_STORAGE.into_response();
         }
-        if std::io::Write::write_all(&mut file, &chunk).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        use tokio::io::AsyncWriteExt;
+        if file.write_all(&chunk).await.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    if std::io::Write::flush(&mut file).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    use tokio::io::AsyncWriteExt;
+    if file.flush().await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     drop(file);
@@ -649,28 +697,42 @@ async fn put_file(
     let need = crate::handlers::utils::bytes_to_mb_ceil(written);
     let (used_mb, quota_mb) = quota_info(pool, &user.username).await;
     if used_mb + need > quota_mb {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = tokio::fs::remove_file(&tmp).await;
         return StatusCode::INSUFFICIENT_STORAGE.into_response();
     }
 
     // 覆盖语义：目标存在则物理替换 + 删除旧 DB 行
-    let target = parent_full.join(&name);
-    let existed = target.exists();
+    let target = absolute_uploads_path(&parent_full.join(&name));
+    let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
     if existed {
-        if std::fs::remove_file(&target).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        if tokio::fs::remove_file(&target).await.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        let _ = sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
-            .bind(&user.username)
-            .bind(&name)
-            .bind(&parent)
-            .execute(pool)
-            .await;
+        let _ =
+            sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
+                .bind(&user.username)
+                .bind(&name)
+                .bind(&parent)
+                .execute(pool)
+                .await;
     }
-    if std::fs::rename(&tmp, &target).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if tokio::fs::rename(&tmp, &target).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // 内容策略（与分片上传一致）：扩展名黑名单 + 完整文件 MIME 检测（防 WebDAV 绕过）
+    if crate::handlers::utils::is_blocked_extension(&name) {
+        let _ = tokio::fs::remove_file(&target).await;
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !crate::handlers::utils::is_allowed_mime_streaming(&target)
+        .await
+        .unwrap_or(true)
+    {
+        let _ = tokio::fs::remove_file(&target).await;
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     // 登记 + 配额重算
@@ -731,12 +793,13 @@ async fn mkcol(pool: &SqlitePool, user: &DavUser, path: &str) -> Response {
     if std::fs::create_dir(&full).is_err() {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
-        .bind(&user.username)
-        .bind(&name)
-        .bind(&parent)
-        .execute(pool)
-        .await;
+    let _ =
+        sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
+            .bind(&user.username)
+            .bind(&name)
+            .bind(&parent)
+            .execute(pool)
+            .await;
     let _ = crate::handlers::utils::log_audit(
         pool,
         &user.username,
@@ -789,31 +852,71 @@ async fn move_or_copy(
     if dst_full.exists() && !overwrite {
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
-    // 覆盖目标：先移走旧目标（物理 + DB），操作完成后再清理
-    let mut displaced: Option<(std::path::PathBuf, String, String, String)> = None; // (tmp_path, name, parent, logical)
+    // 覆盖目标：先移走旧目标（物理 + DB 行暂存），移动成功后再清理。
+    // DB 行暂存是为了失败时能完整恢复——旧实现删行后失败只还原物理文件，
+    // 目标文件从此"隐身"（无 DB 行 → UI 不可见且会被 ensure_file_on_disk 判为孤儿）
+    #[derive(sqlx::FromRow)]
+    struct DisplacedFileRow {
+        name: String,
+        parent_path: String,
+        is_dir: i64,
+        size_mb: f64,
+        identifier: Option<String>,
+    }
+    // (tmp_path, name, parent, logical, 暂存的 DB 行)
+    let mut displaced: Option<(
+        std::path::PathBuf,
+        String,
+        String,
+        String,
+        Vec<DisplacedFileRow>,
+    )> = None;
     if dst_full.exists() {
         let tmp = format!("{TMP_DIR}/dav_disp_{}", uuid::Uuid::new_v4());
         if std::fs::rename(&dst_full, &tmp).is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        let _ = sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
-            .bind(&user.username)
-            .bind(&d_name)
-            .bind(&d_parent)
-            .execute(pool)
-            .await;
         let child_prefix = if d_parent.is_empty() {
-            format!("{d_name}/%")
+            format!("{}/%", crate::db::queries::escape_like(&d_name))
         } else {
-            format!("{d_parent}/{d_name}/%")
+            format!(
+                "{}/{}/%",
+                crate::db::queries::escape_like(&d_parent),
+                crate::db::queries::escape_like(&d_name)
+            )
         };
-        let _ = sqlx::query("DELETE FROM files WHERE username = ? AND parent_path LIKE ?")
-            .bind(&user.username)
-            .bind(&child_prefix)
-            .execute(pool)
-            .await;
+        // 暂存目标及其子树的 DB 行（失败回滚时重插）
+        let rows: Vec<DisplacedFileRow> = sqlx::query_as(
+            "SELECT name, parent_path, is_dir, size_mb, identifier FROM files WHERE username = ? AND ((name = ? AND parent_path = ?) OR parent_path LIKE ? ESCAPE '\\')",
+        )
+        .bind(&user.username)
+        .bind(&d_name)
+        .bind(&d_parent)
+        .bind(&child_prefix)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let _ =
+            sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
+                .bind(&user.username)
+                .bind(&d_name)
+                .bind(&d_parent)
+                .execute(pool)
+                .await;
+        let _ =
+            sqlx::query("DELETE FROM files WHERE username = ? AND parent_path LIKE ? ESCAPE '\\'")
+                .bind(&user.username)
+                .bind(&child_prefix)
+                .execute(pool)
+                .await;
         let displaced_logical = logical_path(&d_parent, &d_name);
-        displaced = Some((tmp.into(), d_name.clone(), d_parent.clone(), displaced_logical));
+        displaced = Some((
+            tmp.into(),
+            d_name.clone(),
+            d_parent.clone(),
+            displaced_logical,
+            rows,
+        ));
     }
 
     let (s_parent, s_name) = split_last(src_rel);
@@ -829,12 +932,23 @@ async fn move_or_copy(
         let _ = crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &d_parent).await;
         // move_core 为同名移动；Destination 含新文件名时先移动再改名（rename_core 处理子树）
         if s_parent == d_parent {
-            crate::handlers::file_ops::rename_core(pool, &user.username, &s_parent, &s_name, &d_name)
-                .await
+            crate::handlers::file_ops::rename_core(
+                pool,
+                &user.username,
+                &s_parent,
+                &s_name,
+                &d_name,
+            )
+            .await
         } else {
-            let moved =
-                crate::handlers::file_ops::move_core(pool, &user.username, &s_parent, &d_parent, &s_name)
-                    .await;
+            let moved = crate::handlers::file_ops::move_core(
+                pool,
+                &user.username,
+                &s_parent,
+                &d_parent,
+                &s_name,
+            )
+            .await;
             match moved {
                 Ok(()) if d_name != s_name => {
                     crate::handlers::file_ops::rename_core(
@@ -850,12 +964,15 @@ async fn move_or_copy(
             }
         }
     } else {
-        copy_recursive(pool, &user.username, &s_parent, &s_name, &d_parent, &d_name).await
+        copy_recursive(pool, &user.username, &s_parent, &s_name, &d_parent, &d_name)
+            .await
+            .map_err(|e| crate::error::AppError::internal_log("WebDAV 复制", e))
     };
 
     match result {
         Ok(()) => {
-            if let Some((tmp, name, parent, logical)) = displaced {
+            if let Some((tmp, name, parent, logical, _rows)) = displaced {
+                // 成功：DB 行已删，物理位移文件清掉
                 let _ = std::fs::remove_dir_all(&tmp);
                 let _ = crate::handlers::utils::log_audit(
                     pool,
@@ -868,7 +985,11 @@ async fn move_or_copy(
                 )
                 .await;
             }
-            let action = if is_move { "webdav_move" } else { "webdav_copy" };
+            let action = if is_move {
+                "webdav_move"
+            } else {
+                "webdav_copy"
+            };
             let _ = crate::handlers::utils::log_audit(
                 pool,
                 &user.username,
@@ -883,9 +1004,22 @@ async fn move_or_copy(
             StatusCode::CREATED.into_response()
         }
         Err(_) => {
-            // 失败：还原被移走的旧目标
-            if let Some((tmp, _, _, _)) = displaced {
+            // 失败：完整还原被移走的旧目标（物理文件 + DB 行）
+            if let Some((tmp, _, _, _, rows)) = displaced {
                 let _ = std::fs::rename(&tmp, &dst_full);
+                for r in rows {
+                    let _ = sqlx::query(
+                        "INSERT OR IGNORE INTO files (username, name, parent_path, is_dir, size_mb, identifier) VALUES (?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&user.username)
+                    .bind(&r.name)
+                    .bind(&r.parent_path)
+                    .bind(r.is_dir)
+                    .bind(r.size_mb)
+                    .bind(&r.identifier)
+                    .execute(pool)
+                    .await;
+                }
             }
             StatusCode::CONFLICT.into_response()
         }
@@ -919,17 +1053,22 @@ async fn copy_recursive(
     .await
     .map_err(|e| format!("COPY 源查询失败: {e}"))?;
 
-    // 配额预检
+    // 配额复核 + 登记统一进写事务：并发 COPY 之间由 SQLite 写锁串行化，
+    // 避免预检通过后互相穿插导致配额超额；失败回滚不留半截 DB 行
     let total_mb: f64 = rows
         .iter()
         .filter(|r| r.2 == 0)
         .map(|r| r.3)
         .sum::<f64>()
         .ceil();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("COPY 事务失败: {e}"))?;
     let (used_mb, quota_mb) = {
         let row = sqlx::query("SELECT used_mb, quota_mb FROM users WHERE username = ?")
             .bind(username)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| format!("配额查询失败: {e}"))?;
         match row {
@@ -956,8 +1095,7 @@ async fn copy_recursive(
             .map_err(|_| "COPY 源路径非法".to_string())?;
         let dst_parent = safe_join_sandbox(base, &format!("{username}/{new_parent}"))
             .map_err(|_| "COPY 目标路径非法".to_string())?;
-        std::fs::create_dir_all(&dst_parent)
-            .map_err(|e| format!("COPY 创建目录失败: {e}"))?;
+        std::fs::create_dir_all(&dst_parent).map_err(|e| format!("COPY 创建目录失败: {e}"))?;
         if is_dir != 0 {
             std::fs::create_dir_all(dst_parent.join(target_name))
                 .map_err(|e| format!("COPY 创建目录失败: {e}"))?;
@@ -967,7 +1105,7 @@ async fn copy_recursive(
             .bind(username)
             .bind(target_name)
             .bind(&new_parent)
-            .execute(pool)
+            .execute(&mut *tx)
             .await;
         } else {
             std::fs::copy(&src, dst_parent.join(target_name))
@@ -979,10 +1117,18 @@ async fn copy_recursive(
             .bind(target_name)
             .bind(&new_parent)
             .bind(size_mb)
-            .execute(pool)
+            .execute(&mut *tx)
             .await;
         }
     }
+    let _ = sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
+        .bind(total_mb as i64)
+        .bind(username)
+        .execute(&mut *tx)
+        .await;
+    tx.commit()
+        .await
+        .map_err(|e| format!("COPY 提交失败: {e}"))?;
     Ok(())
 }
 

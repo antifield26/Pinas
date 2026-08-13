@@ -20,6 +20,36 @@ pub fn bytes_to_mb_ceil(bytes: u64) -> i64 {
     (bytes as f64 / BYTES_PER_MB_F64).ceil() as i64
 }
 
+/// 增量调整用户已用配额（delta_mb 可负）：热点路径用它替代全表 SUM 重算
+/// （update_user_used_mb 每次全量扫描，保留为对账/低频路径）
+pub async fn adjust_user_used_mb(pool: &sqlx::SqlitePool, username: &str, delta_mb: i64) {
+    if delta_mb == 0 {
+        return;
+    }
+    if let Err(e) = sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
+        .bind(delta_mb)
+        .bind(username)
+        .execute(pool)
+        .await
+    {
+        tracing::error!("[Quota] 增量调整失败: {}", e);
+    }
+}
+
+/// 事务内变体（与文件登记同事务提交，保证配额与 DB 记录原子一致）
+pub async fn adjust_user_used_mb_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    username: &str,
+    delta_mb: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
+        .bind(delta_mb)
+        .bind(username)
+        .execute(&mut **tx)
+        .await
+        .map(|_| ())
+}
+
 pub static BLOCKED_EXTENSIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     let mut m = HashSet::new();
     m.insert("exe");
@@ -40,6 +70,36 @@ pub fn is_blocked_extension(file_name: &str) -> bool {
         return BLOCKED_EXTENSIONS.contains(ext.to_lowercase().as_str());
     }
     false
+}
+
+/// 转义 LIKE 模式中的通配符（配合 `LIKE ? ESCAPE '\'` 使用），
+/// 防止用户输入中的 %/_ 意外匹配其他行或制造昂贵扫描
+/// （实现位于 db::queries，此处重导出供 handlers 层统一调用）
+pub use crate::db::queries::escape_like;
+
+/// 校验收藏链接 URL：仅允许 http/https 且含主机名。
+/// 拒绝 javascript:/data:/vbscript:/file: 等 scheme（`<a href>` 点击即执行 → 存储型 XSS）
+/// 与 `//` 无主机形式；拒绝控制字符。
+pub fn validate_url(url: &str) -> crate::error::AppResult<()> {
+    use crate::error::AppError;
+    let u = url.trim();
+    if u.is_empty() {
+        return Err(AppError::bad_request("URL不能为空"));
+    }
+    if u.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(AppError::bad_request("URL包含非法字符"));
+    }
+    let lower = u.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(AppError::bad_request("URL必须以http://或https://开头"));
+    }
+    // http:// 之后必须有实际主机名（排除 "http://"、"https://"、"http:///x" 这类空主机）
+    let rest = &u[u.find("://").unwrap() + 3..];
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err(AppError::bad_request("URL缺少主机名"));
+    }
+    Ok(())
 }
 
 /// 校验文件/文件夹名称合法性(安全白名单)
@@ -90,6 +150,39 @@ pub fn is_allowed_mime(data: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// 签发短时效、路径限定的媒体令牌（30 分钟）：替代会话 token 出现在媒体 URL 中。
+/// 泄露影响受限——只能访问签发路径前缀之下的资源，半小时后自动失效。
+/// 返回空串表示签发失败（调用方应退化为不签发，媒体 URL 走 Cookie/Bearer 认证）。
+pub async fn issue_media_token(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    path_prefix: &str,
+) -> String {
+    let token = uuid::Uuid::new_v4().to_string();
+    let token_hash = crate::core::hash_token(&token);
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::minutes(30))
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::minutes(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    match sqlx::query(
+        "INSERT INTO media_tokens (username, token_hash, path_prefix, expires_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(username)
+    .bind(&token_hash)
+    .bind(path_prefix)
+    .bind(&expires_at)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => token,
+        Err(e) => {
+            tracing::error!("[Media] 媒体令牌入库失败: {}", e);
+            String::new()
+        }
+    }
 }
 
 pub async fn is_allowed_mime_streaming(

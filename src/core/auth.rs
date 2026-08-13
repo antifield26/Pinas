@@ -53,11 +53,11 @@ pub async fn auth_middleware(
             .and_then(|h| h.strip_prefix("Bearer "))
             .map(|t| t.to_string())
     };
-    let extract_from_query = |req: &Request| -> Option<String> {
+    let extract_query_param = |req: &Request, name: &str| -> Option<String> {
         req.uri().query().and_then(|q| {
             for pair in q.split('&') {
                 let mut parts = pair.splitn(2, '=');
-                if parts.next() == Some("token") {
+                if parts.next() == Some(name) {
                     return parts.next().map(|v| v.to_string());
                 }
             }
@@ -65,14 +65,59 @@ pub async fn auth_middleware(
         })
     };
 
-    // 优先级：Cookie (httpOnly) > Authorization Header > Query param
-    let mut target_token = extract_from_cookie(&req).or_else(|| extract_from_header(&req));
+    // 优先级：Cookie (httpOnly) > Authorization Header
+    let target_token = extract_from_cookie(&req).or_else(|| extract_from_header(&req));
 
-    // media/ssh 路径额外支持 query 参数
+    // /api/media/* 无 Cookie/Header 时走短时效路径限定媒体令牌（mt）。
+    // 会话 token 不再接受 URL 查询串（完整会话凭证进日志/历史的风险已被媒体令牌取代）
     if target_token.is_none()
-        && (uri_path.starts_with("/api/media/") || uri_path.starts_with("/api/ssh/"))
+        && uri_path.starts_with("/api/media/")
+        && let Some(mt) = extract_query_param(&req, "mt")
+        && !mt.is_empty()
     {
-        target_token = extract_from_query(&req).or_else(|| extract_from_header(&req));
+        let mt_hash = hash_token(&mt);
+        let row = sqlx::query(
+            "SELECT m.username, m.path_prefix, COALESCE(u.role, 'user') as role \
+                 FROM media_tokens m LEFT JOIN users u ON m.username = u.username \
+                 WHERE m.token_hash = ? AND m.expires_at > datetime('now')",
+        )
+        .bind(&mt_hash)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("[Auth Error] 媒体令牌查询失败: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        match row {
+            Some(row) => {
+                // 路径限定：令牌只能访问其签发路径前缀之下的资源（边界感知，防 "dir" 匹配 "dir2"）
+                let path_prefix: String = row.get("path_prefix");
+                let media_path = uri_path
+                    .strip_prefix("/api/media/")
+                    .unwrap_or_default()
+                    .trim_start_matches('/');
+                let prefix = path_prefix.trim_start_matches('/').trim_end_matches('/');
+                let within = if prefix.is_empty() {
+                    true
+                } else {
+                    media_path == prefix || media_path.starts_with(&format!("{}/", prefix))
+                };
+                if !within {
+                    warn!("[Auth] 媒体令牌路径越界: {:?}", media_path);
+                    return reject_no_token(uri_path);
+                }
+                req.extensions_mut().insert(UserSession {
+                    username: row.get("username"),
+                    role: row.get("role"),
+                    must_change_pwd: false,
+                });
+                return Ok(next.run(req).await);
+            }
+            None => {
+                warn!("[Auth] 媒体令牌无效或已过期");
+                return reject_no_token(uri_path);
+            }
+        }
     }
 
     let target_token = match target_token {

@@ -13,12 +13,12 @@
       {% if !has_global_search %}<th class="p-4 w-8"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)" class="rounded"></th>{% endif %}
       <th class="p-4">
         <a href="#" hx-get="/drive/list" hx-target="#drive-file-list"
-           hx-vals='{"path":{{ current_path | json }},"sort_by":"name_desc"}'
+           hx-vals='{"path":{{ current_path | json }},"sort_by":"name_desc","search":{{ search | json }}}'
            class="hover:text-indigo-600 transition">{% if has_global_search %}搜索结果{% else %}文件名 ▾{% endif %}</a>
       </th>
       <th class="p-4 w-24 hidden sm:table-cell">
         <a href="#" hx-get="/drive/list" hx-target="#drive-file-list"
-           hx-vals='{"path":{{ current_path | json }},"sort_by":"size_desc"}'
+           hx-vals='{"path":{{ current_path | json }},"sort_by":"size_desc","search":{{ search | json }}}'
            class="hover:text-indigo-600 transition">大小</a>
       </th>
       <th class="p-4 text-right"><span class="hidden sm:inline">操作</span></th>

@@ -239,10 +239,17 @@ pub async fn upload_chunk(
     .execute(&pool)
     .await;
 
-    // 累计分片字节（磁盘上限/配额核算依据）
+    // 累计分片字节（磁盘上限/配额核算依据）。
+    // 同索引重传（断点重试/覆盖）会先截断再写：必须减去该片旧大小再累加新值，
+    // 否则重复计入导致 5GB 上限被提前触发
+    let prev_chunk_len = tokio::fs::metadata(&chunk_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0) as i64;
     let _ = sqlx::query(
-        "UPDATE upload_chunks SET bytes_received = bytes_received + ? WHERE username = ? AND identifier = ?",
+        "UPDATE upload_chunks SET bytes_received = MAX(0, bytes_received - ? + ?) WHERE username = ? AND identifier = ?",
     )
+    .bind(prev_chunk_len)
     .bind(total_written as i64)
     .bind(&session.username)
     .bind(&params.identifier)
@@ -269,7 +276,7 @@ pub async fn merge_chunks(
     }
     validate_identifier(&payload.identifier)?;
 
-    // 从数据库获取总分片数（可选，也可直接从文件系统推断）
+    // 从数据库获取总分片数（DB 错误必须传播，否则静默跳过完整性校验）
     let total_chunks: Option<i32> = sqlx::query_scalar(
         "SELECT total_chunks FROM upload_chunks WHERE username = ? AND identifier = ?",
     )
@@ -277,7 +284,7 @@ pub async fn merge_chunks(
     .bind(&payload.identifier)
     .fetch_optional(&pool)
     .await
-    .unwrap_or(None);
+    .map_err(|e| AppError::internal_log("查询分片记录", e))?;
 
     let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, payload.identifier);
     // 读取目录下所有分片文件
@@ -296,9 +303,10 @@ pub async fn merge_chunks(
     }
     chunks.sort();
 
-    // 如果已知总分片数，校验是否完整
+    // 如果已知总分片数，校验完整性：必须恰好是 0..total 的连续集合，
+    // 仅数量相等会放过 {0,1,2,4} 这种缺 3 的空洞，产出错位损坏的文件
     if let Some(total) = total_chunks
-        && chunks.len() != total as usize
+        && chunks != (0..total).collect::<Vec<i32>>()
     {
         return Err(AppError::bad_request(format!(
             "分片不完整，已上传 {} 个，预期 {} 个",
@@ -317,6 +325,25 @@ pub async fn merge_chunks(
     // 兜底复检：合并目标必须位于用户沙箱目录之下（防御未来校验绕过）
     if !target_file_path.starts_with(&user_dir) {
         return Err(AppError::bad_request("非法文件名"));
+    }
+
+    // 同名预检：File::create 会截断已存在文件，而随后 INSERT 因 UNIQUE 约束失败时
+    // 清理守卫会连新文件一起删除，等于销毁了旧文件。必须先于任何写盘检查。
+    let same_name_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE username = ? AND name = ? AND parent_path = ?)",
+    )
+    .bind(username)
+    .bind(&payload.file_name)
+    .bind(&parent_path)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(true); // DB 异常时保守拒绝，绝不冒险覆盖
+    if same_name_exists
+        || tokio::fs::try_exists(&target_file_path)
+            .await
+            .unwrap_or(true)
+    {
+        return Err(AppError::conflict("同名文件已存在，请先删除或重命名"));
     }
 
     // 合并前配额预检：先算分片总量再写盘，避免大文件写完才被拒绝
@@ -417,10 +444,7 @@ pub async fn merge_chunks(
     .map_err(|e| AppError::internal_log("文件记录入库", e))?;
 
     // 在事务内更新用户已用容量（配额用向上取整值避免微文件累积逃逸）
-    sqlx::query("UPDATE users SET used_mb = MAX(0, used_mb + ?) WHERE username = ?")
-        .bind(file_size_mb_ceil)
-        .bind(username)
-        .execute(&mut *tx)
+    crate::handlers::utils::adjust_user_used_mb_tx(&mut tx, username, file_size_mb_ceil)
         .await
         .map_err(|e| AppError::internal_log("更新用户容量", e))?;
 

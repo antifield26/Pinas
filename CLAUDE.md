@@ -157,7 +157,7 @@ Browser                      Axum Server
 
 ## 数据库
 
-13 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `schema_version` + FTS5 `files_fts`（trigram，触发器同步）
+14 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `media_tokens`, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）
 
 - **WAL 模式** (`Normal` synchronous)，连接池 16
 - **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
@@ -175,7 +175,9 @@ PINAS_TEMP_CLEANUP_HOURS=24        PINAS_TRASH_CLEANUP_DAYS=30
 PINAS_ADMIN_PASSWORD=              PINAS_GUEST_PASSWORD=
 PINAS_DEEPSEEK_API_KEY=            PINAS_DEEPSEEK_API_BASE=https://api.deepseek.com
 PINAS_DEEPSEEK_MODEL=deepseek-v4-flash     PINAS_ALLOW_REGISTRATION=false
-MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
+PINAS_COOKIE_SECURE=               PINAS_SYNC_PASSWORDS=false
+PINAS_AGENT_DAILY_QUOTA=200        MINECRAFT_HOST=127.0.0.1
+MINECRAFT_PORT=25565
 ```
 
 ## 代码约定
@@ -190,6 +192,12 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 - **WebDAV** `/dav/*`：Basic 认证（60s 成功缓存防每请求 argon2）+ 全路径沙箱 + DELETE 进回收站；
   路由级 5GiB body limit；dav.rs 文件操作统一 std::fs（测试环境 tokio::fs 相对路径有 ENOENT 竞态）
 - 密码学函数从 `src/core` 导入（`hash_password`, `verify_password`, `hash_token`）
+- **媒体访问走短时效路径限定令牌** `/api/media/?mt=`（media_tokens 表，30 分钟，目录限定）；
+  会话 token 一律不进 URL 查询串
+- **回收站目录 `uploads/.trash`**（不在 uploads/tmp 内——24h 临时分片清扫只清白名单条目，
+  绝不触碰回收站）
+- **AI 端点双重限速**（5 分钟窗口 + 每日配额）；分享匿名端点限速 + 每分享失败锁定
+- **Cookie 默认强制 Secure**（纯 HTTP 局域网需 PINAS_COOKIE_SECURE=false）
 
 ### 错误处理
 - `AppError` 枚举（11 种 HTTP 状态） + `AppResult<T>` = `Result<T, AppError>`
@@ -223,7 +231,8 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v11 预缓存全部本地资源（含 marked/purify；版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验），离线可用
+- PWA：SW v12 预缓存全部本地资源（含 marked/purify/manifest；`/api/` 一律不缓存防敏感 JSON 滞留；
+  版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验），离线可用
 - 版本对齐：Cargo.toml → `/health` version；`?v=` 与 sw.js 预缓存 URL 严格一致（check-versions.sh 强制）
 
 ### UI 规范（v1.5 起）
@@ -238,8 +247,10 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 33 个集成测试 + 11 个单元测试（含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
-  子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义、AI 流式 503）
+- 51 个集成测试 + 17 个单元测试（含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
+  子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义、AI 流式 503；
+  v1.7 新增同名重传 409、重命名覆盖保护、中文多字节子树、回收站清扫豁免、FK 全连接、媒体令牌作用域、
+  分享爆破锁定、AI 配额、SSE 截断、带时间日程日历、HSTS 门控、大小写搜索等）
 - 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署

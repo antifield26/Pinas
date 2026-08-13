@@ -33,6 +33,38 @@ static PROMPT_CACHE: LazyLock<
     Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// 每用户每日 AI 请求配额（键 username:YYYY-MM-DD）。
+/// AI 调用消耗主人全局 API 额度，未限速的 guest 账号可无限刷取，必须双重限速。
+static AGENT_DAILY: LazyLock<Mutex<std::collections::HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// AI 端点限速：每 5 分钟窗口 window_attempts 次 + 每日总配额（PINAS_AGENT_DAILY_QUOTA）
+async fn agent_check_rate(
+    config: &Config,
+    username: &str,
+    window_attempts: u32,
+) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    if !crate::handlers::rate_limit::check_rate_limit(
+        &format!("agent:{}", username),
+        window_attempts,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    {
+        return Err(AppError::too_many_requests("AI 请求过于频繁，请稍后再试"));
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let key = format!("{}:{}", username, today);
+    let mut map = AGENT_DAILY.lock().await;
+    let count = map.entry(key).or_insert(0);
+    if *count >= config.agent_daily_quota {
+        return Err(AppError::too_many_requests("今日 AI 请求次数已达上限"));
+    }
+    *count += 1;
+    Ok(())
+}
+
 // ====== 模型列表 ======
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
     ("deepseek-v4-pro", "DeepSeek V4 Pro (推荐)"),
@@ -348,12 +380,28 @@ struct ResolvedAgentConfig {
     max_tokens: u32,
 }
 
+fn validate_model(model: Option<&str>) -> Result<(), crate::error::AppError> {
+    use crate::error::AppError;
+    if let Some(m) = model
+        && !m.is_empty()
+        && !AVAILABLE_MODELS.iter().any(|(id, _)| *id == m)
+    {
+        return Err(AppError::bad_request(format!("不支持的模型: {}", m)));
+    }
+    Ok(())
+}
+
 async fn resolve_agent_config(
     pool: &SqlitePool,
     config: &Config,
     session: &UserSession,
     requested_model: Option<String>,
 ) -> Result<ResolvedAgentConfig, (StatusCode, String)> {
+    // 模型名白名单：客户端可任意传 model，需拦在转发上游之前
+    if let Err(e) = validate_model(requested_model.as_deref()) {
+        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+    }
+
     // 尝试读取用户设置
     let user_settings: UserSettingsRow = sqlx::query_as(
         "SELECT deepseek_api_key, deepseek_api_base, deepseek_model, temperature, max_tokens FROM user_settings WHERE username = ?"
@@ -418,6 +466,25 @@ pub async fn get_models() -> impl IntoResponse {
 
 // ====== 对话消息持久化 ======
 
+/// 校验对话归属：conversation_id 由客户端提供，写路径必须验证所有权，
+/// 否则任何登录用户（含 guest）都能向他人对话注入消息（污染其 LLM 上下文）
+async fn assert_conv_owned(
+    pool: &SqlitePool,
+    username: &str,
+    conv_id: i64,
+) -> Result<(), sqlx::Error> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ? AND username = ?")
+            .bind(conv_id)
+            .bind(username)
+            .fetch_one(pool)
+            .await?;
+    if n == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
 /// 保存一轮对话消息；无 conversation_id 时自动创建对话（标题取首条用户消息截断）
 async fn save_chat_round(
     pool: &SqlitePool,
@@ -427,7 +494,11 @@ async fn save_chat_round(
     assistant_reply: &str,
 ) -> Result<i64, sqlx::Error> {
     let conv_id = match conversation_id {
-        Some(id) => id,
+        Some(id) => {
+            // 归属校验：拒绝写入他人对话
+            assert_conv_owned(pool, username, id).await?;
+            id
+        }
         None => {
             let title: String = user_msg.chars().take(20).collect();
             let title = if title.len() < user_msg.len() {
@@ -519,8 +590,12 @@ pub async fn get_conversation_messages(
     if owns == 0 {
         return (StatusCode::NOT_FOUND, "对话不存在").into_response();
     }
+    // 上限保护：对话消息无界增长会拖垮单次响应与后续每轮 LLM 上下文（保留最近 500 条）
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT role, content FROM conversation_messages WHERE conversation_id = ? ORDER BY id ASC",
+        "SELECT role, content FROM (
+            SELECT id, role, content FROM conversation_messages
+            WHERE conversation_id = ? ORDER BY id DESC LIMIT 500
+        ) ORDER BY id ASC",
     )
     .bind(id)
     .fetch_all(&pool)
@@ -684,7 +759,11 @@ fn build_tool_defs() -> Vec<ToolDef> {
 }
 
 /// 执行单个工具调用；Err 消息作为 role="tool" 消息回传模型（模型可据此修正）
-async fn execute_tool(name: &str, args_json: &str, ctx: &ToolContext<'_>) -> Result<String, String> {
+async fn execute_tool(
+    name: &str,
+    args_json: &str,
+    ctx: &ToolContext<'_>,
+) -> Result<String, String> {
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("参数解析失败: {e}"))?;
     match name {
@@ -782,7 +861,11 @@ async fn execute_tool(name: &str, args_json: &str, ctx: &ToolContext<'_>) -> Res
             for (title, due, priority, status, category) in rows {
                 out.push_str(&format!(
                     "- [{}] {} (优先级: {}, 状态: {}, 截止: {})\n",
-                    if category == "schedule" { "日程" } else { "待办" },
+                    if category == "schedule" {
+                        "日程"
+                    } else {
+                        "待办"
+                    },
                     title,
                     priority,
                     status,
@@ -839,10 +922,14 @@ fn parse_text_invokes(content: &str) -> Vec<(String, String)> {
     let mut rest = content;
     while let Some(start) = rest.find("<invoke") {
         rest = &rest[start..];
-        let Some(name_marker) = rest.find("name=") else { break };
+        let Some(name_marker) = rest.find("name=") else {
+            break;
+        };
         let after = &rest[name_marker + 5..];
         let Some(open) = after.find('"') else { break };
-        let Some(name_end) = after[open + 1..].find('"') else { break };
+        let Some(name_end) = after[open + 1..].find('"') else {
+            break;
+        };
         let name_end = open + 1 + name_end;
         let name = &after[open + 1..name_end];
         let tail = &after[name_end + 1..];
@@ -850,16 +937,22 @@ fn parse_text_invokes(content: &str) -> Vec<(String, String)> {
         // 带 args 属性：<invoke name="x" args='{"k":"v"}'/>
         if let Some(a) = tail.trim_start().strip_prefix("args=") {
             let quote = a.chars().next().unwrap_or('"');
-            let a = &a[quote.len_utf8()..];
+            // 模型输出可能在此处被 max_tokens 截断（a 为空串），切片越界会 panic；
+            // release 下 panic=abort 等于整站宕机，必须用 get() 安全处理
+            let a = a.get(quote.len_utf8()..).unwrap_or("");
             let Some(end) = a.find(quote) else { break };
             out.push((name.to_string(), a[..end].to_string()));
             rest = &a[end..];
             continue;
         }
         // 块体形式：<invoke name="x">\n{…}\n</invoke>
-        let Some(body_start) = tail.find('>') else { break };
+        let Some(body_start) = tail.find('>') else {
+            break;
+        };
         let body = &tail[body_start + 1..];
-        let Some(body_end) = body.find("</invoke>") else { break };
+        let Some(body_end) = body.find("</invoke>") else {
+            break;
+        };
         out.push((name.to_string(), body[..body_end].trim().to_string()));
         rest = &body[body_end..];
     }
@@ -890,12 +983,7 @@ async fn run_tool_loop(
         let Some(choice) = resp.choices.first() else {
             return Ok(());
         };
-        let Some(tool_calls) = choice
-            .message
-            .tool_calls
-            .clone()
-            .filter(|c| !c.is_empty())
-        else {
+        let Some(tool_calls) = choice.message.tool_calls.clone().filter(|c| !c.is_empty()) else {
             // 无结构化 tool_calls：检查 DeepSeek 文本调用格式（<invoke name="...">…</invoke>，
             // V3.2+/V4 系列模型默认输出该格式而非 OpenAI 结构化调用）
             if let Some(content) = &choice.message.content {
@@ -908,8 +996,9 @@ async fn run_tool_loop(
                     };
                     let mut results = String::new();
                     for (tname, targs) in invokes {
-                        let result =
-                            execute_tool(&tname, &targs, &ctx).await.unwrap_or_else(|e| e);
+                        let result = execute_tool(&tname, &targs, &ctx)
+                            .await
+                            .unwrap_or_else(|e| e);
                         results.push_str(&format!(
                             "<invoke-result name=\"{tname}\">\n{result}\n</invoke-result>\n"
                         ));
@@ -953,11 +1042,11 @@ async fn run_tool_loop(
             is_admin,
         };
         for call in &tool_calls {
-            let result = match execute_tool(&call.function.name, &call.function.arguments, &ctx).await
-            {
-                Ok(s) => s,
-                Err(e) => e,
-            };
+            let result =
+                match execute_tool(&call.function.name, &call.function.arguments, &ctx).await {
+                    Ok(s) => s,
+                    Err(e) => e,
+                };
             messages.push(DeepSeekMessage {
                 role: "tool".to_string(),
                 tool_call_id: Some(call.id.clone()),
@@ -1092,7 +1181,11 @@ pub async fn agent_chat_stream(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<ChatRequest>,
 ) -> Response {
-    let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await {
+    if let Err(e) = agent_check_rate(&config, &session.username, 10).await {
+        return e.into_response();
+    }
+    let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await
+    {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
@@ -1104,7 +1197,8 @@ pub async fn agent_chat_stream(
         c.push_str(TOOL_INSTRUCTIONS);
     }
     let is_admin = session.role == crate::constants::ROLE_ADMIN;
-    if let Err(e) = run_tool_loop(&pool, &session.username, is_admin, &resolved, &mut messages).await
+    if let Err(e) =
+        run_tool_loop(&pool, &session.username, is_admin, &resolved, &mut messages).await
     {
         return e.into_response();
     }
@@ -1123,84 +1217,88 @@ pub async fn agent_chat_stream(
     };
 
     use axum::response::sse::{Event, KeepAlive, Sse};
-    use futures_util::stream;
     use futures_util::StreamExt;
+    use futures_util::stream;
 
-    // 上游 SSE 字节流 → 按空行拆帧解析 delta → 逐段转发；全文累积用于持久化
-    let full = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let full_arc = full.clone();
-    // 拆帧缓冲区：跨 chunk 累积,filter_map 闭包经 Arc 共享可变状态
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_arc = buf.clone();
-    let delta_stream = upstream.bytes_stream().filter_map(move |chunk| {
-        let full = full_arc.clone();
-        let buf = buf_arc.clone();
-        async move {
-            let mut events: Vec<Event> = Vec::new();
-            let bytes = match chunk {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!("[Agent] 流式上游读取失败: {}", e);
-                    events.push(Event::default().data("{\"error\":\"upstream\"}"));
-                    return Some(stream::iter(events));
-                }
-            };
-            let mut b = buf.lock().unwrap();
-            b.extend_from_slice(&bytes);
-            while let Some(pos) = b.windows(2).position(|w| w == b"\n\n") {
-                let raw: Vec<u8> = b.drain(..pos + 2).collect();
-                let text = String::from_utf8_lossy(&raw);
-                let data: String = text
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("data:").map(str::trim))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if data == "[DONE]" {
-                    continue; // 上游结束帧：不再产生事件
-                }
-                if let Ok(v) = serde_json::from_str::<DeepSeekStreamChunk>(&data) {
-                    for choice in &v.choices {
-                        if let Some(d) = &choice.delta.content
-                            && !d.is_empty()
-                        {
-                            full.lock().unwrap().push_str(d);
-                            events.push(Event::default().data(d.as_str()));
-                        }
-                    }
-                }
-            }
-            drop(b);
-            if events.is_empty() {
-                None
-            } else {
-                Some(stream::iter(events))
-            }
-        }
-    })
-    .flatten();
-
-    // 终结事件：持久化整轮对话 + 发 [DONE]
+    // 上游 SSE 字节流 → 按空行拆帧解析 delta → mpsc 转发；
+    // detached task 独立于客户端连接：客户端断连后仍跑完上游并持久化整轮对话（不再依赖 tail 元素）
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
     let pool2 = pool.clone();
     let uname = session.username.clone();
     let umsg = last_user_msg;
     let conv_id = payload.conversation_id;
     let model2 = resolved.model.clone();
-    let tail = stream::once(async move {
+
+    tokio::spawn(async move {
+        let mut full = String::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut upstream = upstream.bytes_stream();
+        loop {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    buf.extend_from_slice(&bytes);
+                    while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                        let raw: Vec<u8> = buf.drain(..pos + 2).collect();
+                        let text = String::from_utf8_lossy(&raw);
+                        let data: String = text
+                            .lines()
+                            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if data == "[DONE]" {
+                            continue; // 上游结束帧：不再产生事件
+                        }
+                        if let Ok(v) = serde_json::from_str::<DeepSeekStreamChunk>(&data) {
+                            for choice in &v.choices {
+                                if let Some(d) = &choice.delta.content
+                                    && !d.is_empty()
+                                {
+                                    full.push_str(d);
+                                    // json_data 编码：多行 delta（含 \n 的 Markdown）不再破坏 SSE 帧；
+                                    // 客户端断连时 send 失败忽略，持久化仍会执行
+                                    let ev = Event::default()
+                                        .json_data(d)
+                                        .unwrap_or_else(|_| Event::default());
+                                    let _ = tx.send(ev).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::error!("[Agent] 流式上游读取失败: {}", e);
+                    let _ = tx
+                        .send(Event::default().data("{\"error\":\"upstream\"}"))
+                        .await;
+                    break;
+                }
+                None => break,
+            }
+        }
+        // 上游结束（[DONE]/EOF/错误）：无论客户端是否在场都持久化
         if let Some(um) = umsg {
-            let reply = full.lock().unwrap().clone();
             tracing::info!(
                 "[AI Agent] 流式完成 用户={} 模型={} 回复长度={}",
                 uname,
                 model2,
-                reply.len()
+                full.len()
             );
-            let _ = save_chat_round(&pool2, &uname, conv_id, &um, &reply).await;
+            let _ = save_chat_round(&pool2, &uname, conv_id, &um, &full).await;
         }
-        Event::default().data("[DONE]")
+        // tx 在此 drop → handler 端 ReceiverStream 结束 → 追加 [DONE]
     });
 
-    Sse::new(delta_stream.chain(tail).map(Ok::<_, std::convert::Infallible>))
-        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("keep-alive"))
+    let mut rx = rx;
+    let event_stream =
+        stream::poll_fn(move |cx| rx.poll_recv(cx)).map(Ok::<_, std::convert::Infallible>);
+    let tail = stream::once(async { Ok(Event::default().data("[DONE]")) });
+
+    Sse::new(event_stream.chain(tail))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
         .into_response()
 }
 
@@ -1211,6 +1309,9 @@ pub async fn agent_chat(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<ChatRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = agent_check_rate(&config, &session.username, 30).await {
+        return e.into_response();
+    }
     let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await
     {
         Ok(r) => r,
@@ -1301,6 +1402,9 @@ pub async fn generate_briefing(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<BriefingRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = agent_check_rate(&config, &session.username, 5).await {
+        return e.into_response();
+    }
     let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await
     {
         Ok(r) => r,
@@ -1458,6 +1562,9 @@ pub async fn agent_chat_fragment(
     Extension(session): Extension<UserSession>,
     axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if let Err(e) = agent_check_rate(&config, &session.username, 30).await {
+        return e.into_response();
+    }
     let message = form.get("message").cloned().unwrap_or_default();
     if message.trim().is_empty() {
         return AppTemplate(ChatMessageFragment {
@@ -1719,7 +1826,7 @@ pub async fn agent_settings_form(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_text_invokes;
+    use super::{parse_text_invokes, save_chat_round};
 
     #[test]
     fn test_parse_text_invokes_block_form() {
@@ -1745,5 +1852,77 @@ mod tests {
         assert_eq!(parse_text_invokes(multi).len(), 2);
         assert!(parse_text_invokes("没有工具调用的普通回复").is_empty());
         assert!(parse_text_invokes("<invoke>缺名字</invoke>").is_empty());
+    }
+
+    /// 回归测试：模型输出被 max_tokens 截断在 args= 处时不得 panic（panic=abort 下即整站宕机）
+    #[test]
+    fn test_parse_text_invokes_truncated_args_no_panic() {
+        // 各种截断形态都必须安全返回（不 panic）
+        assert!(parse_text_invokes("<invoke name=\"x\" args=").is_empty());
+        assert!(parse_text_invokes("<invoke name=\"x\" args='").is_empty());
+        assert!(parse_text_invokes("<invoke name=\"x\" args='{\"a\":").is_empty());
+        // 截断的调用后仍能解析出后续完整调用（核心断言：不 panic + 有效调用不丢失）
+        let mixed = "截断 <invoke name=\"x\" args= 然后 <invoke name=\"y\" args='{\"k\":1}'/>";
+        let invokes = parse_text_invokes(mixed);
+        assert!(
+            invokes
+                .iter()
+                .any(|(n, a)| n == "y" && a.contains("\"k\":1")),
+            "截断后应仍能解析出完整调用: {:?}",
+            invokes
+        );
+    }
+
+    /// 回归测试：save_chat_round 必须拒绝写入他人对话（越权注入他人 LLM 上下文）
+    #[tokio::test]
+    async fn test_save_chat_round_rejects_foreign_conversation() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, title TEXT NOT NULL DEFAULT '新对话', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE conversation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // alice 创建对话
+        let alice_conv: i64 = sqlx::query_scalar(
+            "INSERT INTO conversations (username, title) VALUES ('alice', '私人对话') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // 无 conversation_id 时自动创建（正常路径）
+        let new_id = save_chat_round(&pool, "bob", None, "你好", "回复")
+            .await
+            .unwrap();
+        assert!(new_id > 0);
+
+        // bob 向 alice 的对话写入 → 必须失败
+        let err = save_chat_round(&pool, "bob", Some(alice_conv), "注入", "内容")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sqlx::Error::RowNotFound));
+
+        // alice 自己写入 → 成功
+        save_chat_round(&pool, "alice", Some(alice_conv), "正常", "回复")
+            .await
+            .unwrap();
+
+        // 确认 bob 的注入没有落库
+        let injected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_messages WHERE conversation_id = ? AND content = '注入'",
+        )
+        .bind(alice_conv)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(injected, 0, "越权消息不得写入他人对话");
     }
 }

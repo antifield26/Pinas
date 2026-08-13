@@ -8,12 +8,11 @@ WORKDIR /app
 
 # 预缓存依赖（利用 Docker layer caching）
 COPY Cargo.toml Cargo.lock ./
-COPY pinas-core/Cargo.toml ./pinas-core/
-COPY pinas-core/src/ ./pinas-core/src/
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release 2>/dev/null || true
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release
 
-# 完整编译
+# 完整编译（templates/ 必须拷贝：Askama 在编译期解析模板文件）
 COPY src/ ./src/
+COPY templates/ ./templates/
 COPY assets/ ./assets/
 COPY static/ ./static/
 RUN cargo build --release

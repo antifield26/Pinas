@@ -28,6 +28,7 @@ pub fn spawn_all(
         cancel.child_token(),
     );
     spawn_session_cleanup(pool.clone(), cancel.child_token());
+    spawn_conversation_cleanup(pool.clone(), cancel.child_token());
     spawn_chunk_rows_cleanup(pool.clone(), cancel.child_token());
     spawn_audit_cleanup(pool.clone(), cancel.child_token());
     spawn_auto_backup(pool.clone(), cancel.child_token());
@@ -46,6 +47,38 @@ fn spawn_session_cleanup(pool: SqlitePool, cancel: CancellationToken) {
                         .execute(&pool).await
                     {
                         tracing::error!("清理过期会话失败: {}", e);
+                    }
+                    // 过期媒体令牌一并清理（短时效路径限定令牌，防表无限增长）
+                    let _ = sqlx::query("DELETE FROM media_tokens WHERE expires_at <= datetime('now')")
+                        .execute(&pool).await;
+                }
+            }
+        }
+    });
+}
+
+/// 每对话保留最近 500 条消息，超出的历史删除（防无界增长拖垮 LLM 上下文与响应体积）
+const CONV_MESSAGE_CAP: i64 = 500;
+
+fn spawn_conversation_cleanup(pool: SqlitePool, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => { tracing::info!("对话历史清理任务已停止"); break; }
+                _ = interval.tick() => {
+                    let r = sqlx::query(
+                        "DELETE FROM conversation_messages WHERE id NOT IN (
+                            SELECT id FROM conversation_messages AS m
+                            WHERE m.conversation_id = conversation_messages.conversation_id
+                            ORDER BY id DESC LIMIT ?
+                        )",
+                    )
+                    .bind(CONV_MESSAGE_CAP)
+                    .execute(&pool)
+                    .await;
+                    if let Err(e) = r {
+                        tracing::error!("清理超限对话历史失败: {}", e);
                     }
                 }
             }
@@ -112,6 +145,8 @@ fn spawn_wal_checkpoint(pool: SqlitePool, cancel: CancellationToken) {
 
 /// 清理过期临时分片
 fn spawn_temp_chunk_cleanup(_pool: SqlitePool, hours: u64, cancel: CancellationToken) {
+    // interval(0) 会 panic（period must be non-zero），release panic=abort 即整站启动崩溃
+    let hours = hours.max(1);
     tokio::spawn(async move {
         if let Err(e) = clean_expired_temp_chunks(hours).await {
             tracing::error!("初始清理临时分片失败: {}", e);
@@ -170,6 +205,8 @@ fn spawn_trash_cleanup(
     interval_hours: u64,
     cancel: CancellationToken,
 ) {
+    // interval(0) 会 panic（同 spawn_temp_chunk_cleanup 说明）
+    let interval_hours = interval_hours.max(1);
     tokio::spawn(async move {
         if let Err(e) = handlers::clean_expired_trash(&pool, days).await {
             tracing::error!("初始清理过期回收站失败: {}", e);
@@ -262,9 +299,35 @@ pub async fn auto_backup_once(
 
 // --- 辅助函数 ---
 
-/// 清理超过指定小时数的临时分片
+/// 判断 uploads/tmp 下的条目是否为可清扫的临时对象：
+/// 分片目录（标识符 [A-Za-z0-9_-]+，见 upload.rs validate_identifier）或
+/// WebDAV 临时文件（dav_{uuid} / dav_disp_{uuid}）。
+/// 其余条目（如历史遗留的 trash 目录）一律跳过，防止误删非临时数据。
+fn is_sweepable_temp_entry(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // 纵深防御：即便回收站目录仍在 tmp 下（旧版遗留），也绝不清扫
+    if name == "trash" {
+        return false;
+    }
+    if name.starts_with("dav_") || name.starts_with("dav_disp_") {
+        return true;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 清理超过指定小时数的临时分片（白名单：仅限分片目录与 dav 临时文件）
 async fn clean_expired_temp_chunks(hours: u64) -> Result<(), std::io::Error> {
-    let tmp_dir = std::path::Path::new(TMP_DIR);
+    clean_expired_temp_chunks_in(std::path::Path::new(TMP_DIR), hours).await
+}
+
+/// 同 clean_expired_temp_chunks，显式指定 tmp 目录（供测试注入临时路径，避免依赖进程 CWD）
+async fn clean_expired_temp_chunks_in(
+    tmp_dir: &std::path::Path,
+    hours: u64,
+) -> Result<(), std::io::Error> {
     if !tmp_dir.exists() {
         return Ok(());
     }
@@ -277,6 +340,11 @@ async fn clean_expired_temp_chunks(hours: u64) -> Result<(), std::io::Error> {
             && modified <= cutoff
         {
             let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !is_sweepable_temp_entry(&name) {
+                continue;
+            }
             if path.is_dir() {
                 let _ = tokio::fs::remove_dir_all(&path).await;
                 info!("清理过期临时分片目录: {:?}", path);
@@ -317,6 +385,43 @@ async fn clean_old_logs(retention_days: u64) -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// 回填旧 mtime（1 天前），使条目落入清扫窗口
+    fn age_to_old(path: &std::path::Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        filetime::set_file_mtime(path, old.into()).unwrap();
+    }
+
+    /// 回归测试：回收站目录（无论位置）与任何非分片条目都不得被临时清扫销毁
+    #[tokio::test]
+    async fn test_temp_sweep_spares_trash_and_unexpected_entries() {
+        let dir = tempdir().unwrap();
+        let tmp = dir.path();
+        // 回收站（模拟旧版位于 tmp 内）
+        let trash = tmp.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::write(trash.join("victim.txt"), b"precious").unwrap();
+        age_to_old(&trash);
+        // 过期分片目录（应被清除）
+        let chunk = tmp.join("abc-123_45");
+        std::fs::create_dir_all(&chunk).unwrap();
+        age_to_old(&chunk);
+        // 过期 dav 临时目录（应被清除）
+        let dav = tmp.join("dav_0000-1111-2222");
+        std::fs::create_dir_all(&dav).unwrap();
+        age_to_old(&dav);
+        // 非分片模式的意外条目（带点号，不匹配白名单，应保留）
+        let odd = tmp.join("keep.me");
+        std::fs::write(&odd, b"not a chunk").unwrap();
+        age_to_old(&odd);
+
+        clean_expired_temp_chunks_in(tmp, 1).await.unwrap();
+
+        assert!(trash.join("victim.txt").exists(), "回收站内容不得被清扫");
+        assert!(!chunk.exists(), "过期分片目录应被清除");
+        assert!(!dav.exists(), "过期 dav 临时目录应被清除");
+        assert!(odd.exists(), "非分片条目应保留");
+    }
 
     #[tokio::test]
     async fn test_auto_backup_creates_valid_db() {

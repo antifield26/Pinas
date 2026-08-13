@@ -61,9 +61,7 @@ pub async fn create_link(
     if payload.title.trim().is_empty() || payload.url.trim().is_empty() {
         return Err(AppError::bad_request("标题和URL不能为空"));
     }
-    if !payload.url.starts_with("http://") && !payload.url.starts_with("https://") {
-        return Err(AppError::bad_request("URL必须以http://或https://开头"));
-    }
+    crate::handlers::utils::validate_url(&payload.url)?;
     sqlx::query("INSERT INTO links (username, title, url, icon) VALUES (?, ?, ?, ?)")
         .bind(&session.username)
         .bind(&payload.title)
@@ -92,11 +90,8 @@ pub async fn update_link(
     Path(id): Path<i64>,
     Json(payload): Json<UpdateLinkRequest>,
 ) -> AppResult<(StatusCode, &'static str)> {
-    if let Some(ref url) = payload.url
-        && !url.starts_with("http://")
-        && !url.starts_with("https://")
-    {
-        return Err(AppError::bad_request("URL必须以http://或https://开头"));
+    if let Some(ref url) = payload.url {
+        crate::handlers::utils::validate_url(url)?;
     }
     // 不允许将标题更新为空字符串
     if let Some(ref t) = payload.title
@@ -242,6 +237,10 @@ pub async fn links_create_fragment(
     if title.trim().is_empty() || url.trim().is_empty() {
         return AppTemplate(empty_link_form()).into_response();
     }
+    // 片段路径必须与 JSON API 同样校验 scheme（防 javascript: 存储型 XSS）
+    if crate::handlers::utils::validate_url(&url).is_err() {
+        return AppTemplate(empty_link_form()).into_response();
+    }
     let icon = form.get("icon").cloned().filter(|s| !s.is_empty());
 
     let _ = sqlx::query("INSERT INTO links (username, title, url, icon) VALUES (?, ?, ?, ?)")
@@ -277,6 +276,16 @@ pub async fn links_update_fragment(
     let title = form.get("title").cloned();
     let url = form.get("url").cloned();
     let icon = form.get("icon").cloned().filter(|s| !s.is_empty());
+
+    // 片段路径必须与 JSON API 同样校验 scheme（防 javascript: 存储型 XSS）
+    if url
+        .as_deref()
+        .is_some_and(|u| crate::handlers::utils::validate_url(u).is_err())
+    {
+        return AppTemplate(LinkListFragment {
+            links: get_user_links(&pool, &session.username).await,
+        });
+    }
 
     let _ = sqlx::query(
         "UPDATE links SET title = COALESCE(?, title), url = COALESCE(?, url), icon = COALESCE(?, icon) WHERE id = ? AND username = ?"

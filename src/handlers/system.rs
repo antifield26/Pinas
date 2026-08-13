@@ -151,16 +151,9 @@ struct SystemMonitorLive {
 pub async fn system_monitor_fragment(
     Extension(session): Extension<crate::core::UserSession>,
 ) -> impl IntoResponse {
+    // 非管理员 403：与 JSON /api/system/status 一致（此前 200 空数据掩盖未授权状态）
     if session.role != crate::constants::ROLE_ADMIN {
-        return AppTemplate(SystemMonitorLive {
-            cpu_bar_pct: 0,
-            mem_used_mb: 0,
-            mem_total_mb: 0,
-            mem_bar_pct: 0,
-            temp_display: "N/A".into(),
-            temp_color_class: String::new(),
-        })
-        .into_response();
+        return axum::http::StatusCode::FORBIDDEN.into_response();
     }
 
     let cpu_temp = read_cpu_temp().await;

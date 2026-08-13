@@ -1,5 +1,9 @@
+{# 服务端值一律走 data-* 属性（x-init 读取），不内插进 JS 表达式字符串——HTML 实体解码
+   绕过转义是经典注入通道，此约定与"模板内联 JS 零用户数据"一致 #}
 <div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-md shadow-2xl mx-auto" onclick="event.stopPropagation()"
-     x-data="{ category: '{{ category }}', isAllDay: {{ is_all_day }}, showDate: {{ show_date }} }"
+     x-data="{}"
+     data-category="{{ category }}" data-is-all-day="{{ is_all_day }}" data-show-date="{{ show_date }}"
+     x-init="category = $root.dataset.category; isAllDay = $root.dataset.isAllDay === 'true'; showDate = $root.dataset.showDate === 'true';"
      id="todo-form-card">
   <div class="flex justify-between items-center p-5 border-b border-gray-100 dark:border-gray-800">
     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100">

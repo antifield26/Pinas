@@ -14,6 +14,43 @@ use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, log_audit, safe_join_sandbox, verify_password};
 
+// --- 匿名分享端点的防护（分享页公开无认证，必须独立限速） ---
+use crate::handlers::{MaybePeer, extract_ip, rate_limit};
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::Instant;
+use tokio::sync::Mutex;
+
+/// 每分享密码失败尝试锁定：同一分享 5 次错误密码 → 锁定 15 分钟（防无限速爆破）
+static SHARE_FAILED: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const SHARE_MAX_FAILURES: u32 = 5;
+const SHARE_LOCKOUT_SECS: u64 = 15 * 60;
+
+async fn share_check_locked(code: &str) -> bool {
+    let map = SHARE_FAILED.lock().await;
+    match map.get(code) {
+        Some((n, t)) => *n >= SHARE_MAX_FAILURES && t.elapsed().as_secs() < SHARE_LOCKOUT_SECS,
+        None => false,
+    }
+}
+
+async fn share_record_failure(code: &str) {
+    let mut map = SHARE_FAILED.lock().await;
+    let entry = map.entry(code.to_string()).or_insert((0, Instant::now()));
+    if entry.1.elapsed().as_secs() >= SHARE_LOCKOUT_SECS {
+        // 锁定期已过：重新计数
+        *entry = (1, Instant::now());
+    } else {
+        entry.0 += 1;
+    }
+}
+
+async fn share_clear_failures(code: &str) {
+    SHARE_FAILED.lock().await.remove(code);
+}
+
 // --- DTOs ---
 #[derive(Deserialize)]
 pub struct CreateShareRequest {
@@ -137,8 +174,16 @@ pub async fn access_share(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Path(code): Path<String>,
     Query(params): Query<AccessShareRequest>,
+    MaybePeer(peer_ip): MaybePeer,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     use axum::http::header;
+
+    // 匿名端点限速：每 IP 每分钟 10 次（含 Argon2 校验，防 CPU DoS 与无限速爆破）
+    let rate_key = extract_ip(peer_ip, &headers).unwrap_or_else(|| format!("share:{}", code));
+    if !rate_limit::check_rate_limit(&rate_key, 10, std::time::Duration::from_secs(60)).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试").into_response();
+    }
 
     let share =
         sqlx::query("SELECT username, file_path, password, expires_at FROM shares WHERE code = ?")
@@ -157,6 +202,14 @@ pub async fn access_share(
 
     // 密码校验（有密码的分享必须验证）
     if let Some(pwd_hash) = db_password {
+        // 该分享已被连续错误尝试锁定
+        if share_check_locked(&code).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "尝试次数过多，分享已临时锁定",
+            )
+                .into_response();
+        }
         let input_pwd = params.password.unwrap_or_default().to_string();
         let hash_clone = pwd_hash.clone();
         let is_valid =
@@ -164,8 +217,10 @@ pub async fn access_share(
                 .await
                 .unwrap_or(false);
         if !is_valid {
+            share_record_failure(&code).await;
             return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
         }
+        share_clear_failures(&code).await;
     }
 
     // 过期校验
@@ -241,8 +296,15 @@ pub async fn share_page(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Path(share_id): Path<String>,
     Query(params): Query<AccessShareRequest>,
+    MaybePeer(peer_ip): MaybePeer,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let code = &share_id;
+    // 匿名端点限速：每 IP 每分钟 30 次（密码表单提交路径含 Argon2，防 CPU DoS）
+    let rate_key = extract_ip(peer_ip, &headers).unwrap_or_else(|| format!("share:{}", code));
+    if !rate_limit::check_rate_limit(&rate_key, 30, std::time::Duration::from_secs(60)).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试").into_response();
+    }
     // Look up share info（username 用于解析文件真实路径）
     let share =
         sqlx::query("SELECT file_path, password, expires_at, username FROM shares WHERE code = ?")
@@ -281,11 +343,25 @@ pub async fn share_page(
     // If password protected and wrong/missing password, show password form
     // Use spawn_blocking for Argon2 verification to avoid blocking async runtime
     let pwd_ok = if password_required {
+        // 该分享已被连续错误尝试锁定
+        if share_check_locked(code).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "尝试次数过多，分享已临时锁定",
+            )
+                .into_response();
+        }
         let hash = stored_pwd.clone();
         let input = submitted_password.clone();
-        tokio::task::spawn_blocking(move || crate::core::verify_password(&hash, &input))
+        let ok = tokio::task::spawn_blocking(move || crate::core::verify_password(&hash, &input))
             .await
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if ok {
+            share_clear_failures(code).await;
+        } else {
+            share_record_failure(code).await;
+        }
+        ok
     } else {
         true
     };
@@ -350,8 +426,16 @@ pub async fn share_subfile(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Path((share_id, file_path)): Path<(String, String)>,
     Query(params): Query<AccessShareRequest>,
+    MaybePeer(peer_ip): MaybePeer,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     use axum::http::header;
+
+    // 匿名端点限速：每 IP 每分钟 30 次（含 Argon2 校验，防 CPU DoS）
+    let rate_key = extract_ip(peer_ip, &headers).unwrap_or_else(|| format!("share:{}", share_id));
+    if !rate_limit::check_rate_limit(&rate_key, 30, std::time::Duration::from_secs(60)).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试").into_response();
+    }
 
     // 1. 查询分享信息
     let share_row = sqlx::query(
@@ -373,6 +457,14 @@ pub async fn share_subfile(
 
     // 2. 校验密码（如果有）— spawn_blocking 避免阻塞
     if let Some(pwd_hash) = db_password {
+        // 该分享已被连续错误尝试锁定
+        if share_check_locked(&share_id).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "尝试次数过多，分享已临时锁定",
+            )
+                .into_response();
+        }
         let input_pwd = params.password.unwrap_or_default().to_string();
         let hash_clone = pwd_hash.clone();
         let is_valid =
@@ -380,8 +472,10 @@ pub async fn share_subfile(
                 .await
                 .unwrap_or(false);
         if !is_valid {
+            share_record_failure(&share_id).await;
             return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
         }
+        share_clear_failures(&share_id).await;
     }
 
     // 3. 校验有效期

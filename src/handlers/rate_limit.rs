@@ -1,10 +1,8 @@
+use crate::constants::MAX_RATE_LIMIT_ENTRIES;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-
-/// 限速器最大容量 — 防止伪造 IP 攻击耗尽内存
-const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 
 /// 异步内存速率限制器：每个 IP 在 window 内最多允许 max_attempts 次请求
 /// 使用 tokio::sync::Mutex 避免阻塞异步运行时的工作线程
@@ -19,18 +17,13 @@ pub async fn check_rate_limit(ip: &str, max_attempts: u32, window: Duration) -> 
     let mut map = RATE_LIMITER.lock().await;
     let now = Instant::now();
 
-    // 容量保护：若 map 超过上限，先强制清理过期条目
-    if map.len() >= MAX_RATE_LIMIT_ENTRIES {
+    // 容量保护：map 满时先清理过期条目；清理后仍满则拒绝新键。
+    // 不驱逐任意条目——驱逐最旧键会被攻击者利用：大量伪造键挤掉受害者的计数，
+    // 重置其窗口实现登录爆破绕过（DoS 放大成 auth 绕过）
+    if map.len() >= MAX_RATE_LIMIT_ENTRIES && !map.contains_key(ip) {
         map.retain(|_, (_, last)| now.duration_since(*last) <= window);
-        // 清理后仍超限，移除最旧条目
         if map.len() >= MAX_RATE_LIMIT_ENTRIES {
-            let oldest_key = map
-                .iter()
-                .min_by_key(|(_, (_, last))| *last)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = oldest_key {
-                map.remove(&key);
-            }
+            return false;
         }
     }
 

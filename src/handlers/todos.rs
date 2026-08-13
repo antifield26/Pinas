@@ -174,16 +174,18 @@ pub async fn get_todos(
         builder.push_bind(format!("%{}%", s));
         builder.push(")");
     }
+    // 带时间的日程 due_date 形如 "2026-08-13T10:00:00"，与纯日期字符串
+    // 直接比较时 'T'(0x54) > '3'，导致带时间日程被日期筛选全部漏掉——统一按前 10 字符比较
     if let Some(ref df) = params.date_from {
-        builder.push(" AND due_date >= ");
+        builder.push(" AND substr(due_date, 1, 10) >= ");
         builder.push_bind(df.clone());
     }
     if let Some(ref dt) = params.date_to {
-        builder.push(" AND due_date <= ");
+        builder.push(" AND substr(due_date, 1, 10) <= ");
         builder.push_bind(dt.clone());
     }
     if let Some(ref d) = params.date {
-        builder.push(" AND due_date = ");
+        builder.push(" AND substr(due_date, 1, 10) = ");
         builder.push_bind(d.clone());
     }
 
@@ -748,7 +750,8 @@ pub async fn todos_calendar_fragment(
     Query(params): Query<TodoCalendarQuery>,
 ) -> impl IntoResponse {
     use chrono::Datelike;
-    let now = chrono::Utc::now();
+    // Local 时区：与 compute_effective_status 一致（UTC 下 UTC+8 用户"今天"会偏 8 小时）
+    let now = chrono::Local::now();
     let year = params.year.unwrap_or(now.year());
     let month = params.month.unwrap_or(now.month() as i32).clamp(1, 12);
 
@@ -787,8 +790,10 @@ pub async fn todos_calendar_fragment(
     // 查询当月所有 todos
     let month_start = format!("{}-{:02}-01", year, month);
     let month_end = format!("{}-{:02}-{:02}", year, month, days_in_month);
+    // 带时间的日程（"2026-08-13T10:00:00"）与 "2026-08-31" 字符串比较会因 'T' > '3' 被漏掉，
+    // 比较与统计键均取日期部分（前 10 字符）
     let sql = format!(
-        "SELECT {} FROM todos WHERE username = ? AND due_date >= ? AND due_date <= ? ORDER BY due_date",
+        "SELECT {} FROM todos WHERE username = ? AND substr(due_date, 1, 10) >= ? AND substr(due_date, 1, 10) <= ? ORDER BY due_date",
         TODO_COLS
     );
     let todos: Vec<TodoItem> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
@@ -799,12 +804,13 @@ pub async fn todos_calendar_fragment(
         .await
         .unwrap_or_default();
 
-    // 按日期统计
+    // 按日期统计（键取日期部分，与日历格子键一致）
     use std::collections::HashMap;
     let mut date_counts: HashMap<String, usize> = HashMap::new();
     for t in &todos {
         if let Some(ref d) = t.due_date {
-            *date_counts.entry(d.clone()).or_insert(0) += 1;
+            let key: String = d.chars().take(10).collect();
+            *date_counts.entry(key).or_insert(0) += 1;
         }
     }
 

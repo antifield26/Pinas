@@ -366,7 +366,9 @@
                     var data = line.slice(5).trim();
                     if (!data) return;
                     if (data === '[DONE]') { finishOnce(); reader.cancel(); return; }
-                    bubble.append(data);
+                    // 服务端 json_data 编码（多行 delta 安全）；旧格式纯文本兜底
+                    try { var parsed = JSON.parse(data); bubble.append(parsed); }
+                    catch (e) { bubble.append(data); }
                   });
                   if (!AppAgent.streaming) return;
                 }

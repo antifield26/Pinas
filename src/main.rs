@@ -41,11 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         warn!("切换工作目录到 '{}' 失败: {}", data_dir, e);
     }
-    tokio::fs::create_dir_all(TRASH_DIR).await?;
-
-    // 4. 数据库连接池 + 初始化
+    // 4. 数据库连接池 + 初始化（含回收站旧目录迁移，必须先于 TRASH_DIR 创建与清扫任务）
     let pool = db::create_pool(&config.database_url).await?;
     db::init(&pool, &config).await?;
+    tokio::fs::create_dir_all(TRASH_DIR).await?;
 
     // 5. 创建全局取消令牌，并启动后台清理任务
     let cancel_token = CancellationToken::new();

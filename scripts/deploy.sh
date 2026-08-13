@@ -42,6 +42,10 @@ fi
 if [ -f "$PROJECT_DIR/assets/manifest.json" ]; then
   cp "$PROJECT_DIR/assets/manifest.json" "$DEPLOY_DIR/assets/manifest.json"
 fi
+# JS 库（htmx/alpine/marked/purify）同样必须拷贝——全新部署缺它们页面无交互
+for f in "$PROJECT_DIR"/assets/*.min.js; do
+  [ -f "$f" ] && cp "$f" "$DEPLOY_DIR/assets/"
+done
 
 # 4. 记录部署版本(可复现溯源)
 echo "$VERSION commit=$COMMIT_SHA date=$COMMIT_DATE deployed=$(date '+%Y-%m-%d %H:%M:%S')" > "$DEPLOY_DIR/VERSION"

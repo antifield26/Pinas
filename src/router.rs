@@ -8,8 +8,8 @@ use axum::{
 };
 use tower_http::{
     compression::{
-        predicate::{DefaultPredicate, Predicate},
         CompressionLayer,
+        predicate::{DefaultPredicate, Predicate},
     },
     set_header::SetResponseHeaderLayer,
 };
@@ -173,10 +173,7 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/todos/form", get(handlers::todos_empty_form))
         .route("/todos/form/{id}", get(handlers::todos_edit_form))
         .route("/api/agent/chat", post(handlers::agent_chat))
-        .route(
-            "/api/agent/chat/stream",
-            post(handlers::agent_chat_stream),
-        )
+        .route("/api/agent/chat/stream", post(handlers::agent_chat_stream))
         .route("/api/agent/briefing", post(handlers::generate_briefing))
         // HTMX Agent fragment routes
         .route("/agent/chat", post(handlers::agent_chat_fragment))

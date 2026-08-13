@@ -9,7 +9,7 @@
   <div class="p-5 overflow-auto flex-1">
     {% if is_image %}
     <div class="flex items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-4">
-      <img src="/api/media/{{ file_path }}" alt="{{ file_name }}"
+      <img src="/api/media/{{ file_path }}?mt={{ media_token }}" alt="{{ file_name }}"
            class="max-w-full max-h-[70vh] object-contain rounded shadow-lg"
            onerror="showMediaError(this)">
     </div>
@@ -18,11 +18,11 @@
       <video id="video-player" data-key="{{ username }}:{{ file_path }}" controls autoplay muted playsinline
              class="max-w-full max-h-[70vh] rounded-lg" preload="metadata"
              onerror="showMediaError(this)">
-        <source src="/api/media/{{ file_path }}" type="{{ mime_type }}">
+        <source src="/api/media/{{ file_path }}?mt={{ media_token }}" type="{{ mime_type }}">
         <p class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
           <span class="text-5xl">🎬</span>
           <span class="text-gray-600 dark:text-gray-400 text-sm">您的浏览器不支持此视频格式</span>
-          <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+          <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"
              class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3">↓ 下载文件</a>
         </p>
       </video>
@@ -54,13 +54,13 @@
       <span class="text-6xl">♪</span>
       <span class="text-lg font-medium text-gray-700 dark:text-gray-300">{{ file_name }}</span>
       <audio controls preload="metadata" class="w-full max-w-md">
-        <source src="/api/media/{{ file_path }}" type="{{ mime_type }}">
+        <source src="/api/media/{{ file_path }}?mt={{ media_token }}" type="{{ mime_type }}">
         您的浏览器不支持此音频格式
       </audio>
     </div>
     {% else if is_pdf %}
     <!-- iframe 而非 embed：CSP object-src 'none' 会拦截 embed，frame-src 'self' 已放行 -->
-    <iframe src="/api/media/{{ file_path }}#toolbar=1&navpanes=1"
+    <iframe src="/api/media/{{ file_path }}?mt={{ media_token }}#toolbar=1&navpanes=1"
             class="w-full rounded-lg" style="min-height: 75vh; border: 0;">
     {% else if is_text %}
     <div class="relative">
@@ -79,7 +79,7 @@
       <p class="text-gray-600 dark:text-gray-400 text-sm">此文件类型不支持在线预览</p>
       <p class="text-xs text-gray-400 font-mono">{{ mime_type }}</p>
       <div class="flex gap-2 mt-2">
-        <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+        <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"
            class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm">↓ 下载文件</a>
         <button onclick="App.closeModal()"
                 class="bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 font-medium py-2 px-4 rounded-lg transition text-sm">关闭</button>
@@ -91,13 +91,13 @@
       <span class="text-5xl">🎬</span>
       <p class="text-gray-600 dark:text-gray-400 text-sm">媒体加载失败</p>
       <p class="text-xs text-gray-400 mt-1">可能是编码格式不兼容，请下载后使用本地播放器</p>
-      <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+      <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"
          class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3">↓ 下载文件</a>
     </div>
   </div>
   {% if is_image || is_video || is_audio || is_pdf || is_text || is_markdown %}
   <div class="px-5 py-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex items-center gap-2 shrink-0">
-    <a href="/api/media/{{ file_path }}" download="{{ file_name }}"
+    <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"
        class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-3 py-1.5 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">↓ 下载</a>
     {% if is_image %}
     {% if !prev_name.is_empty() %}

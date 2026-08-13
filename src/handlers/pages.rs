@@ -36,17 +36,18 @@ struct LoginPage;
 
 // ====== 辅助函数 ======
 
-fn page_context(session: &UserSession, page: &str) -> impl FnOnce() -> (String, bool, String) {
-    let username = session.username.clone();
-    let is_admin = session.role == "admin";
-    let current_page = page.to_string();
-    move || (username, is_admin, current_page)
+fn page_context(session: &UserSession, page: &str) -> (String, bool, String) {
+    (
+        session.username.clone(),
+        session.role == "admin",
+        page.to_string(),
+    )
 }
 
 macro_rules! page_handler {
     ($func:ident, $PageType:ident, $page:expr) => {
         pub async fn $func(Extension(session): Extension<UserSession>) -> impl IntoResponse {
-            let (username, is_admin, current_page) = page_context(&session, $page)();
+            let (username, is_admin, current_page) = page_context(&session, $page);
             AppTemplate($PageType {
                 username,
                 is_admin,

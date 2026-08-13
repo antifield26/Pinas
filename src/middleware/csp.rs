@@ -7,6 +7,14 @@ use axum::{
 
 /// 安全响应头中间件：为所有响应添加安全相关的 HTTP 头
 pub async fn security_headers(req: Request, next: Next) -> Response {
+    // HSTS 只在 HTTPS 接入时下发：无条件下发会让纯 HTTP 局域网访问被浏览器
+    // 永久强制升级（max-age 一年），本地直连立即不可用（需在 next.run 移走 req 前读取）
+    let is_https = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
 
@@ -34,11 +42,13 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         ),
     );
 
-    // HSTS (仅 HTTPS 部署时生效)
-    headers.insert(
-        header::STRICT_TRANSPORT_SECURITY,
-        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-    );
+    // HSTS (仅 HTTPS 接入时生效；见 is_https 说明)
+    if is_https {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
 
     // 禁止 MIME 类型嗅探
     headers.insert(

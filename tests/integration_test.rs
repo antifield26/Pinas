@@ -11,20 +11,47 @@ use pi_nas::router;
 use sqlx::SqlitePool;
 use tower::util::ServiceExt;
 
-/// 创建测试应用（内存 SQLite，仅建表不含默认用户）
-/// 文件系统隔离：进程内首次调用把 CWD 切换到独立临时目录（uploads/ 不再污染项目目录）
-async fn test_app() -> (SqlitePool, axum::Router) {
-    use std::sync::Once;
-    static CWD_INIT: Once = Once::new();
+/// 进程级共享：首次调用把 CWD 切换到独立临时目录（uploads/ 不再污染项目目录）。
+/// 所有 test_app* 辅助函数共用同一个 Once——各自独立会导致测试中途切换 CWD
+static CWD_INIT: std::sync::Once = std::sync::Once::new();
+
+fn ensure_test_cwd() {
     CWD_INIT.call_once(|| {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
         // tempdir 存活到进程结束（测试共用同一 CWD，用户目录按 username 天然隔离）
         std::mem::forget(dir);
     });
-    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+}
+
+async fn test_pool() -> SqlitePool {
+    // foreign_keys 经连接选项设置，确保池中每条连接都启用 FK 约束
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            "sqlite::memory:"
+                .parse::<sqlx::sqlite::SqliteConnectOptions>()
+                .unwrap()
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap()
+}
+
+/// 创建测试应用（内存 SQLite，仅建表不含默认用户）
+async fn test_app() -> (SqlitePool, axum::Router) {
+    ensure_test_cwd();
+    let pool = test_pool().await;
     db::init_test_db(&pool).await.unwrap();
     let config = Config::default();
+    let app = router::build_router(config, pool.clone());
+    (pool, app)
+}
+
+/// 创建带自定义配置的测试应用（F18 等需改配额/开关的测试用）
+async fn test_app_with_config(config: Config) -> (SqlitePool, axum::Router) {
+    ensure_test_cwd();
+    let pool = test_pool().await;
+    db::init_test_db(&pool).await.unwrap();
     let app = router::build_router(config, pool.clone());
     (pool, app)
 }
@@ -331,9 +358,11 @@ async fn test_change_password_sets_secure_flag() {
         .unwrap()
         .to_str()
         .unwrap();
+    // F15 (v1.7.0)：Cookie 默认强制 Secure（部署于 CF 隧道后）——纯 HTTP 局域网需
+    // 显式 PINAS_COOKIE_SECURE=false 才会关闭
     assert!(
-        !cookie2.contains("; Secure"),
-        "直连 http 场景不应带 Secure: {}",
+        cookie2.contains("; Secure"),
+        "默认配置下 Cookie 应始终带 Secure: {}",
         cookie2
     );
 }
@@ -1071,11 +1100,10 @@ async fn register_and_login(app: &axum::Router) -> String {
 
 /// 注册并登录，返回 (token, username)
 async fn register_and_login_with_username(app: &axum::Router) -> (String, String) {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let username = format!("testuser_{}", timestamp);
+    // 原子计数器保证进程内唯一：并行测试下毫秒时间戳可能碰撞（共享限速器等全局状态互相干扰）
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let username = format!("testuser_{}_{}", std::process::id(), n);
 
     // 注册
     let resp = app
@@ -1405,6 +1433,283 @@ async fn test_rename_move_subtree_paths() {
     assert!(std::path::Path::new(&format!("uploads/{}/x/a2/b/c", username)).is_dir());
 }
 
+/// 回归测试：重命名/移动目标已存在时返回 409 且目标文件内容不被覆盖销毁
+#[tokio::test]
+async fn test_rename_move_conflict_preserves_target() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 上传 a.bin（内容 A）与 b.bin（内容 B）
+    let content_a: Vec<u8> = vec![b'A'; 1024];
+    let content_b: Vec<u8> = vec![b'B'; 1024];
+    upload_one_chunk(&app, &token, "conf-a", 0, 1, &content_a).await;
+    upload_one_chunk(&app, &token, "conf-b", 0, 1, &content_b).await;
+    for (ident, name) in [("conf-a", "a.bin"), ("conf-b", "b.bin")] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_with_token(
+                "/api/files/merge",
+                &format!(
+                    r#"{{"identifier":"{}","file_name":"{}","parent_path":""}}"#,
+                    ident, name
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "上传 {} 失败", name);
+    }
+
+    // a.bin → b.bin 必须 409
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/rename",
+            r#"{"name":"a.bin","new_name":"b.bin","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "重命名为已存在目标应 409"
+    );
+
+    // b.bin 的磁盘内容必须仍是 B（修复前已被 a.bin 覆盖销毁）
+    let b_path = format!("uploads/{}/b.bin", username);
+    let disk_b = tokio::fs::read(&b_path).await.unwrap();
+    assert_eq!(disk_b, content_b, "b.bin 内容不得被覆盖");
+    let a_path = format!("uploads/{}/a.bin", username);
+    assert!(
+        tokio::fs::try_exists(&a_path).await.unwrap(),
+        "a.bin 应保持原名存在"
+    );
+
+    // 移动冲突：dir2 下已有 b2.bin，把根目录 b2.bin 移入 dir2 必须 409
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/create_folder",
+            r#"{"name":"dir2","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    upload_one_chunk(&app, &token, "conf-b2", 0, 1, &content_b).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"conf-b2","file_name":"b2.bin","parent_path":"dir2"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    upload_one_chunk(&app, &token, "conf-b2-root", 0, 1, &content_a).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"conf-b2-root","file_name":"b2.bin","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/move",
+            r#"{"name":"b2.bin","target_dir":"dir2","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "移入含同名文件的目录应 409"
+    );
+    let disk = tokio::fs::read(format!("uploads/{}/dir2/b2.bin", username))
+        .await
+        .unwrap();
+    assert_eq!(disk, content_b, "dir2/b2.bin 内容不得被覆盖");
+}
+
+/// 回归测试：重传同名文件必须 409，且不销毁已存在的旧文件
+#[tokio::test]
+async fn test_merge_reupload_same_name_keeps_original() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 首次上传 same.bin（内容 A）
+    let content_a: Vec<u8> = vec![b'A'; 2048];
+    upload_one_chunk(&app, &token, "reup-1", 0, 1, &content_a).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"reup-1","file_name":"same.bin","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 同名重传（新 identifier）→ 409
+    let content_b: Vec<u8> = vec![b'B'; 2048];
+    upload_one_chunk(&app, &token, "reup-2", 0, 1, &content_b).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"reup-2","file_name":"same.bin","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "同名重传应 409");
+
+    // 磁盘内容必须仍是 A（修复前旧文件已被截断+删除）
+    let disk = tokio::fs::read(format!("uploads/{}/same.bin", username))
+        .await
+        .unwrap();
+    assert_eq!(disk, content_a, "旧文件内容不得被重传销毁");
+
+    // 列表仍只有一条 same.bin
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/files/list?path=", &token))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let count = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["name"] == "same.bin")
+        .count();
+    assert_eq!(count, 1, "同名文件记录应只有一条");
+}
+
+/// 回归测试：中文目录（多字节）重命名/移动后，深层子路径不得损坏；
+/// 名称含 % 的目录不得因 LIKE 通配符误伤其他行
+#[tokio::test]
+async fn test_rename_move_chinese_and_wildcard_subtree() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 目录树 目录/a%b + 深层文件 报告.txt
+    for (name, parent) in [("目录", ""), ("a%b", "目录")] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_with_token(
+                "/api/files/create_folder",
+                &format!(r#"{{"name":"{}","current_path":"{}"}}"#, name, parent),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "创建 {}/{} 失败",
+            parent,
+            name
+        );
+    }
+    let content: Vec<u8> = vec![b'X'; 512];
+    upload_one_chunk(&app, &token, "zh-sub", 0, 1, &content).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"zh-sub","file_name":"报告.txt","parent_path":"目录/a%b"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "上传深层文件失败");
+
+    // 重命名 目录 → 新目录，深层子路径必须完整迁移
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/rename",
+            r#"{"name":"目录","new_name":"新目录","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "中文目录重命名失败");
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, parent_path FROM files WHERE username = ?")
+            .bind(&username)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        rows.iter()
+            .any(|(n, p)| n == "报告.txt" && p == "新目录/a%b"),
+        "深层文件 parent_path 应为 新目录/a%b（多字节 SUBSTR 修复），实际: {:?}",
+        rows
+    );
+    assert!(
+        rows.iter().any(|(n, p)| n == "a%b" && p == "新目录"),
+        "中间目录 a%b 的 parent_path 应为 新目录，实际: {:?}",
+        rows
+    );
+    assert!(
+        std::path::Path::new(&format!("uploads/{}/新目录/a%b/报告.txt", username)).exists(),
+        "磁盘深层文件应随重命名迁移"
+    );
+}
+
+/// 回归测试：外键约束必须在池中每条连接生效（连接选项级 PRAGMA）
+#[tokio::test]
+async fn test_foreign_keys_enforced() {
+    let (pool, app) = test_app().await;
+
+    // 引用不存在的用户 → FK 约束必须拒绝
+    let err =
+        sqlx::query("INSERT INTO conversations (username, title) VALUES ('ghost', '孤儿对话')")
+            .execute(&pool)
+            .await;
+    assert!(err.is_err(), "引用不存在用户的对话应被 FK 拒绝");
+
+    // 级联删除：删除用户后其对话应被 CASCADE 清除
+    sqlx::query("INSERT INTO users (username, password, role) VALUES ('fkuser', 'x', 'user')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO conversations (username, title) VALUES ('fkuser', 'c1')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE username = 'fkuser'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE username = 'fkuser'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "删除用户应级联删除其对话");
+
+    // 冒烟：应用路由仍可用
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/health", ""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// 媒体代理 Range 语义：HEAD 元数据 / 206 部分内容 / 416 越界 / 空文件 200
 #[tokio::test]
 async fn test_media_proxy_range_semantics() {
@@ -1630,7 +1935,10 @@ async fn dav_send(
     } else {
         Body::from(body)
     };
-    app.clone().oneshot(builder.body(body).unwrap()).await.unwrap()
+    app.clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap()
 }
 
 async fn read_body_text(resp: axum::http::Response<axum::body::Body>) -> String {
@@ -1688,14 +1996,30 @@ async fn test_dav_put_get_roundtrip_and_propfind() {
     assert_eq!(read_body_text(resp).await, "hello dav");
 
     // PROPFIND 根 Depth 1 → 包含 hello.txt 与配额属性
-    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&auth), vec![], &[("Depth", "1")]).await;
+    let resp = dav_send(
+        &app,
+        "PROPFIND",
+        "/dav/",
+        Some(&auth),
+        vec![],
+        &[("Depth", "1")],
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
     let xml = read_body_text(resp).await;
     assert!(xml.contains("hello.txt"), "PROPFIND 应列出子项: {}", xml);
     assert!(xml.contains("quota-available-bytes"), "应含配额属性");
 
     // Depth infinity → 403
-    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&auth), vec![], &[("Depth", "infinity")]).await;
+    let resp = dav_send(
+        &app,
+        "PROPFIND",
+        "/dav/",
+        Some(&auth),
+        vec![],
+        &[("Depth", "infinity")],
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -1707,7 +2031,15 @@ async fn test_dav_put_overwrite() {
     let auth = basic_auth_header(&username, "testpass123");
 
     dav_send(&app, "PUT", "/dav/a.txt", Some(&auth), b"v1".to_vec(), &[]).await;
-    let resp = dav_send(&app, "PUT", "/dav/a.txt", Some(&auth), b"v2-longer".to_vec(), &[]).await;
+    let resp = dav_send(
+        &app,
+        "PUT",
+        "/dav/a.txt",
+        Some(&auth),
+        b"v2-longer".to_vec(),
+        &[],
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     let resp = dav_send(&app, "GET", "/dav/a.txt", Some(&auth), vec![], &[]).await;
@@ -1760,8 +2092,24 @@ async fn test_dav_move_copy_overwrite() {
     let (_, username) = register_and_login_with_username(&app).await;
     let auth = basic_auth_header(&username, "testpass123");
 
-    dav_send(&app, "PUT", "/dav/src.txt", Some(&auth), b"move-me".to_vec(), &[]).await;
-    dav_send(&app, "PUT", "/dav/dst.txt", Some(&auth), b"occupied".to_vec(), &[]).await;
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/src.txt",
+        Some(&auth),
+        b"move-me".to_vec(),
+        &[],
+    )
+    .await;
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/dst.txt",
+        Some(&auth),
+        b"occupied".to_vec(),
+        &[],
+    )
+    .await;
 
     // Overwrite: F 且目标存在 → 412
     let resp = dav_send(
@@ -1790,7 +2138,10 @@ async fn test_dav_move_copy_overwrite() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let resp = dav_send(&app, "GET", "/dav/moved.txt", Some(&auth), vec![], &[]).await;
     let st = resp.status();
-    let cl = resp.headers().get("content-length").map(|v| v.to_str().unwrap_or("?").to_string());
+    let cl = resp
+        .headers()
+        .get("content-length")
+        .map(|v| v.to_str().unwrap_or("?").to_string());
     let bd = read_body_text(resp).await;
     println!("[TEST] GET moved status={} cl={:?} body={:?}", st, cl, bd);
 
@@ -1818,7 +2169,15 @@ async fn test_dav_delete_goes_to_trash() {
     let (_, username) = register_and_login_with_username(&app).await;
     let auth = basic_auth_header(&username, "testpass123");
 
-    dav_send(&app, "PUT", "/dav/trashme.txt", Some(&auth), b"bye".to_vec(), &[]).await;
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/trashme.txt",
+        Some(&auth),
+        b"bye".to_vec(),
+        &[],
+    )
+    .await;
     let resp = dav_send(&app, "DELETE", "/dav/trashme.txt", Some(&auth), vec![], &[]).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
@@ -1912,7 +2271,15 @@ async fn test_search_global_cjk_and_ascii() {
         &[],
     )
     .await; // 使用手册.pdf
-    dav_send(&app, "PUT", "/dav/report.docx", Some(&auth), b"x".to_vec(), &[]).await;
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/report.docx",
+        Some(&auth),
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
 
     // 3 字中文词（FTS trigram）
     let resp = app
@@ -1937,7 +2304,10 @@ async fn test_search_global_cjk_and_ascii() {
         ))
         .await
         .unwrap();
-    assert!(read_body_text(resp).await.contains("使用手册"), "2 字词 LIKE 兜底应命中");
+    assert!(
+        read_body_text(resp).await.contains("使用手册"),
+        "2 字词 LIKE 兜底应命中"
+    );
     // ASCII 子串
     let resp = app
         .clone()
@@ -1994,12 +2364,19 @@ async fn test_preview_markdown_mode() {
     .await;
     let resp = app
         .clone()
-        .oneshot(get_with_token("/drive/preview?path=%2F&name=readme.md", &token))
+        .oneshot(get_with_token(
+            "/drive/preview?path=%2F&name=readme.md",
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let html = read_body_text(resp).await;
-    assert!(html.contains("markdown-data"), "markdown 模式应输出数据块: {}", html);
+    assert!(
+        html.contains("markdown-data"),
+        "markdown 模式应输出数据块: {}",
+        html
+    );
     assert!(
         html.contains("\\u003cscript"),
         "script 标签必须转义防 </script> 逃逸: {}",
@@ -2021,5 +2398,658 @@ async fn test_agent_stream_unconfigured() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "未配置 AI 应 503");
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "未配置 AI 应 503"
+    );
+}
+
+// ====== 11. P1 批次回归测试 (v1.7.0) ======
+
+/// F9: 分片空洞（缺中间片）合并必须拒绝，而非产出错位损坏文件
+#[tokio::test]
+async fn test_merge_rejects_gap() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+
+    let identifier = "gap-test-1";
+    let data = vec![0xAB; 1024];
+    // 上传 0,1,3 共 3 片（总数声明 4，缺 2）
+    for idx in [0, 1, 3] {
+        upload_one_chunk(&app, &token, identifier, idx, 4, &data).await;
+    }
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            &format!(
+                r#"{{"identifier":"{}","file_name":"gap.bin","parent_path":""}}"#,
+                identifier
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "分片空洞必须拒绝");
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("分片不完整"),
+        "应返回分片不完整提示"
+    );
+}
+
+/// F12: 带时间的日程必须出现在日历与日期筛选中
+#[tokio::test]
+async fn test_timed_todo_in_calendar_range() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 直接 SQL 插入带时间的日程（含 T 分隔）
+    sqlx::query(
+        "INSERT INTO todos (username, title, due_date, is_all_day, category) VALUES (?, '定时日程', '2026-08-13T10:00:00', 0, 'schedule')",
+    )
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 日历格子按日期统计（cell 显示 count 而非标题），断言 8 月 13 日格有计数
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/todos/calendar?year=2026&month=8", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let html = String::from_utf8_lossy(&body).to_string();
+    // 有日程的格子才渲染 hx-get="/todos/list?date=..." 链接——13 日必须带（修复前
+    // 带时间日程被月份范围查询漏掉，13 日格为空）
+    assert!(
+        html.contains("date=2026-08-13"),
+        "13 日格应包含日程（日历格子带日期链接）"
+    );
+
+    // /todos/list 日期筛选（日历点击路径）应列出该日程标题
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/todos/list?date=2026-08-13", &token))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let list_html = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        list_html.contains("定时日程"),
+        "/todos/list?date= 应列出带时间日程"
+    );
+
+    // 精确日期筛选应包含
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/todos?date=2026-08-13", &token))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let todos: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        todos.as_array().unwrap().len(),
+        1,
+        "date=2026-08-13 应命中带时间日程"
+    );
+}
+
+/// F16: 媒体令牌 — 签发、路径限定、过期拒绝；旧 ?token= 会话凭证不再接受
+#[tokio::test]
+async fn test_media_token_scoped_and_expires() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 子目录 sub 下上传一个 PNG（合法 MIME 头）
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/create_folder",
+            r#"{"name":"sub","current_path":"/"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let png: Vec<u8> = {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&[0u8; 64]);
+        v
+    };
+    upload_one_chunk(&app, &token, "mt-png", 0, 1, &png).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"mt-png","file_name":"pic.png","parent_path":"sub"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 预览片段应含 ?mt= 媒体令牌
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            "/drive/preview?path=/sub&name=pic.png",
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let html = String::from_utf8_lossy(&body).to_string();
+    let mt_pos = html.find("?mt=").expect("预览应包含媒体令牌");
+    let mt = html[mt_pos + 4..]
+        .split(['"', '&', '#'])
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(!mt.is_empty());
+
+    // 无 Cookie/Authorization，仅 mt → 200
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/media/sub/pic.png?mt={}", mt))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "合法媒体令牌应放行");
+
+    // 路径限定：令牌签发于 sub/ 目录，访问根目录其他文件必须拒绝
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/media/{}/sub/pic.png?mt={}", username, mt))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "路径前缀之外的访问必须拒绝"
+    );
+
+    // 旧 ?token= 会话凭证不再接受
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/media/sub/pic.png?token={}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "会话 token 走 URL 查询串必须被拒绝"
+    );
+
+    // 过期令牌拒绝
+    sqlx::query("UPDATE media_tokens SET expires_at = datetime('now', '-1 hour')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/media/sub/pic.png?mt={}", mt))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "过期令牌必须拒绝");
+}
+
+/// F17: 分享密码连续失败锁定（5 次错误 → 429，锁定 15 分钟）
+#[tokio::test]
+async fn test_share_bruteforce_lockout() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 上传文件并创建带密码分享
+    let data = vec![0x11; 1024];
+    upload_one_chunk(&app, &token, "lockout-f", 0, 1, &data).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"lockout-f","file_name":"lock.bin","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/share/create",
+            r#"{"file_path":"lock.bin","is_dir":false,"password":"right-pass"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let share: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = share["code"].as_str().unwrap().to_string();
+
+    // 连续 5 次错误密码 → 401；第 6 次 → 429 锁定
+    for i in 1..=5 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/share/access/{}?password=wrong-{}", code, i))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "第 {} 次错误应 401",
+            i
+        );
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/share/access/{}?password=wrong-6", code))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "连续失败应锁定"
+    );
+
+    // 正确密码也被锁定期拒绝（锁定的是分享而非密码）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/share/access/{}?password=right-pass", code))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 清理测试文件
+    let _ = tokio::fs::remove_file(format!("uploads/{}/lock.bin", username)).await;
+}
+
+/// F18: AI 每日配额耗尽后 429（限速在 resolve_agent_config/上游调用之前执行）
+#[tokio::test]
+async fn test_agent_rate_limited() {
+    let config = Config {
+        agent_daily_quota: 2,
+        ..Default::default()
+    };
+    let (_pool, app) = test_app_with_config(config).await;
+    let (token, _) = register_and_login_with_username(&app).await;
+
+    // 前 2 次通过限速（无 key → 503），第 3 次配额耗尽 → 429
+    for i in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(post_json_with_token(
+                "/api/agent/chat",
+                r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "第 {} 次应通过限速到达配置检查 (503)",
+            i + 1
+        );
+    }
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/agent/chat",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "日配额耗尽应 429"
+    );
+}
+
+/// F21: javascript: 等危险 scheme 链接必须被拒绝（JSON 与 HTMX 片段路径一致）
+#[tokio::test]
+async fn test_links_reject_javascript_url() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // JSON API → 400
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/links",
+            r#"{"title":"evil","url":"javascript:alert(document.cookie)"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "javascript: URL 应 400"
+    );
+
+    // HTMX 片段 → 不落库（回空表单）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/links")
+                .header("authorization", format!("Bearer {}", token))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("title=evil&url=javascript%3Aalert%281%29"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE username = ?")
+        .bind(&username)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "危险 URL 不得落库");
+
+    // data: URL 同样拒绝
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/links",
+            r#"{"title":"evil2","url":"data:text/html,<script>alert(1)</script>"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "data: URL 应 400");
+}
+
+/// F15: Cookie 默认强制 Secure（无 X-Forwarded-Proto 也带 Secure 标志）
+#[tokio::test]
+async fn test_login_cookie_always_secure() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    // 登出后重新登录，检查 Set-Cookie
+    let _ = app
+        .clone()
+        .oneshot(post_json_with_token("/api/logout", "{}", &token))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/login",
+            &format!(r#"{{"username":"{}","password":"testpass123"}}"#, username),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .unwrap_or_default();
+    assert!(
+        set_cookie.contains("Secure"),
+        "Cookie 应默认带 Secure 标志: {}",
+        set_cookie
+    );
+}
+
+/// F20: 未知用户登录返回 401（哑哈希等时校验不改变响应语义）
+#[tokio::test]
+async fn test_login_unknown_user_delayed() {
+    let (_pool, app) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/login",
+            r#"{"username":"no-such-user","password":"whatever123"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// F26: 全局搜索模式下排序表头保留 search 参数
+#[tokio::test]
+async fn test_global_search_sort_keeps_query() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+    // 全局搜索模式要求 path 显式为 ""（缺省会归一为 "/"）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            "/drive/list?path=&search=readme&sort_by=size_desc",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let html = String::from_utf8_lossy(&body).to_string();
+    // Askama 对属性内插值做 HTML 转义（&#34;/&quot;）：浏览器 getAttribute 会还原实体
+    let normalized = html.replace("&#34;", "\"").replace("&quot;", "\"");
+    assert!(
+        normalized.contains(r#""search":"readme""#),
+        "排序表头 hx-vals 应保留 search 参数"
+    );
+}
+
+/// F27: page_size 非正数必须钳位（负 LIMIT 在 SQLite 意为无限制）
+#[tokio::test]
+async fn test_list_page_size_clamped() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+    for ps in ["0", "-5"] {
+        let resp = app
+            .clone()
+            .oneshot(get_with_token(
+                &format!("/api/files/list?path=&page_size={}", ps),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "page_size={} 应 200", ps);
+    }
+}
+
+/// F10: WebDAV MOVE 覆盖失败后，被位移目标的 DB 行必须完整恢复（不"隐身"）
+#[tokio::test]
+async fn test_dav_move_failure_restores_displaced_rows() {
+    let (pool, app) = test_app().await;
+    let (_token, username) = register_and_login_with_username(&app).await;
+    let auth_header = basic_auth_header(&username, "testpass123");
+    let auth = Some(auth_header.as_str());
+
+    // PUT 目标文件 b.txt（真实存在）
+    let resp = dav_send(&app, "PUT", "/dav/b.txt", auth, b"B-data".to_vec(), &[]).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // MOVE 一个不存在的源文件覆盖 b.txt：位移 b.txt 后 move 失败 → 必须完整回滚
+    let resp = dav_send(
+        &app,
+        "MOVE",
+        "/dav/ghost.txt",
+        auth,
+        Vec::new(),
+        &[
+            ("Destination", "http://localhost/dav/b.txt"),
+            ("Overwrite", "T"),
+        ],
+    )
+    .await;
+    assert!(
+        resp.status().is_client_error() || resp.status().is_server_error(),
+        "移动不存在的源应失败"
+    );
+
+    // b.txt 的 DB 行必须仍在（修复前被删 → 文件"隐身"）
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM files WHERE username = ? AND name = 'b.txt' AND parent_path = ''",
+    )
+    .bind(&username)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "失败回滚后 b.txt 的 DB 行必须恢复");
+
+    // 物理文件也在
+    assert!(
+        tokio::fs::try_exists(format!("uploads/{}/b.txt", username))
+            .await
+            .unwrap(),
+        "b.txt 物理文件必须恢复"
+    );
+
+    // 清理
+    let _ = tokio::fs::remove_file(format!("uploads/{}/b.txt", username)).await;
+}
+
+// ====== 12. P2 批次回归测试 (v1.7.1) ======
+
+/// F32: 全局搜索大小写不敏感（v9 迁移重建 trigram case_sensitive 0）
+#[tokio::test]
+async fn test_global_search_case_insensitive() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+
+    // 上传 README.md（大写），搜索小写 readme 应命中
+    let data = b"hello world".to_vec();
+    upload_one_chunk(&app, &token, "fts-case", 0, 1, &data).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"fts-case","file_name":"README.md","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/files/list?search=readme", &token))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let found = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["name"] == "README.md");
+    assert!(found, "小写搜索应命中大写文件名（case_sensitive 0）");
+}
+
+/// F39: HSTS 仅在 HTTPS 接入时下发
+#[tokio::test]
+async fn test_hsts_only_under_https() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+
+    // 无 X-Forwarded-Proto → 无 HSTS
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/files/list?path=", &token))
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("strict-transport-security").is_none(),
+        "纯 HTTP 接入不应下发 HSTS"
+    );
+
+    // 带 X-Forwarded-Proto: https → 有 HSTS
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/files/list?path=")
+                .header("authorization", format!("Bearer {}", token))
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.headers()
+            .get("strict-transport-security")
+            .is_some(),
+        "HTTPS 接入应下发 HSTS"
+    );
+}
+
+/// F16 顺带回归：预览媒体令牌过期/越界后，cookie 会话仍可正常访问媒体
+#[tokio::test]
+async fn test_media_still_works_with_session_auth() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+
+    let data = b"\x89PNG\r\n\x1a\n".to_vec();
+    upload_one_chunk(&app, &token, "media-sess", 0, 1, &data).await;
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/merge",
+            r#"{"identifier":"media-sess","file_name":"sess.png","parent_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Bearer 会话凭证仍正常（媒体令牌是补充通道，不是替代）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/media/sess.png", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

@@ -3,7 +3,11 @@
 // --- 目录路径 ---
 pub const UPLOADS_DIR: &str = "uploads";
 pub const TMP_DIR: &str = "uploads/tmp";
-pub const TRASH_DIR: &str = "uploads/tmp/trash";
+// 回收站必须位于 TMP_DIR 之外：临时分片清扫按 mtime 清空 uploads/tmp 下的所有条目，
+// 若回收站在其内，30 天保留期会被压缩到 ~24 小时（历史数据丢失事故）
+pub const TRASH_DIR: &str = "uploads/.trash";
+/// 旧版回收站位置（v1.6.0 及以前），启动迁移用
+pub const LEGACY_TRASH_DIR: &str = "uploads/tmp/trash";
 pub const LOGS_DIR: &str = "logs";
 pub const STATIC_DIR: &str = "static";
 pub const ASSETS_DIR: &str = "assets";

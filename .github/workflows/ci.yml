@@ -37,3 +37,17 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      # PWA 版本一致性（?v= 与 sw.js 预缓存清单严格对齐）——漏改即预缓存 miss
+      - name: check-versions
+        run: bash scripts/check-versions.sh
+
+      # 目标平台为 aarch64-unknown-linux-gnu (RPi5 cortex-a76)，交叉编译检查防平台性问题
+      - name: aarch64 cargo check
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --workspace --target aarch64-unknown-linux-gnu
+
+      # Dockerfile 冒烟构建（曾因 pinas-core 移除与缺 templates/ 损坏而无人察觉）
+      - name: docker build smoke
+        run: docker build -t pi_nas:ci-smoke .

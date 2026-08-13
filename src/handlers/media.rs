@@ -12,7 +12,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::core::UserSession;
 use crate::handlers::BatchDownloadRequest;
-use crate::handlers::utils::{log_audit, safe_join_sandbox, update_user_used_mb, user_dir_path};
+use crate::handlers::utils::{log_audit, safe_join_sandbox, user_dir_path};
 
 #[derive(Deserialize)]
 pub struct EditGetQuery {
@@ -91,6 +91,38 @@ pub async fn save_file_content_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
     };
 
+    // 配额检查：按新旧大小差值计（改小反而释放空间；改大计入差额）
+    let old_len = tokio::fs::metadata(&full_p)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let new_len = payload.content.len() as u64;
+    if new_len > old_len {
+        let delta_mb = crate::handlers::utils::bytes_to_mb_ceil(new_len - old_len);
+        let row: Option<(i64, i64)> =
+            match sqlx::query_as("SELECT used_mb, quota_mb FROM users WHERE username = ?")
+                .bind(username)
+                .fetch_optional(&pool)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("[Media] 查询用户配额失败: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "服务器内部错误，请稍后重试",
+                    )
+                        .into_response();
+                }
+            };
+        let Some((current_used, quota)) = row else {
+            return (StatusCode::NOT_FOUND, "用户不存在").into_response();
+        };
+        if current_used + delta_mb > quota {
+            return (StatusCode::FORBIDDEN, "存储空间不足，超出配额").into_response();
+        }
+    }
+
     if let Err(e) = tokio::fs::write(&full_p, payload.content.as_bytes()).await {
         tracing::error!("[Media] 写入文件失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "写入文件失败，请重试").into_response();
@@ -126,7 +158,10 @@ pub async fn save_file_content_handler(
     .execute(&pool)
     .await;
 
-    let _ = update_user_used_mb(&pool, username).await;
+    // 增量调整配额（新旧字节差），替代全表 SUM 重算
+    let old_len_mb = crate::handlers::utils::bytes_to_mb_ceil(old_len);
+    let new_len_mb = crate::handlers::utils::bytes_to_mb_ceil(new_len);
+    crate::handlers::utils::adjust_user_used_mb(&pool, username, new_len_mb - old_len_mb).await;
 
     // 审计日志：保存文件
     let _ = log_audit(
@@ -207,7 +242,14 @@ pub async fn media_proxy(
         if let Some((start, end)) = parse_range(range_value, file_size) {
             (start, end, StatusCode::PARTIAL_CONTENT)
         } else {
-            return (StatusCode::RANGE_NOT_SATISFIABLE, HeaderMap::new()).into_response();
+            // RFC 7233 §4.4：416 必须携带 Content-Range: bytes */{size}
+            let mut h416 = HeaderMap::new();
+            h416.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{}", file_size))
+                    .unwrap_or_else(|_| HeaderValue::from_static("bytes */0")),
+            );
+            return (StatusCode::RANGE_NOT_SATISFIABLE, h416).into_response();
         }
     } else {
         // 无 Range 头时返回 200 全量（标准服务器行为）。

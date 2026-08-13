@@ -63,6 +63,22 @@ pub async fn restore_trash(
         return Err(AppError::conflict("目标路径已存在，请先移动或删除同名文件"));
     }
 
+    // 配额预检：恢复大文件同样计入配额，超限拒绝（此前恢复可无限制撑爆配额）
+    let src_size: u64 = dir_size(&src).await;
+    let (current_used, quota): (i64, i64) =
+        sqlx::query_as("SELECT used_mb, quota_mb FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| AppError::internal_log("查询用户配额", e))?
+            .ok_or_else(|| AppError::not_found("用户不存在"))?;
+    if current_used + crate::handlers::utils::bytes_to_mb_ceil(src_size) > quota {
+        return Err(AppError::forbidden(format!(
+            "存储空间不足，配额 {} MB，已使用 {} MB",
+            quota, current_used
+        )));
+    }
+
     if let Some(p) = dst.parent() {
         let _ = tokio::fs::create_dir_all(p).await;
     }
@@ -112,6 +128,28 @@ pub async fn restore_trash(
     )
     .await;
     Ok((StatusCode::OK, "目标已恢复原位"))
+}
+
+/// 计算路径总字节数（文件直接用大小；目录迭代式累加——async fn 递归需装箱，迭代更直白）
+async fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![path.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let meta = match tokio::fs::metadata(&cur).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_file() {
+            total += meta.len();
+            continue;
+        }
+        if let Ok(mut entries) = tokio::fs::read_dir(&cur).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                stack.push(entry.path());
+            }
+        }
+    }
+    total
 }
 
 // 递归恢复目录辅助函数
@@ -203,16 +241,14 @@ pub async fn delete_trash_permanent(
     Ok((StatusCode::OK, "已从磁盘彻底碎纸抹除"))
 }
 
-// 清空回收站（当前用户所有项目）
-#[tracing::instrument(skip_all)]
-pub async fn clear_trash(
-    Extension(pool): Extension<sqlx::SqlitePool>,
-    Extension(session): Extension<UserSession>,
-) -> AppResult<(StatusCode, &'static str)> {
+/// 物理删除某用户回收站的全部条目（文件 + DB 行），返回条目数。
+/// JSON clear_trash 与 HTMX trash_clear_fragment 共用，避免两路径行为漂移。
+async fn clear_trash_physical(pool: &sqlx::SqlitePool, username: &str) -> usize {
     let rows = sqlx::query("SELECT id, trash_uuid FROM trash WHERE username = ?")
-        .bind(&session.username)
-        .fetch_all(&pool)
-        .await?;
+        .bind(username)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
 
     let count = rows.len();
     for row in rows {
@@ -226,9 +262,19 @@ pub async fn clear_trash(
         }
         let _ = sqlx::query("DELETE FROM trash WHERE id = ?")
             .bind(id)
-            .execute(&pool)
+            .execute(pool)
             .await;
     }
+    count
+}
+
+// 清空回收站（当前用户所有项目）
+#[tracing::instrument(skip_all)]
+pub async fn clear_trash(
+    Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(session): Extension<UserSession>,
+) -> AppResult<(StatusCode, &'static str)> {
+    let count = clear_trash_physical(&pool, &session.username).await;
 
     let _ = update_user_used_mb(&pool, &session.username).await;
     let _ = log_audit(
@@ -315,17 +361,15 @@ pub async fn trash_clear_fragment(
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(session): Extension<UserSession>,
 ) -> impl axum::response::IntoResponse {
-    let _ = sqlx::query("DELETE FROM trash WHERE username = ?")
-        .bind(&session.username)
-        .execute(&pool)
-        .await;
+    // 与 JSON clear_trash 共用物理删除逻辑：只删 DB 行会留下孤儿文件持续占盘
+    let count = clear_trash_physical(&pool, &session.username).await;
 
     let _ = log_audit(
         &pool,
         &session.username,
         "trash_clear",
         None,
-        None,
+        Some(&format!("{} items", count)),
         None,
         None,
     )

@@ -35,7 +35,9 @@ pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::E
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(DB_BUSY_TIMEOUT_SECS));
+        .busy_timeout(Duration::from_secs(DB_BUSY_TIMEOUT_SECS))
+        // PRAGMA foreign_keys 是 per-connection 设置，必须经连接选项作用于池中每条连接
+        .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(DB_MAX_CONNECTIONS)
@@ -48,17 +50,58 @@ pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::E
     Ok(pool)
 }
 
-/// 初始化数据库：建表 → 迁移 → 索引 → 默认用户
+/// 初始化数据库：回收站迁移 → 建表 → 迁移 → 索引 → 默认用户
 pub async fn init(
     pool: &sqlx::SqlitePool,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // 必须先于 tasks::cleanup::spawn_all 的首次临时分片清扫执行（main.rs 中 init 早于 spawn_all）
+    migrate_trash_dir().await?;
     init_tables(pool).await?;
-    migrations::run(pool).await;
+    migrations::run(pool).await?;
     init_indexes(pool).await?;
     init_default_users(pool, config).await?;
     // 清理过期会话
     queries::clean_expired_sessions(pool).await?;
+    Ok(())
+}
+
+/// 启动迁移：v1.6.0 及以前回收站位于 uploads/tmp/trash（临时分片清扫范围内），
+/// 迁移到 uploads/.trash。同盘 rename 原子；目标已存在时跳过（幂等）。
+async fn migrate_trash_dir() -> Result<(), Box<dyn std::error::Error>> {
+    let old = std::path::Path::new(LEGACY_TRASH_DIR);
+    let new = std::path::Path::new(TRASH_DIR);
+    if !old.is_dir() {
+        return Ok(()); // 新部署或已被旧版清扫销毁：无迁移对象
+    }
+    if new.exists() {
+        // 目标已存在（空目录）时移除空壳再迁移；非空则保留不动并告警，避免覆盖现有数据
+        if tokio::fs::remove_dir(&new).await.is_err() {
+            tracing::warn!("[DB] 回收站迁移跳过：目标 {} 已存在且非空", TRASH_DIR);
+            return Ok(());
+        }
+    }
+    if let Some(parent) = new.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    match tokio::fs::rename(&old, &new).await {
+        Ok(()) => {
+            tracing::info!(
+                "[DB] 回收站目录已迁移: {} → {}",
+                LEGACY_TRASH_DIR,
+                TRASH_DIR
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "[DB] 回收站目录迁移失败（{} → {}）: {}",
+                LEGACY_TRASH_DIR,
+                TRASH_DIR,
+                e
+            );
+            return Err(e.into());
+        }
+    }
     Ok(())
 }
 
@@ -251,12 +294,15 @@ async fn init_indexes(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 /// 为用户存储或更新密码哈希（env 设置→UPDATE，首次运行→INSERT，否则跳过）
+/// sync_enabled: PINAS_SYNC_PASSWORDS=true 时才允许 env 密码覆盖已有密码——
+/// 否则用户在 UI 改密后会被环境变量在下次重启时悄悄重置（env 变成永久后门）
 async fn sync_user_password(
     pool: &sqlx::SqlitePool,
     username: &str,
     role: &str,
     env_pwd: Option<&str>,
     is_first_run: bool,
+    sync_enabled: bool,
     quota_mb: i64,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match env_pwd.filter(|p| !p.is_empty()) {
@@ -268,6 +314,13 @@ async fn sync_user_password(
                 .await?
                 .is_some();
             if exists {
+                if !sync_enabled && !is_first_run {
+                    info!(
+                        "[Init] {} 检测到环境变量密码但 PINAS_SYNC_PASSWORDS 未开启，跳过同步",
+                        username
+                    );
+                    return Ok(None);
+                }
                 sqlx::query(
                     "UPDATE users SET password = ?, must_change_pwd = 0 WHERE username = ?",
                 )
@@ -326,6 +379,7 @@ async fn init_default_users(
         ROLE_ADMIN,
         config.admin_password.as_deref(),
         is_first_run,
+        config.sync_passwords,
         config.default_quota_mb,
     )
     .await?;
@@ -336,10 +390,15 @@ async fn init_default_users(
         ROLE_USER,
         config.guest_password.as_deref(),
         is_first_run,
+        config.sync_passwords,
         config.default_quota_mb,
     )
     .await?;
 
+    if !is_first_run {
+        // 非首次运行：自动生成凭据文件不应滞留（首次登录成功后 auth.rs 也会删，此为兜底）
+        let _ = tokio::fs::remove_file("credentials.txt").await;
+    }
     if is_first_run {
         tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, ROLE_ADMIN)).await?;
         tokio::fs::create_dir_all(format!("{}/{}", UPLOADS_DIR, "guest")).await?;
@@ -381,6 +440,8 @@ pub async fn init_test_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
     init_tables(pool).await?;
-    migrations::run(pool).await;
+    migrations::run(pool)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(format!("迁移失败: {e}")))?;
     Ok(())
 }

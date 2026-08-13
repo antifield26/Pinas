@@ -3,6 +3,14 @@
 
 use sqlx::{Row, SqlitePool};
 
+/// 转义 LIKE 模式中的通配符（配合 `LIKE ? ESCAPE '\'` 使用），
+/// 防止用户输入中的 %/_ 意外匹配其他行或制造昂贵扫描
+pub fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// 更新目录子树中所有子记录的 parent_path（事务内调用）
 /// old_prefix: 旧的完整路径前缀
 /// new_prefix: 新的完整路径前缀
@@ -21,11 +29,13 @@ pub async fn update_child_paths(
         .await?;
 
     // 更新深层子节点: parent_path LIKE old_prefix/%
+    // 注意: SUBSTR 偏移必须用 SQLite 的 length(?)（字符数），Rust 的 .len() 是字节数，
+    // 中文等多字节文件名会导致深层子路径被从中截断损坏
     sqlx::query(
-        "UPDATE files SET parent_path = ? || SUBSTR(parent_path, ? + 1) WHERE username = ? AND parent_path LIKE ?"
+        "UPDATE files SET parent_path = ? || SUBSTR(parent_path, length(?) + 1) WHERE username = ? AND parent_path LIKE ? ESCAPE '\\'"
     )
-    .bind(new_prefix).bind(old_prefix.len() as i64).bind(username)
-    .bind(format!("{}/%", old_prefix))
+    .bind(new_prefix).bind(old_prefix).bind(username)
+    .bind(format!("{}/%", escape_like(old_prefix)))
     .execute(&mut **tx).await?;
 
     Ok(())

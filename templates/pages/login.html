@@ -74,8 +74,11 @@
           if (data.must_change_pwd) {
             window.location.href = '/change-password';
           } else {
+            // redirect 仅允许站内绝对路径：拒绝 https://、//evil.com、javascript: 等（开放重定向/XSS）
             var params = new URLSearchParams(window.location.search);
-            window.location.href = params.get('redirect') || '/';
+            var target = params.get('redirect') || '/';
+            if (target.charAt(0) !== '/' || target.charAt(1) === '/') target = '/';
+            window.location.href = target;
           }
         } else {
           var text = await res.text();

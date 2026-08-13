@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::core::UserSession;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::templates::AppTemplate;
 use askama::Template;
 
@@ -65,12 +65,17 @@ pub async fn rename_conversation(
     Path(id): Path<i64>,
     Json(body): Json<ConvRenameRequest>,
 ) -> AppResult<Json<Conversation>> {
-    sqlx::query("UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ? AND username = ?")
+    let result = sqlx::query("UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ? AND username = ?")
         .bind(&body.title).bind(id).bind(&session.username).execute(&pool).await?;
+    // 归属校验：影响 0 行即不存在或他人对话（此前仍回查并泄露他人标题/确认 ID 存在）
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("对话不存在"));
+    }
     let conv = sqlx::query_as::<_, Conversation>(
-        "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?",
+        "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ? AND username = ?",
     )
     .bind(id)
+    .bind(&session.username)
     .fetch_one(&pool)
     .await?;
     Ok(Json(conv))

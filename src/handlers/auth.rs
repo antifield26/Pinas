@@ -15,6 +15,33 @@ use crate::db::queries;
 use crate::handlers::rate_limit;
 use crate::handlers::utils::log_audit;
 
+/// 未知用户登录/认证时用哑哈希做等时校验，抹平"用户是否存在"的时序侧信道
+static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::handlers::utils::hash_password("pinas-dummy-hash-constant-v1").unwrap_or_default()
+});
+
+/// 供 WebDAV 认证等路径复用的哑哈希（未知用户等时校验）
+pub fn dummy_hash_for_timing() -> &'static str {
+    &DUMMY_HASH
+}
+
+/// 对密码执行 Argon2 校验（阻塞 CPU 操作移入 spawn_blocking，避免卡住 async 运行时）
+async fn verify_password_async(hash: &str, password: &str) -> bool {
+    let hash = hash.to_string();
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || match PasswordHash::new(&hash) {
+        Ok(parsed_hash) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok(),
+        Err(e) => {
+            tracing::error!("[Auth] 密码哈希解析失败: {}", e);
+            false
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// 校验用户名格式：2-32 字符，仅允许字母/数字/下划线/连字符
 fn validate_username(username: &str) -> Result<(), &'static str> {
     if username.len() < 2 || username.len() > 32 {
@@ -78,20 +105,17 @@ fn extract_auth_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-/// 根据 X-Forwarded-Proto 决定 Cookie 是否带 Secure 标志（反向代理 HTTPS 场景必需）
-fn should_secure_cookie(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false)
+/// Cookie 是否带 Secure 标志：默认强制 Secure（部署于 CF 隧道后，公网 HTTPS）。
+/// 仅纯 HTTP 局域网场景需显式配置 PINAS_COOKIE_SECURE=false
+fn should_secure_cookie(config: &Config) -> bool {
+    config.cookie_secure.unwrap_or(true)
 }
 
 /// 从请求提取限速键（客户端 IP）。
 /// - 直连(对端非回环):忽略一切客户端头,用真实对端 IP —— 杜绝伪造 X-Forwarded-For 绕过限速
 /// - 回环(cloudflared 本地隧道):信任 CF-Connecting-IP > X-Real-IP > X-Forwarded-For 最左侧
 /// - 无 ConnectInfo(测试场景):回退信任头,无头则 None(调用方按用户名限速)
-fn extract_ip(peer_ip: Option<std::net::IpAddr>, headers: &HeaderMap) -> Option<String> {
+pub fn extract_ip(peer_ip: Option<std::net::IpAddr>, headers: &HeaderMap) -> Option<String> {
     match peer_ip {
         Some(ip) if !ip.is_loopback() => return Some(ip.to_string()),
         Some(_) => {
@@ -183,19 +207,7 @@ pub async fn login(
         .unwrap_or(None);
 
     if let Some((db_hash, role, must_change)) = row {
-        let password = payload.password.clone();
-
-        let is_valid = tokio::task::spawn_blocking(move || match PasswordHash::new(&db_hash) {
-            Ok(parsed_hash) => Argon2::default()
-                .verify_password(password.as_bytes(), &parsed_hash)
-                .is_ok(),
-            Err(e) => {
-                tracing::error!("[Login] 密码哈希解析失败: {}", e);
-                false
-            }
-        })
-        .await
-        .unwrap_or(false);
+        let is_valid = verify_password_async(&db_hash, &payload.password).await;
 
         if is_valid {
             // 登录成功即删除含明文密码的凭据文件（一次性引导文件）
@@ -234,7 +246,7 @@ pub async fn login(
             // 构建 httpOnly Cookie（服务器端设置，JS 不可访问）
             // Secure 标志确保 Cookie 仅通过 HTTPS 传输（反向代理场景必需）
             let max_age = config.session_days * 86400;
-            let secure_flag = if should_secure_cookie(&headers) {
+            let secure_flag = if should_secure_cookie(&config) {
                 "; Secure"
             } else {
                 ""
@@ -265,6 +277,8 @@ pub async fn login(
         tracing::warn!("[Login] 用户 '{}' 密码验证失败", payload.username);
     } else {
         tracing::warn!("[Login] 用户 '{}' 不存在", payload.username);
+        // 等时哑哈希校验：抹平用户枚举时序侧信道
+        let _ = verify_password_async(&DUMMY_HASH, &payload.password).await;
     }
     (StatusCode::UNAUTHORIZED, "账号或访问密码校验失败").into_response()
 }
@@ -524,7 +538,7 @@ pub async fn change_password(
     .await;
 
     let max_age = config.session_days * 86400;
-    let secure_flag = if should_secure_cookie(&headers) {
+    let secure_flag = if should_secure_cookie(&config) {
         "; Secure"
     } else {
         ""
@@ -546,6 +560,7 @@ pub async fn change_password(
 
 pub async fn logout(
     Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(config): Extension<Config>,
     req: axum::http::Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let headers = req.headers();
@@ -590,7 +605,7 @@ pub async fn logout(
         .await;
     }
 
-    let secure_flag = if should_secure_cookie(headers) {
+    let secure_flag = if should_secure_cookie(&config) {
         "; Secure"
     } else {
         ""

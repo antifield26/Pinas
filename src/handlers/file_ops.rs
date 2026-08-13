@@ -111,33 +111,66 @@ fn fmt_size(mb: f64, is_dir: bool) -> String {
     }
 }
 
-/// 磁盘文件存在性校验 + 孤儿 DB 记录清理
-async fn ensure_file_on_disk(
+/// 批量磁盘存在性校验 + 孤儿 DB 记录清理（列表热路径）：
+/// 逐行 stat+DELETE 会造成 N 次顺序 await 与 N 个 WAL 写事务（每行还触发 FTS 触发器），
+/// 改为并发 try_exists + 单条批量 DELETE。返回磁盘上实际存在的 (name, parent_path) 集合。
+async fn reconcile_files_on_disk(
     pool: &sqlx::SqlitePool,
     username: &str,
-    parent_path: &str,
-    name: &str,
-    is_dir: bool,
-) -> bool {
+    rows: &[(String, String, bool)], // (name, parent_path, is_dir)
+) -> std::collections::HashSet<(String, String)> {
+    use std::collections::HashSet;
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let rel = user_file_path(username, parent_path, name);
-    // 路径非法(穿越)视为不存在，交由调用方清理 DB 记录
-    let Ok(full) = safe_join_sandbox(base, &rel) else {
-        return false;
-    };
-    let exists = if is_dir { full.is_dir() } else { full.exists() };
-    if !exists {
-        tracing::warn!("[文件同步] 磁盘文件缺失，清理数据库记录: {:?}", full);
-        let _ =
-            sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
-                .bind(username)
-                .bind(name)
-                .bind(parent_path)
-                .execute(pool)
-                .await;
-        return false;
+    let checks = rows.iter().map(|(name, parent_path, is_dir)| async move {
+        let rel = user_file_path(username, parent_path, name);
+        let exists = match safe_join_sandbox(base, &rel) {
+            Ok(full) => match tokio::fs::metadata(&full).await {
+                Ok(meta) => {
+                    if *is_dir {
+                        meta.is_dir()
+                    } else {
+                        meta.is_file()
+                    }
+                }
+                Err(_) => false,
+            },
+            // 路径非法(穿越)视为不存在，交由调用方清理 DB 记录
+            Err(_) => false,
+        };
+        ((name.clone(), parent_path.clone()), exists)
+    });
+    let results = futures_util::future::join_all(checks).await;
+
+    let mut present: HashSet<(String, String)> = HashSet::with_capacity(results.len());
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for ((name, parent), exists) in results {
+        if exists {
+            present.insert((name, parent));
+        } else {
+            missing.push((name, parent));
+        }
     }
-    true
+    if !missing.is_empty() {
+        tracing::warn!("[文件同步] 批量清理 {} 条磁盘缺失记录", missing.len());
+        let mut qb = sqlx::QueryBuilder::new("DELETE FROM files WHERE username = ");
+        qb.push_bind(username);
+        qb.push(" AND (name, parent_path) IN (");
+        let mut first = true;
+        for (name, parent) in &missing {
+            if !first {
+                qb.push(",");
+            }
+            first = false;
+            qb.push("(")
+                .push_bind(name)
+                .push(",")
+                .push_bind(parent)
+                .push(")");
+        }
+        qb.push(")");
+        let _ = qb.build().execute(pool).await;
+    }
+    present
 }
 
 /// 标准化显示路径
@@ -186,20 +219,28 @@ async fn query_files(
     );
     qb.push_bind(username);
     if let Some(s) = &search {
+        let s_raw = (*s).to_string();
+        let s = crate::db::queries::escape_like(s);
         if parent_path.is_empty() {
             // 全局搜索（path 为空）：≥3 字符走 FTS5 trigram（子串匹配含中文），≤2 字符降级 LIKE 兜底
-            if s.chars().count() >= 3 {
+            if s_raw.chars().count() >= 3 {
                 qb.push(" AND id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ");
-                qb.push_bind(format!("\"{}\"", s.replace('"', "\"\"")));
+                qb.push_bind(format!("\"{}\"", s_raw.replace('"', "\"\"")));
                 qb.push(")");
             } else {
-                qb.push(" AND (name LIKE ").push_bind(format!("%{}%", s));
-                qb.push(" OR parent_path LIKE ").push_bind(format!("%{}%", s));
+                qb.push(" AND (name LIKE ")
+                    .push_bind(format!("%{}%", s))
+                    .push(" ESCAPE '\\'");
+                qb.push(" OR parent_path LIKE ")
+                    .push_bind(format!("%{}%", s))
+                    .push(" ESCAPE '\\'");
                 qb.push(")");
             }
         } else {
             qb.push(" AND parent_path = ").push_bind(parent_path);
-            qb.push(" AND name LIKE ").push_bind(format!("%{}%", s));
+            qb.push(" AND name LIKE ")
+                .push_bind(format!("%{}%", s))
+                .push(" ESCAPE '\\'");
         }
     } else {
         qb.push(" AND parent_path = ").push_bind(parent_path);
@@ -213,6 +254,9 @@ async fn query_files(
         _ => " ORDER BY is_dir DESC, name ASC",
     };
     qb.push(order);
+    // 防御上限：HTMX 片段列表无分页 UI（JSON API 路径有分页），
+    // 超量目录（10 万级文件）一次性全量渲染会打爆响应与前端
+    qb.push(" LIMIT 1000");
 
     #[derive(sqlx::FromRow)]
     struct FileRowRaw {
@@ -223,20 +267,20 @@ async fn query_files(
     }
     match qb.build_query_as::<FileRowRaw>().fetch_all(pool).await {
         Ok(rows) => {
-            let mut files = Vec::with_capacity(rows.len());
-            for r in rows {
-                let is_dir = r.is_dir != 0;
-                if !ensure_file_on_disk(pool, username, &r.parent_path, &r.name, is_dir).await {
-                    continue;
-                }
-                files.push(FileRowData {
+            let batch: Vec<(String, String, bool)> = rows
+                .iter()
+                .map(|r| (r.name.clone(), r.parent_path.clone(), r.is_dir != 0))
+                .collect();
+            let present = reconcile_files_on_disk(pool, username, &batch).await;
+            rows.into_iter()
+                .filter(|r| present.contains(&(r.name.clone(), r.parent_path.clone())))
+                .map(|r| FileRowData {
                     name: r.name,
-                    is_dir,
-                    size_display: fmt_size(r.size_mb.unwrap_or(0.0), is_dir),
+                    is_dir: r.is_dir != 0,
+                    size_display: fmt_size(r.size_mb.unwrap_or(0.0), r.is_dir != 0),
                     parent_path: r.parent_path,
-                });
-            }
-            files
+                })
+                .collect()
         }
         Err(e) => {
             tracing::error!("[Drive] 文件列表查询失败: {}", e);
@@ -256,6 +300,7 @@ async fn fallback_file_list(
         files,
         current_path: path,
         has_global_search: false,
+        search: String::new(),
     })
     .into_response();
     resp.headers_mut().insert(
@@ -285,15 +330,22 @@ fn bind_list_where(
                 qb.push_bind(format!("\"{}\"", search_raw.replace('"', "\"\"")));
                 qb.push(")");
             } else {
-                qb.push(" AND (name LIKE ").push_bind(search_pattern);
-                qb.push(" OR parent_path LIKE ").push_bind(search_pattern);
+                qb.push(" AND (name LIKE ")
+                    .push_bind(search_pattern)
+                    .push(" ESCAPE '\\'");
+                qb.push(" OR parent_path LIKE ")
+                    .push_bind(search_pattern)
+                    .push(" ESCAPE '\\'");
                 qb.push(")");
             }
         } else {
             qb.push(" AND (parent_path = ").push_bind(current_path);
             qb.push(" OR parent_path LIKE ")
-                .push_bind(like_pattern.as_deref().unwrap_or(""));
-            qb.push(") AND name LIKE ").push_bind(search_pattern);
+                .push_bind(like_pattern.as_deref().unwrap_or(""))
+                .push(" ESCAPE '\\'");
+            qb.push(") AND name LIKE ")
+                .push_bind(search_pattern)
+                .push(" ESCAPE '\\'");
         }
     } else {
         qb.push(" AND parent_path = ").push_bind(current_path);
@@ -313,8 +365,9 @@ pub async fn list_files(
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
     let search_raw = query.search.as_deref().unwrap_or("");
+    // LIKE 通配符转义：用户输入中的 %/_ 不得意外匹配其他行（制造昂贵的全表扫描）
     let search_pattern = if has_search {
-        format!("%{}%", search_raw)
+        format!("%{}%", crate::db::queries::escape_like(search_raw))
     } else {
         String::new()
     };
@@ -324,11 +377,12 @@ pub async fn list_files(
         None
     };
     let page = query.page.unwrap_or(1).max(1);
+    // clamp 下界：负 LIMIT 在 SQLite 中意为"无限制"，0 会除零/返回畸形分页
     let page_size = query
         .page_size
         .unwrap_or(crate::constants::DEFAULT_PAGE_SIZE)
-        .min(crate::constants::MAX_PAGE_SIZE);
-    let offset = (page - 1) * page_size;
+        .clamp(1, crate::constants::MAX_PAGE_SIZE);
+    let offset = (page - 1).saturating_mul(page_size);
     let order_sql = match query.sort_by.as_deref() {
         Some("name_desc") => " ORDER BY is_dir DESC, name DESC",
         Some("size_asc") => " ORDER BY is_dir DESC, size_mb ASC",
@@ -372,20 +426,16 @@ pub async fn list_files(
 
     match dq.build_query_as::<FileItem>().fetch_all(&pool).await {
         Ok(files) => {
-            let mut valid = Vec::with_capacity(files.len());
-            for f in files {
-                // 全局搜索时每行 parent_path 不同，按行内路径校验磁盘存在
-                let row_path = if current_path.is_empty() {
-                    &f.parent_path
-                } else {
-                    &current_path
-                };
-                if ensure_file_on_disk(&pool, &session.username, row_path, &f.name, f.is_dir != 0)
-                    .await
-                {
-                    valid.push(f);
-                }
-            }
+            // 批量磁盘校验（并发 try_exists + 单条批量 DELETE，替代逐行 stat+DELETE 的 N+1 写放大）
+            let batch: Vec<(String, String, bool)> = files
+                .iter()
+                .map(|f| (f.name.clone(), f.parent_path.clone(), f.is_dir != 0))
+                .collect();
+            let present = reconcile_files_on_disk(&pool, &session.username, &batch).await;
+            let valid: Vec<FileItem> = files
+                .into_iter()
+                .filter(|f| present.contains(&(f.name.clone(), f.parent_path.clone())))
+                .collect();
             Json(serde_json::json!({"items": valid, "page": page, "page_size": page_size, "total": total, "total_pages": ((total as f64)/(page_size as f64)).ceil() as i64})).into_response()
         }
         Err(e) => {
@@ -429,16 +479,35 @@ pub async fn create_folder(
         &name,
         std::path::Path::new(crate::constants::UPLOADS_DIR),
     )?;
+    // 重复预检：先建目录再 INSERT 会在 UNIQUE 冲突时留下孤儿目录 + 返回误导性 500
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE username = ? AND name = ? AND parent_path = ?)",
+    )
+    .bind(&session.username)
+    .bind(&name)
+    .bind(&parent)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(true);
+    if exists {
+        return Err(AppError::conflict("同名文件夹已存在"));
+    }
     tokio::fs::create_dir_all(&target).await.map_err(|e| {
         tracing::error!("[Files] 创建目录失败: {}", e);
         AppError::internal("操作失败")
     })?;
-    sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
-        .bind(&session.username)
-        .bind(&name)
-        .bind(&parent)
-        .execute(&pool)
-        .await?;
+    if let Err(e) =
+        sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
+            .bind(&session.username)
+            .bind(&name)
+            .bind(&parent)
+            .execute(&pool)
+            .await
+    {
+        // INSERT 失败回收刚建的物理目录，不留孤儿
+        let _ = tokio::fs::remove_dir(&target).await;
+        return Err(e.into());
+    }
     let _ = log_audit(
         &pool,
         &session.username,
@@ -488,20 +557,37 @@ pub(crate) async fn rename_core(
     parent: &str,
     old_name: &str,
     new_name: &str,
-) -> Result<(), String> {
-    crate::handlers::utils::validate_name(new_name).map_err(|e| e.to_string())?;
+) -> AppResult<()> {
+    if old_name == new_name {
+        return Ok(());
+    }
+    crate::handlers::utils::validate_name(new_name)?;
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let old_p = safe_join_sandbox(base, &user_file_path(username, parent, old_name))
-        .map_err(|e| e.to_string())?;
-    let new_p = safe_join_sandbox(base, &user_file_path(username, parent, new_name))
-        .map_err(|e| e.to_string())?;
+    let old_p = safe_join_sandbox(base, &user_file_path(username, parent, old_name))?;
+    let new_p = safe_join_sandbox(base, &user_file_path(username, parent, new_name))?;
+
+    // 目标冲突预检：fs rename 会原子覆盖已存在目标，而随后的 DB UNIQUE 冲突回滚
+    // 只能把新文件恢复回旧名，被覆盖的旧目标内容已永久丢失。必须先拒绝。
+    let target_row_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE username = ? AND name = ? AND parent_path = ?)",
+    )
+    .bind(username)
+    .bind(new_name)
+    .bind(parent)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(true); // DB 异常时保守拒绝，绝不冒险覆盖
+    if target_row_exists || tokio::fs::try_exists(&new_p).await.unwrap_or(true) {
+        return Err(AppError::conflict("目标名称已存在，请先移动或删除"));
+    }
+
     tokio::fs::rename(&old_p, &new_p)
         .await
-        .map_err(|e| format!("文件系统重命名失败: {}", e))?;
+        .map_err(|e| AppError::internal_log("文件系统重命名", e))?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         let _ = std::fs::rename(&new_p, &old_p);
-        format!("事务失败: {}", e)
+        AppError::internal_log("开启事务", e)
     })?;
 
     sqlx::query("UPDATE files SET name = ? WHERE username = ? AND name = ? AND parent_path = ?")
@@ -513,7 +599,7 @@ pub(crate) async fn rename_core(
         .await
         .map_err(|e| {
             rollback_rename(&old_p, &new_p);
-            format!("数据库更新失败: {}", e)
+            AppError::internal_log("数据库更新", e)
         })?;
 
     update_child_parent_paths(
@@ -525,12 +611,12 @@ pub(crate) async fn rename_core(
     .await
     .map_err(|e| {
         rollback_rename(&old_p, &new_p);
-        format!("子路径更新失败: {}", e)
+        AppError::internal_log("子路径更新", e)
     })?;
 
     tx.commit().await.map_err(|e| {
         rollback_rename(&old_p, &new_p);
-        format!("提交失败: {}", e)
+        AppError::internal_log("提交事务", e)
     })?;
     Ok(())
 }
@@ -568,6 +654,7 @@ pub async fn rename_item(
             .await;
             (StatusCode::OK, "重命名成功").into_response()
         }
+        Err(AppError::Conflict(msg)) => (StatusCode::CONFLICT, msg).into_response(),
         Err(e) => {
             tracing::error!("[Files] 重命名失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "操作失败").into_response()
@@ -583,20 +670,35 @@ pub(crate) async fn move_core(
     src_parent: &str,
     dst_parent: &str,
     name: &str,
-) -> Result<(), String> {
+) -> AppResult<()> {
+    if src_parent == dst_parent {
+        return Ok(());
+    }
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let src_p = safe_join_sandbox(base, &user_file_path(username, src_parent, name))
-        .map_err(|e| e.to_string())?;
-    let dst_p = safe_join_sandbox(base, &user_file_path(username, dst_parent, name))
-        .map_err(|e| e.to_string())?;
+    let src_p = safe_join_sandbox(base, &user_file_path(username, src_parent, name))?;
+    let dst_p = safe_join_sandbox(base, &user_file_path(username, dst_parent, name))?;
+
+    // 目标冲突预检：同 rename_core，防止 fs rename 覆盖同名目标造成永久数据丢失
+    let target_row_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE username = ? AND name = ? AND parent_path = ?)",
+    )
+    .bind(username)
+    .bind(name)
+    .bind(dst_parent)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(true);
+    if target_row_exists || tokio::fs::try_exists(&dst_p).await.unwrap_or(true) {
+        return Err(AppError::conflict("目标目录存在同名文件，请先移动或删除"));
+    }
 
     tokio::fs::rename(&src_p, &dst_p)
         .await
-        .map_err(|e| format!("文件系统移动失败: {}", e))?;
+        .map_err(|e| AppError::internal_log("文件系统移动", e))?;
 
     let mut tx = pool.begin().await.map_err(|e| {
         let _ = std::fs::rename(&dst_p, &src_p);
-        format!("事务失败: {}", e)
+        AppError::internal_log("开启事务", e)
     })?;
 
     sqlx::query(
@@ -610,7 +712,7 @@ pub(crate) async fn move_core(
     .await
     .map_err(|e| {
         let _ = std::fs::rename(&dst_p, &src_p);
-        format!("数据库更新失败: {}", e)
+        AppError::internal_log("数据库更新", e)
     })?;
 
     update_child_parent_paths(
@@ -622,12 +724,12 @@ pub(crate) async fn move_core(
     .await
     .map_err(|e| {
         let _ = std::fs::rename(&dst_p, &src_p);
-        format!("子路径更新失败: {}", e)
+        AppError::internal_log("子路径更新", e)
     })?;
 
     tx.commit().await.map_err(|e| {
         let _ = std::fs::rename(&dst_p, &src_p);
-        format!("提交失败: {}", e)
+        AppError::internal_log("提交事务", e)
     })?;
     Ok(())
 }
@@ -655,6 +757,7 @@ pub async fn move_item(
             .await;
             (StatusCode::OK, "迁移路径成功").into_response()
         }
+        Err(AppError::Conflict(msg)) => (StatusCode::CONFLICT, msg).into_response(),
         Err(e) => {
             tracing::error!("[Files] 移动失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "操作失败").into_response()
@@ -684,6 +787,13 @@ pub async fn move_batch(
             Ok(p) => p,
             Err(_) => return (StatusCode::BAD_REQUEST, "包含非法路径").into_response(),
         };
+        // 目标冲突预检：fs rename 覆盖已存在目标即永久销毁其内容（同 rename_core/move_core）
+        if tokio::fs::try_exists(&dp).await.unwrap_or(true) {
+            for (_, s, d) in moved.iter().rev() {
+                let _ = tokio::fs::rename(d, s).await;
+            }
+            return (StatusCode::CONFLICT, format!("目标存在同名文件: {}", name)).into_response();
+        }
         if let Err(e) = tokio::fs::rename(&sp, &dp).await {
             tracing::error!("[Files] 批量移动 '{}' 失败: {}", name, e);
             for (_, s, d) in moved.iter().rev() {
@@ -700,11 +810,8 @@ pub async fn move_batch(
             for (_, s, d) in moved.iter().rev() {
                 let _ = std::fs::rename(d, s);
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("事务失败: {}", e),
-            )
-                .into_response();
+            tracing::error!("[Files] 批量移动事务失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
         }
     };
 
@@ -722,11 +829,8 @@ pub async fn move_batch(
             for (_, s, d) in moved.iter().rev() {
                 let _ = std::fs::rename(d, s);
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("更新失败: {}", e),
-            )
-                .into_response();
+            tracing::error!("[Files] 批量移动数据库更新失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
         }
         if let Err(e) = update_child_parent_paths(
             &mut tx,
@@ -739,22 +843,16 @@ pub async fn move_batch(
             for (_, s, d) in moved.iter().rev() {
                 let _ = std::fs::rename(d, s);
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("子路径更新失败: {}", e),
-            )
-                .into_response();
+            tracing::error!("[Files] 批量移动子路径更新失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
         }
     }
     if let Err(e) = tx.commit().await {
         for (_, s, d) in moved.iter().rev() {
             let _ = std::fs::rename(d, s);
         }
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("提交失败: {}", e),
-        )
-            .into_response();
+        tracing::error!("[Files] 批量移动提交失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
     }
 
     let _ = log_audit(
@@ -859,12 +957,11 @@ pub async fn delete_batch(
     Json(payload): Json<BatchDeleteRequest>,
 ) -> AppResult<(StatusCode, &'static str)> {
     let parent = user_dir_path(payload.current_path);
+    let mut failed: Vec<String> = Vec::new();
     for name in &payload.names {
-        if delete_to_trash(&pool, &session.username, &parent, name)
-            .await
-            .is_err()
-        {
-            continue;
+        if let Err(e) = delete_to_trash(&pool, &session.username, &parent, name).await {
+            tracing::warn!("[Files] 批量删除 '{}' 失败: {}", name, e);
+            failed.push(name.clone());
         }
     }
     let _ = update_user_used_mb(&pool, &session.username).await;
@@ -872,12 +969,24 @@ pub async fn delete_batch(
         &pool,
         &session.username,
         "delete_batch",
-        Some(&format!("{} items", payload.names.len())),
+        Some(&format!(
+            "{} ok, {} failed",
+            payload.names.len() - failed.len(),
+            failed.len()
+        )),
         None,
         None,
         None,
     )
     .await;
+    if !failed.is_empty() {
+        // 部分失败必须如实报告（此前一律"批量删除成功"掩盖失败）
+        return Err(AppError::bad_request(format!(
+            "{} 项删除失败: {}",
+            failed.len(),
+            failed.join(", ")
+        )));
+    }
     Ok((StatusCode::OK, "批量删除成功"))
 }
 
@@ -890,6 +999,8 @@ struct FileTableFragment {
     current_path: String,
     /// 全局搜索模式（path 为空 + 有搜索词）：结果跨目录，显示所在路径
     has_global_search: bool,
+    /// 当前搜索词（排序表头 hx-vals 需带上，否则点击排序即丢失搜索上下文）
+    search: String,
 }
 
 struct FileRowData {
@@ -967,6 +1078,8 @@ pub struct PreviewFragment {
     prev_name: String,
     next_path: String,
     next_name: String,
+    /// 媒体令牌（短时效 + 目录限定）：<img>/<video> 等无 Cookie 场景的 /api/media/ 访问凭证
+    media_token: String,
 }
 
 /// 画廊导航项（同目录相邻文件）
@@ -1007,6 +1120,7 @@ pub async fn drive_list_fragment(
         files,
         current_path: path,
         has_global_search,
+        search: params.get("search").cloned().unwrap_or_default(),
     })
 }
 
@@ -1430,6 +1544,13 @@ pub async fn drive_preview(
         None => (String::new(), String::new()),
     };
 
+    // 媒体类型签发短时效目录限定令牌（img/video/audio/iframe 无法带 Cookie/Authorization）
+    let media_token = if is_image || is_video || is_audio || is_pdf {
+        crate::handlers::utils::issue_media_token(&pool, &session.username, parent).await
+    } else {
+        String::new()
+    };
+
     Ok(AppTemplate(PreviewFragment {
         file_name: name,
         file_path,
@@ -1448,6 +1569,7 @@ pub async fn drive_preview(
         prev_name,
         next_path,
         next_name,
+        media_token,
     }))
 }
 
@@ -1470,10 +1592,13 @@ async fn gallery_neighbors(
     let Some(i) = rows.iter().position(|(n, _)| n == name) else {
         return (None, None);
     };
-    let prev = rows.get(i.wrapping_sub(1)).filter(|_| i > 0).map(|(n, p)| PreviewNav {
-        path: p.clone(),
-        name: n.clone(),
-    });
+    let prev = rows
+        .get(i.wrapping_sub(1))
+        .filter(|_| i > 0)
+        .map(|(n, p)| PreviewNav {
+            path: p.clone(),
+            name: n.clone(),
+        });
     let next = rows.get(i + 1).map(|(n, p)| PreviewNav {
         path: p.clone(),
         name: n.clone(),
