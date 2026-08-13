@@ -78,6 +78,9 @@
 
         <div class="flex items-center gap-2">
           <span class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded-md font-mono hidden sm:inline">{{ username }}</span>
+          <!-- 账号设置：修改密码入口（独立页不用 hx-boost，整页导航保证主题脚本加载） -->
+          <a href="/change-password" title="账号设置（修改密码）" aria-label="账号设置"
+             class="text-xs px-2 py-1 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition">🔑 账号设置</a>
           <button @click="dark = !dark" class="text-xs p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition" aria-label="切换主题" title="切换主题">🌓</button>
           <button hx-post="/api/logout" hx-target="body" class="text-xs text-gray-400 hover:text-red-600 dark:hover:text-red-400 font-medium transition px-2 py-1" aria-label="退出登录">退出</button>
           <!-- Mobile menu toggle -->
@@ -93,6 +96,8 @@
         <a href="{{ item.href }}" hx-boost="true" @click="open = false"
            class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}</a>
         {% endfor %}
+        <a href="/change-password" @click="open = false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800">🔑 账号设置（修改密码）</a>
       </div>
     </div>
   </nav>
