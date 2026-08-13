@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.7.3 (2026-08-13)
+
+### Changed
+- **修改密码改为弹出式**：导航「账号设置」不再跳独立页，改为 HTMX 片段注入模态框
+  （新路由 /account/password-form + components/password_change_form.html）；
+  成功即关闭弹窗 + Toast，无需离开当前页面。强制改密流程仍走独立页 /change-password
+- 移除「账号设置」按钮的 emoji 符号
+
 ## v1.7.2 (2026-08-13)
 
 ### Added

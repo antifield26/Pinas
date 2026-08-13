@@ -3019,9 +3019,7 @@ async fn test_hsts_only_under_https() {
         .await
         .unwrap();
     assert!(
-        resp.headers()
-            .get("strict-transport-security")
-            .is_some(),
+        resp.headers().get("strict-transport-security").is_some(),
         "HTTPS 接入应下发 HSTS"
     );
 }
@@ -3052,4 +3050,42 @@ async fn test_media_still_works_with_session_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// v1.7.3: 账号设置弹出式改密片段——登录用户 200 + 表单内容；未登录跳登录页
+#[tokio::test]
+async fn test_password_form_fragment() {
+    let (_pool, app) = test_app().await;
+    let (token, _) = register_and_login_with_username(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/account/password-form", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let html = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        html.contains("pwd-modal-form"),
+        "弹窗表单应包含修改密码表单"
+    );
+
+    // 未登录 → 重定向到登录页（非 API 路径语义）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/account/password-form")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_redirection(),
+        "未登录应重定向，实际: {}",
+        resp.status()
+    );
 }

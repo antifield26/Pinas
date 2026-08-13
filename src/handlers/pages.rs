@@ -84,7 +84,7 @@ pub async fn login_page() -> impl IntoResponse {
     with_public_cache(AppTemplate(LoginPage).into_response())
 }
 
-/// 修改密码页面模板（独立模板）
+/// 修改密码页面模板（独立模板，强制改密流程用）
 #[derive(Template)]
 #[template(path = "pages/change_password.html")]
 struct ChangePasswordPage;
@@ -93,4 +93,15 @@ struct ChangePasswordPage;
 #[tracing::instrument(skip_all)]
 pub async fn change_password_page() -> impl IntoResponse {
     with_public_cache(AppTemplate(ChangePasswordPage).into_response())
+}
+
+/// 弹出式修改密码表单片段（导航「账号设置」加载进模态框）
+#[derive(Template)]
+#[template(path = "components/password_change_form.html")]
+struct PasswordChangeFormFragment;
+
+/// GET /account/password-form — 修改密码弹窗片段（登录用户）
+#[tracing::instrument(skip_all)]
+pub async fn password_form_fragment() -> impl IntoResponse {
+    AppTemplate(PasswordChangeFormFragment)
 }

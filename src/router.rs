@@ -71,6 +71,11 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
 
     // --- 受保护路由（需认证）---
     let protected_routes = Router::new()
+        // 账号设置弹窗片段（登录用户）
+        .route(
+            "/account/password-form",
+            get(handlers::password_form_fragment),
+        )
         // HTMX 页面路由
         .route("/", get(handlers::home_page))
         .route("/drive", get(handlers::drive_page))
