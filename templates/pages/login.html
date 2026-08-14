@@ -9,11 +9,11 @@
   {% include "partials/theme_head.html" %}
 </head>
 <body class="bg-gray-100 dark:bg-gray-950 min-h-screen flex items-center justify-center p-4 transition-colors duration-200">
-  <button onclick="toggleDark()" class="fixed top-4 right-4 text-lg p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 transition" aria-label="切换主题" title="切换主题">🌓</button>
+  <button data-toggle-dark class="fixed top-4 right-4 text-lg p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 transition" aria-label="切换主题" title="切换主题">🌓</button>
   <div class="bg-white dark:bg-gray-900 p-8 rounded-2xl shadow-xl w-full max-w-md border border-gray-100 dark:border-gray-800 text-center">
     <h1 class="text-xl font-bold text-gray-800 dark:text-gray-200 mb-8">Antifield Cloud</h1>
 
-    <form id="login-form" class="space-y-4" onsubmit="return handleLogin(event)">
+    <form id="login-form" class="space-y-4">
       <label for="username" class="sr-only">用户名</label>
       <input type="text" id="username" placeholder="用户名" required autocomplete="username"
              class="input-field text-center text-lg">
@@ -30,88 +30,12 @@
     </form>
 
     <div class="pt-4 mt-4 border-t border-gray-100 dark:border-gray-800">
-      <button onclick="toggleRegister()"
+      <button data-toggle-register
               class="text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 font-medium transition"
               id="toggle-btn">没有账号？点击注册</button>
     </div>
   </div>
 
-  <script>
-    var isRegister = false;
-
-    function toggleRegister() {
-      isRegister = !isRegister;
-      document.getElementById('login-btn').textContent = isRegister ? '注册' : '验证并进入';
-      document.getElementById('toggle-btn').textContent = isRegister ? '已有账号？点击登录' : '没有账号？点击注册';
-      document.getElementById('login-error').classList.add('hidden');
-    }
-
-    async function handleLogin(e) {
-      e.preventDefault();
-      var username = document.getElementById('username').value.trim();
-      var password = document.getElementById('password').value;
-      var errEl = document.getElementById('login-error');
-      var btn = document.getElementById('login-btn');
-
-      if (!username || !password) {
-        errEl.textContent = '请填写用户名和密码';
-        errEl.classList.remove('hidden');
-        return false;
-      }
-
-      btn.textContent = '处理中...';
-      btn.disabled = true;
-      errEl.classList.add('hidden');
-
-      try {
-        var endpoint = isRegister ? '/api/register' : '/api/login';
-        var res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: username, password: password })
-        });
-        if (res.ok) {
-          var data = await res.json();
-          // token 由服务器通过 httpOnly Cookie 自动设置，客户端不再存储
-          if (data.must_change_pwd) {
-            window.location.href = '/change-password';
-          } else {
-            // redirect 校验（M12）：站内绝对路径照旧；绝对 URL 仅允许同注册域
-            // （dsh 统一登录回跳 https://pidsh.antifield.work/...）；
-            // 拒绝 //evil.com、javascript:、跨域、反斜杠形式等（开放重定向/XSS）
-            var params = new URLSearchParams(window.location.search);
-            var target = params.get('redirect') || '/';
-            if (target.charAt(0) === '/') {
-              if (target.charAt(1) === '/') target = '/';
-            } else {
-              try {
-                var u = new URL(target);
-                var host = window.location.hostname;
-                var regDomain = host.split('.').slice(-2).join('.');
-                var sameRegDomain = u.hostname === host ||
-                  u.hostname === regDomain ||
-                  u.hostname.endsWith('.' + regDomain);
-                if (u.protocol !== 'https:' || !sameRegDomain) target = '/';
-              } catch (e) {
-                target = '/';
-              }
-            }
-            window.location.href = target;
-          }
-        } else {
-          var text = await res.text();
-          errEl.textContent = text || '认证失败';
-          errEl.classList.remove('hidden');
-        }
-      } catch (e) {
-        errEl.textContent = '网络错误，请检查连接';
-        errEl.classList.remove('hidden');
-      }
-
-      btn.textContent = isRegister ? '注册' : '验证并进入';
-      btn.disabled = false;
-      return false;
-    }
-  </script>
+  <script src="/assets/app.js?v=1" data-cfasync="false"></script>
 </body>
 </html>

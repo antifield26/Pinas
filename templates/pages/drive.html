@@ -2,10 +2,7 @@
 {% block title %}Antifield Cloud — 云盘{% endblock %}
 
 {% block content %}
-<div class="space-y-6" id="drive-drop-zone"
-     ondragover="event.preventDefault(); document.getElementById('drop-overlay').style.display='flex';"
-     ondragleave="if(event.target===this) document.getElementById('drop-overlay').style.display='none';"
-     ondrop="event.preventDefault(); document.getElementById('drop-overlay').style.display='none'; App.handleDrop(event);">
+<div class="space-y-6" id="drive-drop-zone" data-drop-zone>
   <div class="flex items-center gap-2 flex-wrap">
     <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">云盘资源</h2>
     <div class="flex-1"></div>
@@ -13,7 +10,7 @@
             class="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1.5 rounded-lg transition">
       + 上传
     </button>
-    <button onclick="document.getElementById('upload-folder-input').click()"
+    <button data-click-target="upload-folder-input"
             class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 transition bg-indigo-50 dark:bg-indigo-900/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 px-3 py-1.5 rounded-lg">
       ⬆ 上传文件夹
     </button>
@@ -21,8 +18,7 @@
             class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 transition bg-indigo-50 dark:bg-indigo-900/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 px-3 py-1.5 rounded-lg">
       新建文件夹
     </button>
-    <input type="file" id="upload-folder-input" webkitdirectory multiple class="hidden"
-           onchange="App.handleFolderInput(this)">
+    <input type="file" id="upload-folder-input" webkitdirectory multiple class="hidden">
   </div>
 
   
@@ -36,7 +32,7 @@
   <div class="card overflow-hidden">
     <!-- 面包屑 + 搜索 -->
     <div class="p-4 border-b border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 flex items-center gap-3 flex-wrap">
-      <button onclick="App.goParent()" title="上级目录"
+      <button data-go-parent title="上级目录"
               class="shrink-0 text-xs font-medium px-2 py-1 rounded-lg border border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors">↑ 上级</button>
       <div id="drive-breadcrumbs" hx-get="/drive/breadcrumbs" hx-trigger="load" class="fade-me flex items-center gap-1 text-sm overflow-x-auto">
         <span class="text-gray-400">/</span>
@@ -59,100 +55,5 @@
   </div>
 </div>
 
-<script>
-  // 注意：base.html 的 window.App 在 body 末尾定义，本脚本位于 main 内(解析更早)——
-  // 全部逻辑必须等 DOMContentLoaded(App 已定义)后执行，否则 ReferenceError 导致整块失效
-  document.addEventListener('DOMContentLoaded', function() {
-  // 全局搜索切换：勾选时 path 置空（后端 path 空 + 有搜索词 = 全库 FTS 搜索），取消时还原目录浏览
-  document.getElementById('global-search')?.addEventListener('change', function() {
-    var pathEl = document.getElementById('drive-current-path');
-    var searchEl = document.querySelector('input[name="search"]');
-    if (this.checked) {
-      pathEl.dataset.savedPath = pathEl.value || '/';
-      pathEl.value = '';
-      if (searchEl && searchEl.value.trim()) {
-        htmx.ajax('GET', '/drive/list', { target: '#drive-file-list', values: { path: '', search: searchEl.value.trim() } });
-      }
-    } else {
-      pathEl.value = pathEl.dataset.savedPath || '/';
-      htmx.ajax('GET', '/drive/list', { target: '#drive-file-list', values: { path: pathEl.value } });
-      htmx.ajax('GET', '/drive/breadcrumbs', { target: '#drive-breadcrumbs', values: { path: pathEl.value } });
-    }
-  });
-
-  // ====== 上传（拖拽 / 文件夹选择器）统一入口 ======
-
-  // 拖拽递归遍历：webkitGetAsEntry 遍历目录（保留相对路径），不支持时降级仅文件
-  App.collectDropEntries = function(dataTransfer, cb) {
-    var items = dataTransfer.items;
-    var entries = [];
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      if (it && it.webkitGetAsEntry) entries.push(it.webkitGetAsEntry());
-    }
-    var anyDir = entries.some(function(e) { return e && e.isDirectory; });
-    if (!entries.length || !anyDir) {
-      // 降级：仅文件（无相对路径）
-      var out = [];
-      for (var j = 0; j < dataTransfer.files.length; j++) {
-        out.push({ file: dataTransfer.files[j], rel: dataTransfer.files[j].name });
-      }
-      cb(out);
-      return;
-    }
-    var collected = [];
-    var left = entries.length;
-    function walk(entry, base, done) {
-      if (entry.isFile) {
-        entry.file(function(f) { collected.push({ file: f, rel: base + f.name }); done(); }, done);
-      } else if (entry.isDirectory) {
-        var reader = entry.createReader();
-        var all = [];
-        function readAll() {
-          reader.readEntries(function(batch) {
-            if (batch.length) { all = all.concat(batch); readAll(); }
-            else if (!all.length) { done(); }
-            else {
-              var childLeft = all.length;
-              all.forEach(function(child) {
-                walk(child, base + entry.name + '/', function() { childLeft--; if (!childLeft) done(); });
-              });
-            }
-          }, done);
-        }
-        readAll();
-      } else { done(); }
-    }
-    entries.forEach(function(e) {
-      if (e) walk(e, '', function() { left--; if (!left) cb(collected); });
-      else { left--; if (!left) cb(collected); }
-    });
-  };
-
-  // 拖拽落盘：收集（含目录递归）→ 入队 → 开始
-  App.handleDrop = function(e) {
-    var path = (document.getElementById('drive-current-path')?.value || '/').replace(/\/+/g, '/');
-    App.collectDropEntries(e.dataTransfer, function(list) {
-      if (!list.length) return;
-      window.UploadQueue.enqueue(list, path);
-      window.UploadQueue.start();
-    });
-  };
-
-  // 文件夹选择器：webkitRelativePath 已含相对路径
-  App.handleFolderInput = function(input) {
-    var path = (document.getElementById('drive-current-path')?.value || '/').replace(/\/+/g, '/');
-    var list = [];
-    for (var i = 0; i < input.files.length; i++) {
-      var f = input.files[i];
-      list.push({ file: f, rel: f.webkitRelativePath || f.name });
-    }
-    input.value = '';
-    if (!list.length) return;
-    window.UploadQueue.enqueue(list, path);
-    window.UploadQueue.start();
-  };
-  });
-</script>
 {% include "components/upload_queue.html" %}
 {% endblock %}

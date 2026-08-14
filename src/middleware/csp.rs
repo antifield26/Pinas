@@ -19,14 +19,18 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     let headers = response.headers_mut();
 
     // Content-Security-Policy
-    // 注：保留 'unsafe-inline'(htmx 片段内联脚本/内联处理器必需) 与 'unsafe-eval'(Alpine 表达式编译必需)，
-    // 均为当前架构的硬依赖；XSS 防线以消除注入点 + Askama 转义为主。nonce 迁移列为后续改造。
-    // 已移除死条目：unpkg(资源已本地化)、static.cloudflareinsights.com(未使用)、ws:/wss:(无 WebSocket 路由)。
+    // script-src（H8 收敛）：'unsafe-inline' 已移除——全部业务脚本外置于 /assets/app.js，
+    // 内联事件处理器全部 data-* 委托；仅两处 head 主题预涂脚本（防闪白必需）内联，
+    // 经 sha256 哈希放行（哈希 = 脚本逐字节精确值，模板改动需同步更新并跑回归测试）。
+    // 'unsafe-eval' 保留：Alpine x-data 表达式编译与 htmx hx-on 求值依赖。
+    // style-src 'unsafe-inline' 保留：动画延迟/进度条宽度等内联样式依赖。
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'self'; \
-             script-src 'self' 'unsafe-inline' 'unsafe-eval'; \
+             script-src 'self' 'unsafe-eval' \
+               'sha256-e9AA0UHheOX1XAtrSv68GkyqcYbpzWeof+Mi19hqhkE=' \
+               'sha256-fUQGwXEX59qhgqt5aIHkIEfspFhSo+izvQWS1OC/K5s='; \
              style-src 'self' 'unsafe-inline'; \
              img-src 'self' data: blob:; \
              media-src 'self' blob:; \

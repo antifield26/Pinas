@@ -1,10 +1,10 @@
-<div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-md shadow-2xl mx-auto" onclick="event.stopPropagation()">
+<div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-md shadow-2xl mx-auto" data-modal-root>
   <div class="flex justify-between items-center p-5 border-b border-gray-100 dark:border-gray-800">
     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100">AI 设置</h3>
-    <button onclick="App.closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none" aria-label="关闭">&times;</button>
+    <button data-close-modal class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none" aria-label="关闭">&times;</button>
   </div>
   <div class="p-5">
-    <form id="settings-form" onsubmit="return App.saveSettings(event)" class="space-y-4">
+    <form id="settings-form" class="space-y-4">
       <div class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3 text-xs text-amber-700 dark:text-amber-300">
         此处可配置个人 DeepSeek API。不配置则使用服务器全局设置。
       </div>
@@ -26,7 +26,7 @@
         <div>
           <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">Temperature ({{ temperature }})</label>
           <input type="range" id="settings-temperature" min="0" max="2" step="0.1" value="{{ temperature }}"
-                 class="w-full accent-indigo-600" oninput="this.previousElementSibling.textContent='Temperature ('+this.value+')'">
+                 class="w-full accent-indigo-600" data-range-label>
         </div>
         <div>
           <label class="block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">Max Tokens</label>
@@ -40,29 +40,8 @@
       </div>
       <div class="flex gap-2 pt-2">
         <button type="submit" class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-lg text-sm font-medium transition">保存设置</button>
-        <button type="button" onclick="App.closeModal()" class="px-4 py-2 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm font-medium transition" aria-label="取消">取消</button>
+        <button type="button" data-close-modal class="px-4 py-2 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm font-medium transition" aria-label="取消">取消</button>
       </div>
     </form>
   </div>
 </div>
-<script>
-App.saveSettings = async function(e) {
-  e.preventDefault();
-  const body = {
-    deepseek_api_key: document.getElementById('settings-apikey').value.trim() || null,
-    deepseek_api_base: document.getElementById('settings-apibase').value.trim() || null,
-    deepseek_model: document.getElementById('settings-model').value.trim() || null,
-    temperature: parseFloat(document.getElementById('settings-temperature').value),
-    max_tokens: parseInt(document.getElementById('settings-max-tokens').value)
-  };
-  try {
-    const res = await fetch('/api/agent/settings', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin', body: JSON.stringify(body)
-    });
-    if (res.ok) { App.closeModal(); App.showToast('设置已保存', 'success'); }
-    else { App.showToast('保存失败', 'error'); }
-  } catch(e) { App.showToast('网络错误', 'error'); }
-  return false;
-};
-</script>

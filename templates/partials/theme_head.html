@@ -1,13 +1,8 @@
-{# 独立页（登录/改密/分享）暗色模式脚本：head 内同步设置防闪白 + toggleDark 全局函数 #}
+{# 独立页（登录/改密/分享）暗色模式预涂脚本：head 内同步设置防闪白（toggleDark 已外置到 assets/app.js） #}
 <script>
   (function() {
     var dark = localStorage.getItem('theme') === 'dark' ||
       (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches);
     if (dark) document.documentElement.classList.add('dark');
   })();
-  function toggleDark() {
-    var html = document.documentElement;
-    html.classList.toggle('dark');
-    localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
-  }
 </script>

@@ -17,6 +17,12 @@ use crate::handlers::utils::{
 #[derive(Deserialize)]
 pub struct CheckQuery {
     pub identifier: String,
+    /// 秒传目标校验（L5 修复）：客户端声明本次上传的目标文件路径。
+    /// 缺省时保持兼容旧行为（按 identifier 命中即 exists）
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub parent_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,15 +86,28 @@ pub async fn check_chunk(
     let identifier = &query.identifier;
     validate_identifier(identifier)?;
 
-    // 检查文件是否已完全上传（通过文件的 content identifier 匹配）
-    let file_exists =
-        sqlx::query("SELECT 1 FROM files WHERE username = ? AND identifier = ? LIMIT 1")
-            .bind(username)
-            .bind(identifier)
-            .fetch_optional(&pool)
-            .await
-            .unwrap_or(None)
-            .is_some();
+    // 检查文件是否已完全上传（通过文件的 content identifier 匹配）。
+    // L5 修复：identifier 只证明「内容曾在某路径存在过」——若目标路径不同，
+    // 历史实现报 exists=true 让客户端跳过上传，结果目标文件从未被创建（假秒传）。
+    // 客户端声明 file_name/parent_path 时必须在同路径命中才算秒传，否则走正常分片流程
+    let file_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM files
+            WHERE username = ? AND identifier = ?
+              AND (? IS NULL OR name = ?)
+              AND (? IS NULL OR parent_path = ?)
+            LIMIT 1
+        )",
+    )
+    .bind(username)
+    .bind(identifier)
+    .bind(&query.file_name)
+    .bind(&query.file_name)
+    .bind(&query.parent_path)
+    .bind(&query.parent_path)
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(false);
 
     if file_exists {
         return Ok(Json(CheckResponse {

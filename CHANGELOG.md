@@ -1,5 +1,57 @@
 # Changelog
 
+## v1.8.4 (2026-08-14)
+
+### Security（遗留审计项收口）
+- **CSP 全收敛（H8）**：script-src 移除 'unsafe-inline'——全部内联脚本外置到 assets/app.js
+  （hx-boost 导航天然只执行一次，H7 守卫语义固化）；全部内联事件处理器（onclick/onsubmit/
+  onchange/oninput/onerror 等约 30 处）改为 data-* 属性 + document 事件委托；仅保留两处
+  head 主题预涂脚本（防闪白必需），经 CSP sha256 哈希放行（'unsafe-eval' 保留：Alpine
+  表达式与 htmx hx-on 依赖）
+- **Argon2 参数上调**：t=2（OWASP 下限）→ t=3（RPi 4 核 ~150ms），爆破成本提升 50%；
+  验证参数随哈希串自描述，旧哈希不受影响
+- **api_base 深度 SSRF 校验**：统一 validate_api_base（https-only + URL 解析 + 拒 IPv4/IPv6
+  字面量、私网/链路本地前缀、.local/.internal、nip.io/sslip.io/xip.io/localtest.me 重绑定后缀），
+  写入与读取（resolve_agent_config）双侧执行；残余重绑定风险文档化
+- **WebDAV 认证缓存即时失效**：改密/管理员重置后旧凭证不再命中 60s 窗口
+- **媒体令牌前缀规范化**：签发时去空段/拒绝 ..（路径限定校验的歧义面）
+- **dsh 反代资源治理**：WS 并发上限 32（Semaphore）+ 上游 TCP 连接 3s 超时 +
+  HTTP 读空闲 600s 上限（SSE keep-alive 不受影响）
+
+### Fixed（数据与配额精度）
+- **配额原子化（M3/M4）**：新增 check_and_adjust_quota_tx（事务内预检+增量调整），
+  dav PUT / 回收站恢复 / 编辑器保存接入——消除「先检查后写」TOCTOU；
+  update_user_used_mb 事务化（先空写抢锁再 SUM），全量重算与增量调整不再互相覆盖漂移；
+  dav PUT 覆盖按 CEIL 差值计（旧大小释放）
+- **PROPFIND 精确字节（M6）**：getcontentlength 用磁盘真实长度，不再 size_mb 反算
+  （WebDAV-PUT 文件被放大最多 ~1MiB，rclone 校验卡 EOF）
+- **COPY 记账一致（L3）**：逐文件 CEIL 后求和，与 upload 路径口径一致
+- **假秒传修复（L5）**：check 携带目标 file_name/parent_path，内容曾存在于其他路径时
+  不再报 exists（历史上传"成功"但目标文件从未创建）
+- **列表 reconcile 限流（L7）**：join_all（1000 行目录瞬时千并发 stat）→ buffer_unordered(64)
+- **sqlite:// 路径解析（L9）**：strip 后去前导 /，孤儿 WAL 清理路径判断失准修复
+- **迁移降级检测（L10）**：数据库版本高于二进制时显式报错退出，不再静默运行
+- **FTS rebuild 失败可观测（L11）**：v7/v9 迁移 rebuild 失败改 warn 日志
+- **chunk rows 清理对齐（M12）**：孤儿分片行清理阈值随 PINAS_TEMP_CLEANUP_HOURS，
+  不再固定 -1 day
+- **对话历史清理优化（L12）**：相关子查询 O(rows×500) → 窗口函数 ROW_NUMBER 单次排序
+
+### Fixed（AI 与系统集成）
+- **search_files LIKE 转义（L4）**：%/_ 不再意外全匹配/误匹配
+- **AI 参数 clamp 统一（L2）**：resolve 侧 clamp temperature/max_tokens，DB 异常值不直传上游
+- **每日配额本地日界（L5）**：UTC（北京早 8 点重置）→ Local；键由清理任务定期回收
+- **系统提示缓存主动失效（L9）**：待办/链接写路径调用 invalidate_prompt_cache，
+  30s TTL 内改完待办立即问 AI 不再拿到旧上下文
+- **MC 状态缓存与退避（I4）**：成功 15s 缓存；失败指数退避（4s 起封顶 5min），
+  宕机期不再每 5s 一次 ~7s 的无意义 TCP 握手
+
+### Fixed（运维）
+- 日志轮转加 30 份上限（异常日不再无限堆积）；审计保留 90 天说明补全
+
+### Tests
+- 集成测试 70 → 76(+6)：超配额覆盖保旧文件、PROPFIND 精确字节、假秒传、改密后缓存失效、
+  api_base 深度校验、CSP/无内联处理器回归
+
 ## v1.8.3 (2026-08-14)
 
 ### Fixed（前端与运维卫生）

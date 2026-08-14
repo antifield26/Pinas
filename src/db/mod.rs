@@ -16,7 +16,11 @@ use crate::core::{generate_random_password, hash_password};
 pub async fn create_pool(database_url: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
     // 清理孤儿 WAL 文件：如果主 DB 文件不存在但 -wal/-shm 残留，
     // SQLite 会从 WAL 恢复旧数据库，导致"删除 .db 重建"无效
-    let db_path = database_url.strip_prefix("sqlite:").unwrap_or(database_url);
+    // L9 修复：strip 后去前导 /（"sqlite://path" 会得到 "//path" 导致路径判断失准）
+    let db_path = database_url
+        .strip_prefix("sqlite:")
+        .unwrap_or(database_url)
+        .trim_start_matches('/');
     if !std::path::Path::new(db_path).exists() {
         let wal = format!("{}-wal", db_path);
         let shm = format!("{}-shm", db_path);

@@ -22,7 +22,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. 初始化日志（文件 + 控制台）
     tokio::fs::create_dir_all(LOGS_DIR).await?;
-    let file_appender = tracing_appender::rolling::daily(LOGS_DIR, "app.log");
+    // L7：按天轮转 + 最多保留 30 份（历史无上限，异常日可无限堆积；tracing-appender 0.2
+    // 无按大小轮转，以份数上限兜底磁盘占用）
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("app.log")
+        .max_log_files(30)
+        .build(LOGS_DIR)
+        .expect("构建日志滚动器失败");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::registry()
         .with(

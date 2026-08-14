@@ -69,6 +69,7 @@ pub async fn create_link(
         .bind(&payload.icon)
         .execute(&pool)
         .await?;
+    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -123,6 +124,7 @@ pub async fn update_link(
         return Err(AppError::not_found("记录不存在或无权操作"));
     }
 
+    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -153,6 +155,7 @@ pub async fn delete_link(
         return Err(AppError::not_found("记录不存在或无权操作"));
     }
 
+    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -251,6 +254,7 @@ pub async fn links_create_fragment(
         .execute(&pool)
         .await;
 
+    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -293,6 +297,7 @@ pub async fn links_update_fragment(
     .bind(&title).bind(&url).bind(&icon).bind(id).bind(&session.username)
     .execute(&pool).await;
 
+    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -320,6 +325,7 @@ pub async fn links_delete_fragment(
         .execute(&pool)
         .await;
 
+    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,

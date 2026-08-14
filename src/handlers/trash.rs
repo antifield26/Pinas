@@ -65,19 +65,6 @@ pub async fn restore_trash(
 
     // 配额预检：恢复大文件同样计入配额，超限拒绝（此前恢复可无限制撑爆配额）
     let src_size: u64 = dir_size(&src).await;
-    let (current_used, quota): (i64, i64) =
-        sqlx::query_as("SELECT used_mb, quota_mb FROM users WHERE username = ?")
-            .bind(username)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| AppError::internal_log("查询用户配额", e))?
-            .ok_or_else(|| AppError::not_found("用户不存在"))?;
-    if current_used + crate::handlers::utils::bytes_to_mb_ceil(src_size) > quota {
-        return Err(AppError::forbidden(format!(
-            "存储空间不足，配额 {} MB，已使用 {} MB",
-            quota, current_used
-        )));
-    }
 
     if let Some(p) = dst.parent() {
         let _ = tokio::fs::create_dir_all(p).await;
@@ -85,6 +72,24 @@ pub async fn restore_trash(
     tokio::fs::rename(&src, &dst)
         .await
         .map_err(|e| AppError::internal_log("回收站还原", e))?;
+
+    // M3/M4 修复：配额预检 + DB 登记 + trash 行删除进同一写事务（写锁串行化并发，
+    // 消除 TOCTOU；失败整体回滚并还原物理文件，不再事后全量重算与增量互相覆盖）
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::internal_log("开启还原事务", e))?;
+    if let Err(e) = crate::handlers::utils::check_and_adjust_quota_tx(
+        &mut tx,
+        username,
+        crate::handlers::utils::bytes_to_mb_ceil(src_size),
+    )
+    .await
+    {
+        drop(tx);
+        let _ = std::fs::rename(&dst, &src); // 回滚物理还原
+        return Err(e);
+    }
 
     let path_obj = std::path::Path::new(&orig_path);
     let name = path_obj
@@ -103,20 +108,46 @@ pub async fn restore_trash(
         parent
     };
 
-    if dst.is_dir() {
-        let _ = restore_dir_recursive(&pool, username, &dst, &parent_cleaned).await;
+    let db_result = if dst.is_dir() {
+        restore_dir_recursive_tx(&mut tx, username, &dst, &parent_cleaned).await
     } else {
         let meta = dst.metadata().map(|m| m.len()).unwrap_or(0);
         let size_mb = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
-        let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)")
-            .bind(username).bind(&name).bind(&parent_cleaned).bind(size_mb).execute(&pool).await;
+        sqlx::query(
+            "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)",
+        )
+        .bind(username)
+        .bind(&name)
+        .bind(&parent_cleaned)
+        .bind(size_mb)
+        .execute(&mut *tx)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("文件行恢复失败: {e}"))
+    };
+    if let Err(e) = db_result {
+        drop(tx);
+        let _ = std::fs::rename(&dst, &src);
+        tracing::error!("[Trash] 还原登记失败: {}", e);
+        return Err(AppError::internal("还原失败，请稍后重试"));
     }
 
-    let _ = sqlx::query("DELETE FROM trash WHERE id = ?")
+    if let Err(e) = sqlx::query("DELETE FROM trash WHERE id = ?")
         .bind(id)
-        .execute(&pool)
-        .await;
-    let _ = update_user_used_mb(&pool, username).await;
+        .execute(&mut *tx)
+        .await
+    {
+        drop(tx);
+        let _ = std::fs::rename(&dst, &src);
+        tracing::error!("[Trash] 回收行删除失败: {}", e);
+        return Err(AppError::internal("还原失败，请稍后重试"));
+    }
+    if let Err(e) = tx.commit().await {
+        let _ = std::fs::rename(&dst, &src);
+        tracing::error!("[Trash] 还原事务提交失败: {}", e);
+        return Err(AppError::internal("还原失败，请稍后重试"));
+    }
+
     let _ = log_audit(
         &pool,
         username,
@@ -152,9 +183,9 @@ async fn dir_size(path: &std::path::Path) -> u64 {
     total
 }
 
-// 递归恢复目录辅助函数
-async fn restore_dir_recursive(
-    pool: &sqlx::SqlitePool,
+// 递归恢复目录辅助函数（事务内变体：与配额调整/trash 行删除同一事务提交）
+async fn restore_dir_recursive_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     username: &str,
     dir_path: &std::path::Path,
     parent_path: &str,
@@ -169,7 +200,7 @@ async fn restore_dir_recursive(
             .bind(username)
             .bind(&dir_name)
             .bind(parent_path)
-            .execute(pool)
+            .execute(&mut **tx)
             .await;
 
     let new_parent = if parent_path.is_empty() {
@@ -182,7 +213,7 @@ async fn restore_dir_recursive(
             let p = entry.path();
             let n = entry.file_name().to_string_lossy().into_owned();
             if p.is_dir() {
-                Box::pin(restore_dir_recursive(pool, username, &p, &new_parent)).await?;
+                Box::pin(restore_dir_recursive_tx(tx, username, &p, &new_parent)).await?;
             } else {
                 let m = p.metadata().map(|m| m.len()).unwrap_or(0);
                 let size_mb = m as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
@@ -191,7 +222,7 @@ async fn restore_dir_recursive(
                     .bind(&n)
                     .bind(&new_parent)
                     .bind(size_mb)
-                    .execute(pool)
+                    .execute(&mut **tx)
                     .await;
             }
         }

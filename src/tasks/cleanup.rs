@@ -29,7 +29,11 @@ pub fn spawn_all(
     );
     spawn_session_cleanup(pool.clone(), cancel.child_token());
     spawn_conversation_cleanup(pool.clone(), cancel.child_token());
-    spawn_chunk_rows_cleanup(pool.clone(), cancel.child_token());
+    spawn_chunk_rows_cleanup(
+        pool.clone(),
+        config.temp_cleanup_hours,
+        cancel.child_token(),
+    );
     spawn_audit_cleanup(pool.clone(), cancel.child_token());
     spawn_auto_backup(pool.clone(), cancel.child_token());
     spawn_wal_checkpoint(pool.clone(), cancel.child_token());
@@ -51,6 +55,8 @@ fn spawn_session_cleanup(pool: SqlitePool, cancel: CancellationToken) {
                     // 过期媒体令牌一并清理（短时效路径限定令牌，防表无限增长）
                     let _ = sqlx::query("DELETE FROM media_tokens WHERE expires_at <= datetime('now')")
                         .execute(&pool).await;
+                    // AI 每日配额键清理（只保留本地时区今天）
+                    crate::handlers::clean_agent_daily().await;
                 }
             }
         }
@@ -67,11 +73,15 @@ fn spawn_conversation_cleanup(pool: SqlitePool, cancel: CancellationToken) {
             tokio::select! {
                 _ = cancel.cancelled() => { tracing::info!("对话历史清理任务已停止"); break; }
                 _ = interval.tick() => {
+                    // L12 修复：相关子查询 LIMIT 500 是 O(rows×500) 的逐行扫描；
+                    // 窗口函数一次排序即可算出每对话的保留边界
                     let r = sqlx::query(
-                        "DELETE FROM conversation_messages WHERE id NOT IN (
-                            SELECT id FROM conversation_messages AS m
-                            WHERE m.conversation_id = conversation_messages.conversation_id
-                            ORDER BY id DESC LIMIT ?
+                        "DELETE FROM conversation_messages WHERE id IN (
+                            SELECT id FROM (
+                                SELECT id,
+                                    ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY id DESC) AS rn
+                                FROM conversation_messages
+                            ) WHERE rn > ?
                         )",
                     )
                     .bind(CONV_MESSAGE_CAP)
@@ -86,17 +96,23 @@ fn spawn_conversation_cleanup(pool: SqlitePool, cancel: CancellationToken) {
     });
 }
 
-/// 定期清理超 24h 的孤儿分片 DB 行（临时文件由 spawn_temp_chunk_cleanup 清理，行此前无清理）
-fn spawn_chunk_rows_cleanup(pool: SqlitePool, cancel: CancellationToken) {
+/// 定期清理过期孤儿分片 DB 行。阈值与临时文件清扫（PINAS_TEMP_CLEANUP_HOURS）对齐——
+/// M12 修复：历史固定 '-1 day'，管理员调短文件清扫周期后已删分片仍被计入 5GB 上限
+fn spawn_chunk_rows_cleanup(pool: SqlitePool, hours: u64, cancel: CancellationToken) {
     tokio::spawn(async move {
+        let hours = hours.max(1);
+        let modifier = format!("-{} hours", hours);
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => { tracing::info!("分片记录清理任务已停止"); break; }
                 _ = interval.tick() => {
                     if let Err(e) = sqlx::query(
-                        "DELETE FROM upload_chunks WHERE created_at < datetime('now', '-1 day')",
-                    ).execute(&pool).await
+                        "DELETE FROM upload_chunks WHERE created_at < datetime('now', ?)",
+                    )
+                    .bind(&modifier)
+                    .execute(&pool)
+                    .await
                     {
                         tracing::error!("清理孤儿分片记录失败: {}", e);
                     }

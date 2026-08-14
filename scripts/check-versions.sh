@@ -29,8 +29,8 @@ for entry in $TEMPLATE_VERSIONS; do
   fi
 done
 
-# SW 注册版本号一致性（base.html 的 ?v= 与 sw.js 头注释版本号）
-SW_REG="$(grep -oE "sw\.js\?v=[0-9]+" "$PROJECT_DIR/templates/base.html" | head -1)"
+# SW 注册版本号一致性（app.js 的 ?v= 与 sw.js 头注释版本号；主脚本已外置到 assets/app.js）
+SW_REG="$(grep -oE "sw\.js\?v=[0-9]+" "$PROJECT_DIR/assets/app.js" | head -1)"
 SW_HEADER="$(head -3 "$PROJECT_DIR/static/sw.js" | grep -oE 'v[0-9]+' | head -1 | tr -d 'v')"
 echo "==> SW 注册: $SW_REG ; SW 文件头版本: v$SW_HEADER"
 if [ "$SW_REG" != "sw.js?v=${SW_HEADER}" ]; then

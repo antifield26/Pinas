@@ -2,15 +2,15 @@
 <div id="batch-toolbar" class="hidden px-4 py-2 bg-indigo-50 dark:bg-indigo-900/20 border-b border-indigo-100 dark:border-indigo-800 flex items-center gap-2">
   <span id="batch-count" class="text-xs text-indigo-700 dark:text-indigo-300 font-medium">已选 0 项</span>
   <div class="flex-1"></div>
-  <button onclick="batchDelete()"
+  <button data-batch-delete
           class="text-xs bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 px-3 py-1 rounded hover:bg-red-100 dark:hover:bg-red-900/50 transition">删除选中</button>
-  <button onclick="batchDownload()"
+  <button data-batch-download
           class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-3 py-1 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">下载选中</button>
 </div>
 <table class="w-full text-left border-collapse">
   <thead>
     <tr class="bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-      {% if !has_global_search %}<th class="p-4 w-8"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)" class="rounded"></th>{% endif %}
+      {% if !has_global_search %}<th class="p-4 w-8"><input type="checkbox" id="select-all" class="rounded"></th>{% endif %}
       <th class="p-4">
         <a href="#" hx-get="/drive/list" hx-target="#drive-file-list"
            hx-vals='{"path":{{ current_path | json }},"sort_by":"name_desc","search":{{ search | json }}}'
@@ -31,7 +31,7 @@
     {% for f in files %}
     <tr class="animate-fade-in hover:bg-gray-50 dark:hover:bg-gray-800/50 transition"
         style="animation-delay: {% if loop.index0 > 8 %}240ms{% else %}{{ loop.index0 * 30 }}ms{% endif %};">
-      {% if !has_global_search %}<td class="p-2"><input type="checkbox" class="file-checkbox rounded" value="{{ f.name }}" onchange="updateBatchToolbar()"></td>{% endif %}
+      {% if !has_global_search %}<td class="p-2"><input type="checkbox" class="file-checkbox rounded" value="{{ f.name }}"></td>{% endif %}
       <td class="p-4">
         <div class="flex items-center gap-3">
           <span class="text-xs text-gray-400 w-8 shrink-0">{% if f.is_dir %}📁{% else %}📄{% endif %}</span>
@@ -66,57 +66,3 @@
     {% endif %}
   </tbody>
 </table>
-<script>
-  function toggleSelectAll(el) {
-    document.querySelectorAll('.file-checkbox').forEach(cb => { cb.checked = el.checked; });
-    updateBatchToolbar();
-  }
-  function updateBatchToolbar() {
-    const checked = document.querySelectorAll('.file-checkbox:checked');
-    const toolbar = document.getElementById('batch-toolbar');
-    const count = document.getElementById('batch-count');
-    if (checked.length > 0) {
-      toolbar.classList.remove('hidden');
-      count.textContent = '已选 ' + checked.length + ' 项';
-      document.getElementById('select-all').checked = (checked.length === document.querySelectorAll('.file-checkbox').length);
-    } else {
-      toolbar.classList.add('hidden');
-      document.getElementById('select-all').checked = false;
-    }
-  }
-  async function batchDelete() {
-    var names = Array.from(document.querySelectorAll('.file-checkbox:checked')).map(cb => cb.value);
-    if (!names.length || !confirm('确定删除选中的 ' + names.length + ' 个文件？')) return;
-    var path = document.getElementById('drive-current-path')?.value || '/';
-    var res = await fetch('/api/files/delete_batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({ names: names, current_path: path })
-    });
-    if (res.ok) {
-      htmx.ajax('GET', '/drive/list', { target: '#drive-file-list', values: { path: path } });
-    } else {
-      alert('批量删除失败');
-    }
-  }
-  function batchDownload() {
-    var names = Array.from(document.querySelectorAll('.file-checkbox:checked')).map(cb => cb.value);
-    if (!names.length) { alert('请先选择文件'); return; }
-    var path = document.getElementById('drive-current-path')?.value || '/';
-    var form = document.createElement('form');
-    form.method = 'POST';
-    form.action = '/api/files/download_zip';
-    names.forEach(function(n) {
-      var inp = document.createElement('input');
-      inp.type = 'hidden'; inp.name = 'names'; inp.value = n;
-      form.appendChild(inp);
-    });
-    var inp2 = document.createElement('input');
-    inp2.type = 'hidden'; inp2.name = 'current_path'; inp2.value = path;
-    form.appendChild(inp2);
-    document.body.appendChild(form);
-    form.submit();
-    form.remove();
-  }
-</script>

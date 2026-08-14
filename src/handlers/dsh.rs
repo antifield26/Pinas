@@ -29,10 +29,13 @@ use std::{sync::LazyLock, time::Duration};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 
-/// dsh 上游 HTTP 客户端：3s 连接超时，不设整体超时（长连接/WS 透传）
+/// dsh 上游 HTTP 客户端：3s 连接超时；read_timeout 600s 为读间空闲上限
+/// （M5：历史无读超时，上游挂起会无限占连接；SSE 的 keep-alive 帧使正常长流不受影响），
+/// 不设整体超时（长任务/大附件透传）
 static DSH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
+        .read_timeout(Duration::from_secs(600))
         .build()
         .expect("Failed to build dsh proxy client")
 });
@@ -303,6 +306,11 @@ struct WsHandshakeCtx {
     sec_ws_version: Option<String>,
 }
 
+/// WebSocket 并发上限（M3）：防 admin 会话被误用/失陷后开大量 WS 耗尽上游连接与 fd。
+/// 事件通道正常仅 2 条/标签页，32 已远高于实际需求
+static DSH_WS_SEM: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(32));
+
 /// WebSocket 双向泵：浏览器 ↔ dsh 上游，仅放行事件下行路径
 async fn dsh_ws_loop(
     socket: WebSocket,
@@ -316,6 +324,12 @@ async fn dsh_ws_loop(
         warn!("[dsh] WS 路径被拒: {}", path);
         return;
     }
+
+    // 并发上限：满员即关（浏览器已收 101，直接断连并提示重试）
+    let Ok(_permit) = DSH_WS_SEM.try_acquire() else {
+        warn!("[dsh] WS 并发已达上限，拒绝新连接: {}", path);
+        return;
+    };
 
     // 上游握手：Host 必须为公网名（栅栏），Origin/sec-fetch 透传（Origin.host == Host.host 校验）
     let upstream_url = format!("ws://{}{}", upstream_addr, path);
@@ -349,10 +363,20 @@ async fn dsh_ws_loop(
         return;
     };
 
-    let tcp = match tokio::net::TcpStream::connect(&upstream_addr).await {
-        Ok(t) => t,
-        Err(e) => {
+    // M3：上游 TCP 连接必须带超时——历史无超时，SYN drop 过滤时挂到 OS 级超时
+    let tcp = match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&upstream_addr),
+    )
+    .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             warn!("[dsh] WS 上游连接失败 {}: {}", upstream_addr, e);
+            return;
+        }
+        Err(_) => {
+            warn!("[dsh] WS 上游连接超时: {}", upstream_addr);
             return;
         }
     };

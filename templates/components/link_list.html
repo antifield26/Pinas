@@ -18,10 +18,8 @@
     </div>
     <div class="flex gap-0.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition">
       <button hx-get="/links/form/{{ link.id }}" hx-target="#modal-container" hx-swap="innerHTML"
-              onclick="event.preventDefault()"
               class="w-6 h-6 flex items-center justify-center rounded text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/40 text-xs" title="编辑">编辑</button>
       <button hx-delete="/links/{{ link.id }}" hx-target="#links-container" hx-swap="innerHTML"
-              onclick="event.preventDefault()"
               hx-confirm="确定删除？"
               class="w-6 h-6 flex items-center justify-center rounded text-red-600 hover:bg-red-50 dark:hover:bg-red-900/40 text-xs" title="删除">删除</button>
     </div>

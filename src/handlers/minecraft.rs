@@ -98,7 +98,7 @@ fn strip_mc_colors(text: &str) -> String {
 
 // ====== 响应结构体 ======
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct McServerStatus {
     pub online: bool,
     pub version: Option<String>,
@@ -279,6 +279,46 @@ async fn query_mc_server(host: &str, port: u16) -> McServerStatus {
     }
 }
 
+// ====== 状态缓存与失败退避（I4 修复） ======
+// 历史实现每次轮询都新建 TCP 握手（home 页 5s 轮询）：MC 宕机时每次挂 ~7s 且无意义重试。
+// 缓存成功结果 15s；失败进入指数退避（4s 起 ×2，封顶 5min），退避期内直接回缓存
+struct McCacheEntry {
+    at: std::time::Instant,
+    hold: std::time::Duration,
+    status: McServerStatus,
+}
+
+static MC_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<McCacheEntry>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+static MC_FAIL_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+async fn query_mc_cached(host: &str, port: u16) -> McServerStatus {
+    {
+        let cache = MC_CACHE.lock().await;
+        if let Some(entry) = cache.as_ref()
+            && entry.at.elapsed() < entry.hold
+        {
+            return entry.status.clone();
+        }
+    }
+    let status = query_mc_server(host, port).await;
+    let (hold, streak_reset) = if status.online {
+        MC_FAIL_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
+        (std::time::Duration::from_secs(15), true)
+    } else {
+        let streak = MC_FAIL_STREAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let secs = (4u64).saturating_mul(1u64 << streak.min(7)).min(300);
+        (std::time::Duration::from_secs(secs), false)
+    };
+    let _ = streak_reset;
+    *MC_CACHE.lock().await = Some(McCacheEntry {
+        at: std::time::Instant::now(),
+        hold,
+        status: status.clone(),
+    });
+    status
+}
+
 // ====== Axum Handler ======
 
 pub async fn get_minecraft_status(
@@ -294,7 +334,7 @@ pub async fn get_minecraft_status(
         .unwrap_or_else(|_| "25565".into())
         .parse()
         .unwrap_or(25565);
-    let status = query_mc_server(&host, port).await;
+    let status = query_mc_cached(&host, port).await;
     let json = serde_json::to_value(&status).unwrap_or(serde_json::json!({
         "online": false,
         "error": "序列化失败"
@@ -333,7 +373,7 @@ pub async fn minecraft_status_fragment(
         .parse()
         .unwrap_or(25565);
 
-    match query_mc_server(&host, port).await {
+    match query_mc_cached(&host, port).await {
         McServerStatus {
             online: true,
             motd,

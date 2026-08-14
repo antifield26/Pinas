@@ -23,6 +23,16 @@ pub async fn run(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .unwrap_or(0);
 
+    // L10 修复：数据库版本高于本二进制支持的版本时显式报错退出——
+    // 历史实现静默跳过（旧程序跑新库），行为不可预期
+    if current > CURRENT_VERSION {
+        drop(tx);
+        return Err(format!(
+            "数据库 schema 版本 {current} 高于本二进制支持的 {CURRENT_VERSION}，请升级程序或回滚数据库"
+        )
+        .into());
+    }
+
     // 按版本号递增执行迁移
     if current < 1 {
         apply_v1_migrations(&mut tx).await?;
@@ -242,10 +252,13 @@ async fn apply_v7_migrations(
     .execute(&mut **tx)
     .await?;
     // 回填存量数据(不触发 files 表触发器,直接写入 FTS 表)
-    sqlx::query("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+    // L11 修复：rebuild 失败历史被静默吞掉（搜索静默返回空、无告警）——失败必须可观测
+    if let Err(e) = sqlx::query("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
         .execute(&mut **tx)
         .await
-        .ok();
+    {
+        tracing::warn!("[DB] v7 迁移: files_fts rebuild 失败（搜索可能为空）: {e}");
+    }
     tracing::info!("[DB] v7 迁移: files_fts 全文索引(trigram)已建立");
     Ok(())
 }
@@ -412,10 +425,12 @@ async fn apply_v9_migrations(
         )
         .execute(&mut **tx)
         .await?;
-        sqlx::query("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+        if let Err(e) = sqlx::query("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
             .execute(&mut **tx)
             .await
-            .ok();
+        {
+            tracing::warn!("[DB] v9 迁移: files_fts rebuild 失败（搜索可能为空）: {e}");
+        }
         tracing::info!(
             "[DB] v9 迁移: files_fts 大小写不敏感重建完成（{}ms）",
             start.elapsed().as_millis()

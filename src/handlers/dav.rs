@@ -47,6 +47,14 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// 密码变更后失效认证缓存（L8：历史实现改密/重置后旧凭证仍有 60s 的 Basic 访问窗口）
+pub fn invalidate_dav_auth_cache(username: &str) {
+    AUTH_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(username);
+}
+
 /// 手动 Basic 认证（WebDAV 单 handler 内调用）：成功 → DavUser；失败 → 401 响应。
 /// 60s 成功缓存防每请求 argon2（键值含凭证指纹，见 AUTH_CACHE）；角色实时查（权限变更即时生效）。
 /// 未命中缓存时先过限速：Argon2 ~100ms 是公网可用的 CPU DoS 面，必须按对端 IP 限频。
@@ -368,7 +376,7 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             .fetch_all(pool)
             .await
             .unwrap_or_default();
-            for (name, parent_path, is_dir, size_mb, created_at) in rows {
+            for (name, parent_path, is_dir, _size_mb, created_at) in rows {
                 let full = match physical_path(&user.username, &logical_path(&parent_path, &name)) {
                     Ok(p) => p,
                     Err(_) => continue,
@@ -379,9 +387,11 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
                 {
                     continue;
                 }
-                let mtime = tokio::fs::metadata(&absolute_uploads_path(&full))
+                let meta = tokio::fs::metadata(&absolute_uploads_path(&full))
                     .await
-                    .ok()
+                    .ok();
+                let mtime = meta
+                    .as_ref()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
@@ -393,7 +403,9 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
                     if is_dir != 0 {
                         0
                     } else {
-                        (size_mb * 1024.0 * 1024.0) as u64
+                        // M6：getcontentlength 用真实字节——size_mb 反算被向上取整放大最多 ~1MiB，
+                        // rclone 等客户端据此校验会读到 EOF 后仍等待
+                        meta.as_ref().map(|m| m.len()).unwrap_or(0)
                     },
                     mtime,
                     created_at,
@@ -440,7 +452,7 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             .fetch_all(pool)
             .await
             .unwrap_or_default();
-            for (name, parent_path, is_dir, size_mb, created_at) in rows {
+            for (name, parent_path, is_dir, _size_mb, created_at) in rows {
                 let full = match physical_path(&user.username, &logical_path(&parent_path, &name)) {
                     Ok(p) => p,
                     Err(_) => continue,
@@ -451,9 +463,11 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
                 {
                     continue;
                 }
-                let mtime = tokio::fs::metadata(&absolute_uploads_path(&full))
+                let meta = tokio::fs::metadata(&absolute_uploads_path(&full))
                     .await
-                    .ok()
+                    .ok();
+                let mtime = meta
+                    .as_ref()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
@@ -465,7 +479,8 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
                     if is_dir != 0 {
                         0
                     } else {
-                        (size_mb * 1024.0 * 1024.0) as u64
+                        // 同 M6：真实字节，非 size_mb 反算
+                        meta.as_ref().map(|m| m.len()).unwrap_or(0)
                     },
                     mtime,
                     created_at,
@@ -746,35 +761,64 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
     let target = absolute_uploads_path(&parent_full.join(&name));
     let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
 
-    // 配额复核（写盘后按实际字节；覆盖时按增量——旧文件大小将被释放，不算重复占用）
-    let mut need = crate::handlers::utils::bytes_to_mb_ceil(written) as f64;
-    let (used_mb, quota_mb) = quota_info(pool, &user.username).await;
-    if existed {
-        let old_mb: f64 = sqlx::query_scalar(
-            "SELECT size_mb FROM files WHERE username = ? AND name = ? AND parent_path = ?",
+    // 配额预留必须先于 rename（M3/M4 修复 + 覆盖保护）：
+    // 事务内预检+增量（写锁串行化消除 TOCTOU）。delta = 新占用 - 旧占用（覆盖时旧大小释放）。
+    // 注意顺序：若预留放在 rename 之后，超配拒绝时旧文件已被原子替换、删除新文件即销毁旧内容
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let old_contrib: i64 = if existed {
+        sqlx::query_scalar(
+            "SELECT CEIL(size_mb) FROM files WHERE username = ? AND name = ? AND parent_path = ?",
         )
         .bind(&user.username)
         .bind(&name)
         .bind(&parent)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .unwrap_or(None)
-        .unwrap_or(0.0);
-        need = (need - old_mb).max(0.0);
-    }
-    if used_mb as f64 + need > quota_mb as f64 {
+        .unwrap_or(0.0) as i64
+    } else {
+        0
+    };
+    let need_mb = crate::handlers::utils::bytes_to_mb_ceil(written);
+    if let Err(e) = crate::handlers::utils::check_and_adjust_quota_tx(
+        &mut tx,
+        &user.username,
+        need_mb - old_contrib,
+    )
+    .await
+    {
+        drop(tx);
         let _ = tokio::fs::remove_file(&tmp).await;
-        return StatusCode::INSUFFICIENT_STORAGE.into_response();
+        return if matches!(e, crate::error::AppError::Forbidden(_)) {
+            StatusCode::INSUFFICIENT_STORAGE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        .into_response();
     }
-    if tokio::fs::rename(&tmp, &target).await.is_err() {
+    if tx.commit().await.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // 登记：覆盖走 UPDATE（保留行元数据），新建走 INSERT；配额随后全量重算
+    if tokio::fs::rename(&tmp, &target).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        // 预留已提交但落盘失败：全量重算自愈（事务化版本）
+        let _ = update_user_used_mb(pool, &user.username).await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // 登记：覆盖走 UPDATE（保留行元数据），新建走 INSERT。
+    // 失败只影响 DB 行与配额的对账（下轮 update_user_used_mb 自愈），不再触碰文件
     let size_mb = (written as f64 / 1024.0 / 1024.0).ceil();
-    if existed {
-        let _ = sqlx::query(
+    let registered = if existed {
+        sqlx::query(
             "UPDATE files SET size_mb = ?, identifier = NULL WHERE username = ? AND name = ? AND parent_path = ?",
         )
         .bind(size_mb)
@@ -782,9 +826,10 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
         .bind(&name)
         .bind(&parent)
         .execute(pool)
-        .await;
+        .await
+        .is_ok()
     } else {
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)",
         )
         .bind(&user.username)
@@ -792,9 +837,13 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
         .bind(&parent)
         .bind(size_mb)
         .execute(pool)
-        .await;
+        .await
+        .is_ok()
+    };
+    if !registered {
+        tracing::error!("[DAV] 上传登记失败，触发配额重算自愈: {}/{}", parent, name);
+        let _ = update_user_used_mb(pool, &user.username).await;
     }
-    let _ = update_user_used_mb(pool, &user.username).await;
     let _ = crate::handlers::utils::log_audit(
         pool,
         &user.username,
@@ -1125,12 +1174,13 @@ async fn copy_recursive(
     .await
     .map_err(|e| format!("COPY 源查询失败: {e}"))?;
 
+    // L3 修复：记账口径与 upload 路径一致（逐文件 CEIL 后求和）——
+    // 历史为 sum().ceil()，多文件 COPY 会少扣约 1MB/文件
     let total_mb: f64 = rows
         .iter()
         .filter(|r| r.2 == 0)
-        .map(|r| r.3)
-        .sum::<f64>()
-        .ceil();
+        .map(|r| r.3.ceil())
+        .sum::<f64>();
 
     // 阶段一：磁盘复制（无任何 DB 写入）。std::fs::copy 是阻塞 IO，必须移出 async worker
     // 且移出写事务——历史实现把整个拷贝过程包在 SQLite 写事务里：大目录 COPY 会

@@ -1,23 +1,23 @@
-<div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-4xl shadow-2xl mx-auto max-h-[90vh] flex flex-col" onclick="event.stopPropagation()">
+<div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-4xl shadow-2xl mx-auto max-h-[90vh] flex flex-col" data-modal-root>
   <div class="flex justify-between items-center p-5 border-b border-gray-100 dark:border-gray-800 shrink-0">
     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100 flex items-center gap-2">
       <span>{{ file_name }}</span>
       <span class="text-xs font-normal text-gray-400">({{ file_size }})</span>
     </h3>
-    <button onclick="App.closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none">&times;</button>
+    <button data-close-modal class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none">&times;</button>
   </div>
   <div class="p-5 overflow-auto flex-1">
     {% if is_image %}
     <div class="flex items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-4">
       <img src="/api/media/{{ file_path }}?mt={{ media_token }}" alt="{{ file_name }}"
            class="max-w-full max-h-[70vh] object-contain rounded shadow-lg"
-           onerror="showMediaError(this)">
+           data-media-el>
     </div>
     {% else if is_video %}
     <div class="flex items-center justify-center bg-black rounded-lg overflow-hidden">
       <video id="video-player" data-key="{{ username }}:{{ file_path }}" controls autoplay muted playsinline
              class="max-w-full max-h-[70vh] rounded-lg" preload="metadata"
-             onerror="showMediaError(this)">
+             data-media-el>
         <source src="/api/media/{{ file_path }}?mt={{ media_token }}" type="{{ mime_type }}">
         <p class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
           <span class="text-5xl">🎬</span>
@@ -31,7 +31,7 @@
     <div class="relative">
       <div class="flex items-center justify-between mb-2">
         <span class="text-xs text-gray-400 font-mono">markdown</span>
-        <button onclick="var d=document.getElementById('markdown-data');if(d){navigator.clipboard.writeText(JSON.parse(d.textContent));App.showToast('已复制到剪贴板','info')}"
+        <button data-copy-markdown
                 class="text-xs bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-2 py-1 rounded transition">
           复制
         </button>
@@ -40,15 +40,6 @@
       <div id="markdown-body" class="prose prose-sm dark:prose-invert max-w-none bg-gray-100 dark:bg-gray-800 rounded-lg p-4 overflow-auto max-h-[65vh]"></div>
       <script type="application/json" id="markdown-data">{{ markdown_json | safe }}</script>
     </div>
-    <script>
-      (function() {
-        var data = document.getElementById('markdown-data');
-        var body = document.getElementById('markdown-body');
-        if (!data || !body) return;
-        try { window.App.renderMarkdown(body, JSON.parse(data.textContent)); }
-        catch (_) { body.textContent = '（渲染失败）'; }
-      })();
-    </script>
     {% else if is_audio %}
     <div class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-4">
       <span class="text-6xl">♪</span>
@@ -66,7 +57,7 @@
     <div class="relative">
       <div class="flex items-center justify-between mb-2">
         <span class="text-xs text-gray-400 font-mono">{{ mime_type }}</span>
-        <button onclick="navigator.clipboard.writeText(this.closest('.relative').querySelector('pre').textContent);App.showToast('已复制到剪贴板','info')"
+        <button data-copy-text
                 class="text-xs bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-2 py-1 rounded transition">
           复制
         </button>
@@ -81,7 +72,7 @@
       <div class="flex gap-2 mt-2">
         <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"
            class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm">↓ 下载文件</a>
-        <button onclick="App.closeModal()"
+        <button data-close-modal
                 class="bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 font-medium py-2 px-4 rounded-lg transition text-sm">关闭</button>
       </div>
     </div>
@@ -113,25 +104,4 @@
     <span class="text-xs text-gray-400">{{ file_size }}</span>
   </div>
   {% endif %}
-
-  {# 视频续播：localStorage 记忆播放位置（>5s 且距结尾 >10s 恢复；5s 节流保存；播完清除） #}
-  <script>
-    (function() {
-      var v = document.getElementById('video-player');
-      if (!v) return;
-      var key = 'pinas:pos:' + v.getAttribute('data-key');
-      var saved = parseFloat(localStorage.getItem(key) || '0');
-      if (saved > 0) {
-        v.addEventListener('loadedmetadata', function() {
-          if (saved > 5 && v.duration - saved > 10) v.currentTime = saved;
-        }, { once: true });
-      }
-      var lastSave = 0;
-      v.addEventListener('timeupdate', function() {
-        var now = Date.now();
-        if (now - lastSave > 5000) { lastSave = now; localStorage.setItem(key, String(v.currentTime)); }
-      });
-      v.addEventListener('ended', function() { localStorage.removeItem(key); });
-    })();
-  </script>
 </div>

@@ -121,25 +121,36 @@ async fn reconcile_files_on_disk(
 ) -> std::collections::HashSet<(String, String)> {
     use std::collections::HashSet;
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let checks = rows.iter().map(|(name, parent_path, is_dir)| async move {
-        let rel = user_file_path(username, parent_path, name);
-        let exists = match safe_join_sandbox(base, &rel) {
-            Ok(full) => match tokio::fs::metadata(&full).await {
-                Ok(meta) => {
-                    if *is_dir {
-                        meta.is_dir()
-                    } else {
-                        meta.is_file()
+    let username_owned = username.to_string();
+    let owned: Vec<(String, String, bool)> = rows.to_vec();
+    let checks = owned.into_iter().map(move |(name, parent_path, is_dir)| {
+        let username = username_owned.clone();
+        async move {
+            let rel = user_file_path(&username, &parent_path, &name);
+            let exists = match safe_join_sandbox(base, &rel) {
+                Ok(full) => match tokio::fs::metadata(&full).await {
+                    Ok(meta) => {
+                        if is_dir {
+                            meta.is_dir()
+                        } else {
+                            meta.is_file()
+                        }
                     }
-                }
+                    Err(_) => false,
+                },
+                // 路径非法(穿越)视为不存在，交由调用方清理 DB 记录
                 Err(_) => false,
-            },
-            // 路径非法(穿越)视为不存在，交由调用方清理 DB 记录
-            Err(_) => false,
-        };
-        ((name.clone(), parent_path.clone()), exists)
+            };
+            ((name, parent_path), exists)
+        }
     });
-    let results = futures_util::future::join_all(checks).await;
+    // L7 修复：join_all 对 1000 行目录瞬时并发 1000 个 blocking stat，
+    // 4 核 RPi 上线程风暴——buffer_unordered(64) 限流，吞吐损失可忽略
+    use futures_util::StreamExt;
+    let results = futures_util::stream::iter(checks)
+        .buffer_unordered(64)
+        .collect::<Vec<_>>()
+        .await;
 
     let mut present: HashSet<(String, String)> = HashSet::with_capacity(results.len());
     let mut missing: Vec<(String, String)> = Vec::new();

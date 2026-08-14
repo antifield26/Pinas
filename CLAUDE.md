@@ -189,14 +189,17 @@ MINECRAFT_PORT=25565
 - **模板内联 JS 零用户数据**：导航走 `data-nav-path`/`data-breadcrumb-path` 事件委托；`hx-vals` 一律 `|json` 过滤器
 - **限速可信源** `MaybePeer`：直连用真实对端 IP，回环(cloudflared)信任 CF-Connecting-IP，防伪造 XFF 绕过
 - **注册开关** `PINAS_ALLOW_REGISTRATION`（默认 false）；分片临时存储 5GB/用户上限；备份保留 7 份轮转
-- **WebDAV** `/dav/*`：Basic 认证（60s 成功缓存防每请求 argon2）+ 全路径沙箱 + DELETE 进回收站；
-  路由级 5GiB body limit；dav.rs 文件操作统一 std::fs（测试环境 tokio::fs 相对路径有 ENOENT 竞态）
-- 密码学函数从 `src/core` 导入（`hash_password`, `verify_password`, `hash_token`）
+- **WebDAV** `/dav/*`：Basic 认证（60s 缓存键含凭证指纹 sha256(user\0pass)，改密/重置即失效）
+  + 认证限速（10 次/60s/IP）+ 全路径沙箱 + DELETE 进回收站；路由级 5GiB body limit；
+  dav.rs 文件操作统一 std::fs（测试环境 tokio::fs 相对路径有 ENOENT 竞态）
+- 密码学函数从 `src/core` 导入（`hash_password`, `verify_password`, `hash_token`）；
+  Argon2id m=19MiB/t=3/p=1（验证参数随哈希串自描述，旧哈希不受影响）
 - **媒体访问走短时效路径限定令牌** `/api/media/?mt=`（media_tokens 表，30 分钟，目录限定）；
   会话 token 一律不进 URL 查询串
 - **回收站目录 `uploads/.trash`**（不在 uploads/tmp 内——24h 临时分片清扫只清白名单条目，
-  绝不触碰回收站）
-- **AI 端点双重限速**（5 分钟窗口 + 每日配额）；分享匿名端点限速 + 每分享失败锁定
+  绝不触碰回收站）；MOVE 覆盖位移暂存 `uploads/.dav_disp`（启动恢复）
+- **AI 端点双重限速**（5 分钟窗口 + 每日配额，本地时区日界，键定期清理）；分享匿名端点限速 + 每分享失败锁定；
+  **api_base 深度校验**（https-only + 拒 IP/私网/重绑定域名后缀，写入与读取双侧）
 - **Cookie 默认强制 Secure**（纯 HTTP 局域网需 PINAS_COOKIE_SECURE=false）
 
 ### 错误处理
@@ -208,10 +211,13 @@ MINECRAFT_PORT=25565
 - **页面** → `page_handler!` 宏（`pages.rs`）
 - **片段** → Askama 模板结构体 + async fn → `AppTemplate<T>.into_response()`
 - **JSON API** → `AppResult<Json<T>>` + `?` 传播
-- **错误恢复** → `fallback_file_list()` 重新渲染文件列表 + `HX-Trigger: quotaRefresh`
+- **错误恢复** → `fallback_file_list()` 重新渲染文件列表 + `HX-Trigger: quotaRefresh`；
+  失败变体 `fallback_file_list_with_error` 经 `HX-Trigger: {\"toastError\": \"…\"}` 弹错误 Toast
 
 ### 数据库
-- 查询用 `sqlx::query` / `sqlx::query_as`，事务用 `pool.begin().await`
+- 查询用 `sqlx::query` / `sqlx::query_as`，事务用 `pool.begin().await`；
+  **配额原子性**：写路径统一 `check_and_adjust_quota_tx`（事务内预检+增量）；
+  全量重算 `update_user_used_mb` 事务化（先空写抢锁再 SUM，防增量/全量互相覆盖漂移）
 - 日程 `status` 仅存储 `pending`，由 `compute_effective_status()` 动态计算
 - 密码学函数从 `pinas_core` 导入（`hash_password`, `verify_password`, `hash_token`）
 
@@ -221,7 +227,9 @@ MINECRAFT_PORT=25565
 - 变量 `snake_case`，循环 `{% for %} {% endfor %}`，条件用 Rust 风格 (`&&`, `!=`)
 
 ### 前端
-- JS 命名空间 `window.App = { showToast, closeModal, navigateTo, goParent, handleUploadForm }`
+- JS 全部外置于 `assets/app.js`（CSP script-src 无 'unsafe-inline'；仅两处主题预涂脚本内联，
+  经 sha256 哈希放行）；交互统一 data-* 属性 + document 事件委托；
+  `window.App = { showToast, closeModal, navigateTo, goParent, handleUploadForm }`
 - 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传；
   `window.UploadQueue` 队列面板（进度/取消/文件夹上传 webkitdirectory + 拖拽 webkitGetAsEntry 递归）
 - 全局搜索：drive 页"全局"checkbox（path 置空）→ 后端 ≥3 字符走 FTS5 trigram、≤2 字符 LIKE 兜底；结果跨目录显示路径
@@ -236,6 +244,17 @@ MINECRAFT_PORT=25565
   版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验含嵌套路径与 manifest）；
   离线仅静态壳/登录页兜底，HTMX 片段与页面离线不可用
 - 版本对齐：Cargo.toml → `/health` version；`?v=` 与 sw.js 预缓存 URL 严格一致（check-versions.sh 强制）
+
+### 已知边界与接受的残余风险（审计记录，2026-08）
+- CSP script-src 保留 'unsafe-eval'（Alpine x-data 表达式编译 + htmx hx-on 依赖）；style-src 保留
+  'unsafe-inline'（动画延迟/进度条宽度等内联样式依赖）
+- api_base 校验为字符串级：任意合法域名仍可在请求时被 DNS 重绑定到私网（根治需请求时解析并钉扎 IP），
+  仅限用户自配 key 场景，全局 key 强制全局 base
+- AI API key 明文存 SQLite（user_settings/环境变量）；备份文件与 DB 同权限保护
+- 会话为绝对过期（默认 7 天），无空闲超时；分享失败锁定为内存态（重启清零）
+- upload_limit_mb 语义 = 全局 body limit（非单文件上限），单文件实际由配额约束；quota_mb=0 表示禁止上传
+- safe_join_sandbox 校验与后续文件操作之间理论上存在符号链接 swap 竞态（单可信用户家庭场景接受）
+- 登录响应 JSON 回显会话 token（dsh-plugin-pinas Bearer 流程依赖）；页面 JS 不经手存储
 
 ### UI 规范（v1.5 起）
 - **暗色层级**：页面底 `gray-950` → 卡片/导航/模态 `gray-900` → 输入/井面 `gray-800`；hover 恒比基底高一档；边框 `gray-700/800`

@@ -1,6 +1,6 @@
 {# 服务端值一律走 data-* 属性（x-init 读取），不内插进 JS 表达式字符串——HTML 实体解码
    绕过转义是经典注入通道，此约定与"模板内联 JS 零用户数据"一致 #}
-<div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-md shadow-2xl mx-auto" onclick="event.stopPropagation()"
+<div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-md shadow-2xl mx-auto" data-modal-root
      x-data="{}"
      data-category="{{ category }}" data-is-all-day="{{ is_all_day }}" data-show-date="{{ show_date }}"
      x-init="category = $root.dataset.category; isAllDay = $root.dataset.isAllDay === 'true'; showDate = $root.dataset.showDate === 'true';"
@@ -10,7 +10,7 @@
     {% if is_edit %}编辑{% else %}新建{% endif %}
     <span x-text="category === 'schedule' ? '日程' : '待办'"></span>
   </h3>
-    <button onclick="App.closeModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none">&times;</button>
+    <button data-close-modal class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-2xl leading-none">&times;</button>
   </div>
   <div class="p-5">
 
@@ -114,7 +114,7 @@
         {% if is_edit %}保存{% else %}创建{% endif %}
       </button>
       <button type="button"
-              onclick="App.closeModal()"
+              data-close-modal
               class="px-4 py-2 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm font-medium transition">
         取消
       </button>

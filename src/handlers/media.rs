@@ -91,40 +91,58 @@ pub async fn save_file_content_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
     };
 
-    // 配额检查：按新旧大小差值计（改小反而释放空间；改大计入差额）
+    // 配额检查（M3/M4 修复）：按新旧 CEIL 差值在写事务内原子预检 + 预留——
+    // 历史实现「读 used → 判断 → 写盘 → 增量调整」存在 TOCTOU 与全量重算互相覆盖。
+    // 预留成功后写盘失败会由 update_user_used_mb 全量重算自愈
     let old_len = tokio::fs::metadata(&full_p)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
     let new_len = payload.content.len() as u64;
-    if new_len > old_len {
-        let delta_mb = crate::handlers::utils::bytes_to_mb_ceil(new_len - old_len);
-        let row: Option<(i64, i64)> =
-            match sqlx::query_as("SELECT used_mb, quota_mb FROM users WHERE username = ?")
-                .bind(username)
-                .fetch_optional(&pool)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("[Media] 查询用户配额失败: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "服务器内部错误，请稍后重试",
-                    )
-                        .into_response();
-                }
-            };
-        let Some((current_used, quota)) = row else {
-            return (StatusCode::NOT_FOUND, "用户不存在").into_response();
-        };
-        if current_used + delta_mb > quota {
-            return (StatusCode::FORBIDDEN, "存储空间不足，超出配额").into_response();
+    let delta_mb = crate::handlers::utils::bytes_to_mb_ceil(new_len)
+        - crate::handlers::utils::bytes_to_mb_ceil(old_len);
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("[Media] 开启配额事务失败: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "服务器内部错误，请稍后重试",
+            )
+                .into_response();
         }
+    };
+    if let Err(e) =
+        crate::handlers::utils::check_and_adjust_quota_tx(&mut tx, username, delta_mb).await
+    {
+        let _ = tx.rollback().await;
+        return match e {
+            crate::error::AppError::Forbidden(_) => {
+                (StatusCode::FORBIDDEN, "存储空间不足，超出配额").into_response()
+            }
+            crate::error::AppError::NotFound(_) => {
+                (StatusCode::NOT_FOUND, "用户不存在").into_response()
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "服务器内部错误，请稍后重试",
+            )
+                .into_response(),
+        };
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!("[Media] 配额预留提交失败: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "服务器内部错误，请稍后重试",
+        )
+            .into_response();
     }
 
     if let Err(e) = tokio::fs::write(&full_p, payload.content.as_bytes()).await {
         tracing::error!("[Media] 写入文件失败: {}", e);
+        // 预留已提交但写盘失败：全量重算自愈（事务化版本，不会被增量覆盖）
+        let _ = crate::handlers::utils::update_user_used_mb(&pool, username).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, "写入文件失败，请重试").into_response();
     }
 
@@ -158,10 +176,7 @@ pub async fn save_file_content_handler(
     .execute(&pool)
     .await;
 
-    // 增量调整配额（新旧字节差），替代全表 SUM 重算
-    let old_len_mb = crate::handlers::utils::bytes_to_mb_ceil(old_len);
-    let new_len_mb = crate::handlers::utils::bytes_to_mb_ceil(new_len);
-    crate::handlers::utils::adjust_user_used_mb(&pool, username, new_len_mb - old_len_mb).await;
+    // 配额已在写事务内按差值预留（check_and_adjust_quota_tx），此处不再重复调整
 
     // 审计日志：保存文件
     let _ = log_audit(

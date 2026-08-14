@@ -33,10 +33,19 @@ static PROMPT_CACHE: LazyLock<
     Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// 每用户每日 AI 请求配额（键 username:YYYY-MM-DD）。
+/// 每用户每日 AI 请求配额（键 username:YYYY-MM-DD，本地时区日界——L5 修复：
+/// 历史用 UTC，北京时间上午 8 点才重置"每日"配额）。
 /// AI 调用消耗主人全局 API 额度，未限速的 guest 账号可无限刷取，必须双重限速。
 static AGENT_DAILY: LazyLock<Mutex<std::collections::HashMap<String, u32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// 清理过期每日配额键（L5：历史只增不清，随运行天数线性增长）。
+/// 由后台清理任务定期调用；键只保留"今天（本地时区）"。
+pub async fn clean_agent_daily() {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut map = AGENT_DAILY.lock().await;
+    map.retain(|k, _| k.ends_with(&today));
+}
 
 /// AI 端点限速：每 5 分钟窗口 window_attempts 次 + 每日总配额（PINAS_AGENT_DAILY_QUOTA）
 async fn agent_check_rate(
@@ -54,7 +63,7 @@ async fn agent_check_rate(
     {
         return Err(AppError::too_many_requests("AI 请求过于频繁，请稍后再试"));
     }
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let key = format!("{}:{}", username, today);
     let mut map = AGENT_DAILY.lock().await;
     let count = map.entry(key).or_insert(0);
@@ -258,6 +267,12 @@ async fn get_cached_prompt(pool: &SqlitePool, username: &str) -> String {
     prompt
 }
 
+/// 待办/日程/链接变更后主动失效系统提示缓存（L9 修复：历史 30s TTL 内
+/// 刚改完待办立即问 AI 会拿到旧上下文）——由 todos/links 写路径调用
+pub async fn invalidate_prompt_cache(username: &str) {
+    PROMPT_CACHE.lock().await.remove(username);
+}
+
 /// 构建包含用户待办/日程上下文的动态系统提示词
 async fn build_system_prompt(pool: &SqlitePool, username: &str) -> String {
     let mut prompt = SYSTEM_PROMPT_BASE.to_string();
@@ -431,11 +446,18 @@ async fn resolve_agent_config(
     };
 
     // API Base: 用户自配 key 时才允许自配 base；
-    // 使用全局 key 时强制全局 base（防止把全局 key 发往用户可控服务器造成凭据窃取）
+    // 使用全局 key 时强制全局 base（防止把全局 key 发往用户可控服务器造成凭据窃取）。
+    // M1 修复：读取时复用深度校验——写入校验只是第一道闸，历史/异常 DB 数据不得绕过
     let api_base = if user_has_key {
-        user_api_base
-            .filter(|b| !b.is_empty())
-            .unwrap_or_else(|| config.deepseek_api_base.clone())
+        match user_api_base.filter(|b| !b.is_empty()) {
+            Some(b) => {
+                if let Err(msg) = crate::handlers::settings::validate_api_base(&b) {
+                    return Err((StatusCode::BAD_REQUEST, msg));
+                }
+                b
+            }
+            None => config.deepseek_api_base.clone(),
+        }
     } else {
         config.deepseek_api_base.clone()
     };
@@ -446,12 +468,13 @@ async fn resolve_agent_config(
         .or_else(|| user_model.filter(|m| !m.is_empty()))
         .unwrap_or_else(|| config.deepseek_model.clone());
 
+    // L2 修复：参数统一 clamp——DB 历史/异常值不得直传上游（上游 400 整轮失败）
     Ok(ResolvedAgentConfig {
         api_key,
         api_base,
         model,
-        temperature: user_temperature,
-        max_tokens: user_max_tokens,
+        temperature: user_temperature.clamp(0.0, 2.0),
+        max_tokens: user_max_tokens.clamp(1, 8192),
     })
 }
 
@@ -776,13 +799,15 @@ async fn execute_tool(
             if query.is_empty() {
                 return Err("search_files 需要非空 query 参数".to_string());
             }
+            // L4 修复：LIKE 通配符转义——query 含 %/_ 时不得意外全匹配/误匹配
+            let like_pat = format!("%{}%", crate::db::queries::escape_like(query));
             let rows: Vec<(String, String, i64, f64)> = sqlx::query_as(
                 "SELECT name, parent_path, is_dir, size_mb FROM files \
-                 WHERE username = ? AND (name LIKE ? OR parent_path LIKE ?) LIMIT 20",
+                 WHERE username = ? AND (name LIKE ? ESCAPE '\\' OR parent_path LIKE ? ESCAPE '\\') LIMIT 20",
             )
             .bind(ctx.username)
-            .bind(format!("%{query}%"))
-            .bind(format!("%{query}%"))
+            .bind(&like_pat)
+            .bind(&like_pat)
             .fetch_all(ctx.pool)
             .await
             .map_err(|e| format!("搜索失败: {e}"))?;

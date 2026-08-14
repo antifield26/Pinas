@@ -534,6 +534,9 @@ pub async fn change_password(
         return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response();
     }
 
+    // 密码已变更：失效 WebDAV 认证缓存（旧凭证不得再命中 60s 窗口）
+    crate::handlers::dav::invalidate_dav_auth_cache(&username);
+
     // 创建新会话并设置 cookie
     let new_token = Uuid::new_v4().to_string();
     let new_token_hash = hash_token(&new_token);

@@ -72,7 +72,26 @@ page_handler!(todos_page, TodosPage, "todos");
 page_handler!(agent_page, AgentPage, "agent");
 page_handler!(links_page, LinksPage, "links");
 page_handler!(trash_page, TrashPage, "trash");
-page_handler!(admin_page, AdminPage, "admin");
+
+/// GET /admin — 管理页（仅 admin）：页面外壳同样 403——
+/// 审计遗留项：历史用 page_handler! 宏，非管理员也能拿到完整外壳（结构信息泄漏）
+pub async fn admin_page(
+    Extension(session): Extension<UserSession>,
+    Extension(config): Extension<crate::config::Config>,
+) -> impl IntoResponse {
+    if session.role != "admin" {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    let (username, is_admin, current_page) = page_context(&session, "admin");
+    AppTemplate(AdminPage {
+        username,
+        is_admin,
+        current_page,
+        nav: nav_items(is_admin),
+        harness_url: crate::templates::dsh_public_url(&config),
+    })
+    .into_response()
+}
 
 /// 公开静态页面加边缘缓存头（Cloudflare 缓存，避免每次回源走慢链路）
 fn with_public_cache(resp: axum::response::Response) -> axum::response::Response {

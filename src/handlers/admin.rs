@@ -211,6 +211,9 @@ pub async fn reset_user_password(
 
     tx.commit().await?;
 
+    // 密码已重置：失效 WebDAV 认证缓存（旧凭证不得再命中 60s 窗口）
+    crate::handlers::dav::invalidate_dav_auth_cache(&payload.username);
+
     let _ = log_audit(
         &pool,
         &session.username,

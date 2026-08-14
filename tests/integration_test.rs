@@ -3949,3 +3949,308 @@ async fn test_dsh_admin_only() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// M3/M4 回归：dav PUT 超配额必须 507 且旧文件原样保留（配额事务原子化后）
+#[tokio::test]
+async fn test_dav_put_over_quota_preserves_old() {
+    let (pool, app) = test_app().await;
+    let (token_admin, _a) = register_and_login_with_username(&app).await; // 首注册=admin
+    let (_, username_b) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username_b, "testpass123");
+
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/keep.txt",
+        Some(&auth),
+        b"precious".to_vec(),
+        &[],
+    )
+    .await;
+
+    // admin 把 B 配额压到 0
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/quota")
+                .header("authorization", format!("Bearer {}", token_admin))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"username":"{}","quota_mb":0}}"#,
+                    username_b
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // 覆盖 → 507（即使覆盖是等大替换，历史实现预检放行后仍可能 507；断言旧内容仍在）
+    let resp = dav_send(
+        &app,
+        "PUT",
+        "/dav/keep.txt",
+        Some(&auth),
+        b"new-content".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INSUFFICIENT_STORAGE);
+    let resp = dav_send(&app, "GET", "/dav/keep.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(
+        read_body_text(resp).await,
+        "precious",
+        "超配拒绝不得损坏旧文件"
+    );
+    let _ = pool;
+}
+
+/// M6 回归：PROPFIND getcontentlength 必须是真实字节（非 size_mb 反算）
+#[tokio::test]
+async fn test_propfind_exact_content_length() {
+    let (_, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+    // 5 字节文件：size_mb 反算会放大到 1048576
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/five.txt",
+        Some(&auth),
+        b"hello".to_vec(),
+        &[],
+    )
+    .await;
+    let resp = dav_send(
+        &app,
+        "PROPFIND",
+        "/dav/five.txt",
+        Some(&auth),
+        vec![],
+        &[("Depth", "0")],
+    )
+    .await;
+    let xml = read_body_text(resp).await;
+    assert!(
+        xml.contains("<D:getcontentlength>5</D:getcontentlength>"),
+        "应为真实字节 5: {}",
+        xml
+    );
+}
+
+/// L5 回归：同内容不同目标路径不得误报秒传（目标文件必须真实存在过）
+#[tokio::test]
+async fn test_instant_upload_requires_same_target() {
+    let (_pool, app) = test_app().await;
+    let (token, _u) = register_and_login_with_username(&app).await;
+    let identifier = format!("inst-{}", std::process::id());
+    let data = vec![0x65u8; CHUNK_SIZE];
+    upload_one_chunk(&app, &token, &identifier, 0, 1, &data).await;
+    // merge 到 out.bin
+    let resp = app.clone().oneshot(
+        Request::builder().method("POST").uri("/api/files/merge")
+            .header("authorization", format!("Bearer {}", token))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"file_name":"out.bin","identifier":"{}","parent_path":"","total_chunks":1}}"#, identifier)))
+            .unwrap(),
+    ).await.unwrap();
+    assert!(resp.status().is_success());
+
+    // 同路径 → exists:true
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!(
+                "/api/files/check?identifier={}&file_name=out.bin&parent_path=",
+                identifier
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["exists"].as_bool().unwrap(), "同路径应命中秒传");
+
+    // 不同文件名 → exists:false（不得假秒传）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!(
+                "/api/files/check?identifier={}&file_name=other.bin&parent_path=",
+                identifier
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(!v["exists"].as_bool().unwrap(), "不同路径不得假秒传（L5）");
+}
+
+/// L8 回归：改密后旧凭证不得命中 dav 认证缓存
+#[tokio::test]
+async fn test_dav_cache_invalidated_on_password_change() {
+    let (_, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let old_auth = basic_auth_header(&username, "testpass123");
+
+    // 建立缓存
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&old_auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+
+    // 改密
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/user/password")
+                .header("authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"current_password":"testpass123","new_password":"newpass456"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 旧密码立即 401（缓存已失效）
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&old_auth), vec![], &[]).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "改密后旧凭证必须立即失效（L8）"
+    );
+}
+
+/// api_base 深度校验回归（写入侧）
+#[tokio::test]
+async fn test_api_base_validation_rejects_dangerous() {
+    let (_pool, app) = test_app().await;
+    let (token, _u) = register_and_login_with_username(&app).await;
+    let cases = [
+        ("http://api.deepseek.com", 400),  // 非 https
+        ("https://127.0.0.1:8080", 400),   // 回环
+        ("https://10.1.2.3", 400),         // 私网
+        ("https://evil.nip.io", 400),      // 重绑定后缀
+        ("https://api.deepseek.com", 200), // 合法
+    ];
+    for (base, want) in cases {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/agent/settings")
+                    .header("authorization", format!("Bearer {}", token))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"deepseek_api_base":"{}"}}"#, base)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), want, "base={} 应 {}", base, want);
+    }
+}
+
+/// CSP 回归：script-src 无 unsafe-inline + 含主题预涂哈希；页面/片段无内联事件处理器
+#[tokio::test]
+async fn test_csp_and_templates_no_inline_handlers() {
+    let (_pool, app) = test_app().await;
+    let (token, _u) = register_and_login_with_username(&app).await;
+
+    // 登录页（公开）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("script-src"), "缺 script-src");
+    let script_src = csp.split(';').find(|d| d.contains("script-src")).unwrap();
+    assert!(
+        !script_src.contains("unsafe-inline"),
+        "script-src 不得含 unsafe-inline: {}",
+        script_src
+    );
+    assert!(
+        script_src.contains("sha256-"),
+        "预涂脚本需哈希放行: {}",
+        script_src
+    );
+    let html = read_body_text(resp).await;
+    for attr in [
+        "onclick=",
+        "onsubmit=",
+        "onchange=",
+        "oninput=",
+        "onerror=",
+        "onload=",
+    ] {
+        assert!(
+            !html.contains(attr),
+            "登录页不得含内联事件属性 {}: {}",
+            attr,
+            html
+        );
+    }
+    // 主题预涂脚本允许（1 处内联），其余内联 script 必须为 0
+    let inline_scripts = html.matches("<script>").count();
+    assert_eq!(
+        inline_scripts, 1,
+        "登录页应只剩 1 处预涂内联脚本，实际 {}",
+        inline_scripts
+    );
+
+    // drive 页（认证）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/drive")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = read_body_text(resp).await;
+    for attr in [
+        "onclick=",
+        "onsubmit=",
+        "onchange=",
+        "oninput=",
+        "onerror=",
+        "onload=",
+    ] {
+        assert!(
+            !html.contains(attr),
+            "drive 页不得含内联事件属性 {}: {}",
+            attr,
+            html
+        );
+    }
+    assert!(
+        html.contains("/assets/app.js?v=1"),
+        "drive 页应加载外部 app.js"
+    );
+}

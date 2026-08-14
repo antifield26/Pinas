@@ -166,6 +166,21 @@ pub async fn issue_media_token(
     username: &str,
     path_prefix: &str,
 ) -> String {
+    // 前缀规范化（纵深防御）：去首尾 /、压平空段；含 ".." 直接拒绝（返回空串=不签发）。
+    // 路径限定校验在 auth 层按段比较，未规范化的前缀（如 "dir/../x"）会制造歧义
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path_prefix.trim_matches('/').split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            tracing::warn!("[MediaToken] 拒绝含 .. 的前缀: {}", path_prefix);
+            return String::new();
+        }
+        segs.push(seg);
+    }
+    let normalized_prefix = segs.join("/");
+
     let token = uuid::Uuid::new_v4().to_string();
     let token_hash = crate::core::hash_token(&token);
     let expires_at = chrono::Utc::now()
@@ -178,7 +193,7 @@ pub async fn issue_media_token(
     )
     .bind(username)
     .bind(&token_hash)
-    .bind(path_prefix)
+    .bind(&normalized_prefix)
     .bind(&expires_at)
     .execute(pool)
     .await
@@ -315,24 +330,73 @@ pub fn user_dir_path(raw: Option<String>) -> String {
 /// 全量重算用户已用容量。
 /// 统一算法:SUM(CEIL(size_mb))——与上传时按文件向上取整累加的语义一致,消除显示漂移。
 /// (此前为 (SUM+0.5).round(),与上传的 ceil 增量不同,导致配额显示不一致)
+/// 事务化（M4 修复）：先以空写 UPDATE 抢占写锁再读再写——deferred 事务下若先读后写，
+/// 并发增量调整可在读后提交、随后被本函数的旧快照覆盖（配额漂移）
 pub async fn update_user_used_mb(
     pool: &sqlx::SqlitePool,
     username: &str,
 ) -> Result<(), sqlx::Error> {
     tracing::debug!("[配额更新] 开始计算用户 {} 的已用容量", username);
+    let mut tx = pool.begin().await?;
+    // 抢占写锁：确保 SUM 读到的是该事务线性化点之后不会再被其他增量调整修改的状态
+    sqlx::query("UPDATE users SET used_mb = used_mb WHERE username = ?")
+        .bind(username)
+        .execute(&mut *tx)
+        .await?;
     let used_mb: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(CEIL(size_mb)), 0) FROM files WHERE username = ? AND is_dir = 0",
     )
     .bind(username)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     sqlx::query("UPDATE users SET used_mb = ? WHERE username = ?")
         .bind(used_mb)
         .bind(username)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     tracing::debug!("[配额更新] 用户 {} 配额更新成功: {} MB", username, used_mb);
     Ok(())
+}
+
+/// 事务内配额预检 + 增量调整（delta_mb 可为负=释放）。
+/// 与调用方事务原子提交：SQLite 写锁串行化并发写路径，消除「先检查后写」的 TOCTOU
+/// （dav PUT / 回收站恢复 / 编辑器保存共用）。返回调整后的 (used, quota)
+pub async fn check_and_adjust_quota_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    username: &str,
+    delta_mb: i64,
+) -> Result<(i64, i64), crate::error::AppError> {
+    use crate::error::AppError;
+    use sqlx::Row as _;
+    let row = sqlx::query("SELECT used_mb, quota_mb FROM users WHERE username = ?")
+        .bind(username)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| AppError::internal_log("查询配额", e))?;
+    let (used, quota) = match row {
+        Some(r) => (
+            r.try_get::<i64, _>(0)
+                .map_err(|e| AppError::internal_log("解析配额", e))?,
+            r.try_get::<i64, _>(1)
+                .map_err(|e| AppError::internal_log("解析配额", e))?,
+        ),
+        None => return Err(AppError::not_found("用户不存在")),
+    };
+    let new_used = used + delta_mb;
+    if new_used > quota {
+        return Err(AppError::forbidden(format!(
+            "存储空间不足，配额 {} MB，已使用 {} MB",
+            quota, used
+        )));
+    }
+    sqlx::query("UPDATE users SET used_mb = ? WHERE username = ?")
+        .bind(new_used)
+        .bind(username)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::internal_log("更新配额", e))?;
+    Ok((new_used, quota))
 }
 
 pub async fn log_audit(

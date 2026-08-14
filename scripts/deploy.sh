@@ -55,10 +55,14 @@ fi
 if [ -f "$PROJECT_DIR/assets/manifest.json" ]; then
   cp "$PROJECT_DIR/assets/manifest.json" "$DEPLOY_DIR/assets/manifest.json"
 fi
-# JS 库（htmx/alpine/marked/purify）同样必须拷贝——全新部署缺它们页面无交互
+# JS 库（htmx/alpine/marked/purify）+ 主脚本 app.js（非 .min.js 命名，需显式拷贝）
+# 同样必须拷贝——全新部署缺它们页面无交互
 for f in "$PROJECT_DIR"/assets/*.min.js; do
   [ -f "$f" ] && cp "$f" "$DEPLOY_DIR/assets/"
 done
+if [ -f "$PROJECT_DIR/assets/app.js" ]; then
+  cp "$PROJECT_DIR/assets/app.js" "$DEPLOY_DIR/assets/app.js"
+fi
 
 # 3.5 systemd unit Description 同步当前版本（部署目录副本 + /etc/systemd/system）
 if [ -f "$DEPLOY_DIR/antifield-cloud.service" ]; then

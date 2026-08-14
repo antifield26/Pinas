@@ -64,6 +64,50 @@ pub async fn get_agent_settings(
     }
 }
 
+/// 深度校验自定义 api_base（M1/SSRF）：写入与读取（resolve）共用，防历史/异常数据绕过。
+/// - 仅 https
+/// - 拒绝 IP 直连（含 IPv6 字面量）
+/// - 拒绝 localhost/.local/.internal 与私网/链路本地前缀
+/// - 拒绝常见 DNS 重绑定域名后缀（nip.io/sslip.io/xip.io/localtest.me）
+///
+/// 残余风险：任意域名仍可在请求时重绑定到私网（需 DNS 钉扎才能根除），已在 CLAUDE.md 记录
+pub fn validate_api_base(base: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(base).map_err(|_| "API 基础地址格式非法".to_string())?;
+    if url.scheme() != "https" {
+        return Err("API 基础地址必须使用 https://（拒绝明文与本地传输）".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "API 基础地址缺少主机名".to_string())?
+        .to_ascii_lowercase();
+    let is_literal_ip = host.parse::<std::net::IpAddr>().is_ok();
+    let is_local = host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || host.starts_with("172.16.")
+        || host.starts_with("172.17.")
+        || host.starts_with("172.18.")
+        || host.starts_with("172.19.")
+        || host.starts_with("172.2")
+        || host.starts_with("172.30.")
+        || host.starts_with("172.31.")
+        || host.starts_with("100.")
+        || host.starts_with("0.");
+    let is_rebinding = host.ends_with(".nip.io")
+        || host.ends_with(".sslip.io")
+        || host.ends_with(".xip.io")
+        || host.ends_with(".localtest.me");
+    if is_literal_ip || is_local || is_rebinding {
+        return Err("API 基础地址不允许使用 IP 地址、本地主机或重绑定域名".to_string());
+    }
+    Ok(())
+}
+
 /// PUT /api/agent/settings
 #[tracing::instrument(skip_all)]
 pub async fn save_agent_settings(
@@ -73,31 +117,9 @@ pub async fn save_agent_settings(
 ) -> AppResult<Json<serde_json::Value>> {
     if let Some(ref base) = payload.deepseek_api_base
         && !base.is_empty()
+        && let Err(msg) = validate_api_base(base)
     {
-        // 仅允许 https，且拒绝 IP 直连与本地地址（防自定义 base 被用于窃取全局 key / 探内网）
-        if !base.starts_with("https://") {
-            return Err(AppError::bad_request(
-                "API 基础地址必须使用 https://（拒绝明文与本地传输）",
-            ));
-        }
-        let host_part = base
-            .trim_start_matches("https://")
-            .split(['/', '?', ':'])
-            .next()
-            .unwrap_or("");
-        let is_literal_ip = host_part.parse::<std::net::IpAddr>().is_ok();
-        let is_local_host = host_part.eq_ignore_ascii_case("localhost")
-            || host_part.ends_with(".localhost")
-            || host_part.starts_with("127.")
-            || host_part.starts_with("10.")
-            || host_part.starts_with("192.168.")
-            || host_part.ends_with(".local")
-            || host_part.ends_with(".internal");
-        if is_literal_ip || is_local_host {
-            return Err(AppError::bad_request(
-                "API 基础地址不允许使用 IP 地址或本地主机",
-            ));
-        }
+        return Err(AppError::bad_request(msg));
     }
     if let Some(t) = payload.temperature
         && !(0.0..=2.0).contains(&t)
@@ -110,9 +132,11 @@ pub async fn save_agent_settings(
         return Err(AppError::bad_request("Max tokens 必须在 1 到 8192 之间"));
     }
 
+    // 首次保存（无现有行）时 temperature/max_tokens 为 NULL 会撞 NOT NULL 约束 → 500：
+    // INSERT 侧同样 COALESCE 兜底（与 ON CONFLICT 侧口径一致，部分字段保存可用）
     sqlx::query(
         "INSERT INTO user_settings (username, deepseek_api_key, deepseek_api_base, deepseek_model, temperature, max_tokens)
-         VALUES (?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, COALESCE(?, 0.7), COALESCE(?, 4096))
          ON CONFLICT(username) DO UPDATE SET
              deepseek_api_key = CASE WHEN excluded.deepseek_api_key IS NULL THEN user_settings.deepseek_api_key ELSE NULLIF(excluded.deepseek_api_key, '') END,
              deepseek_api_base = CASE WHEN excluded.deepseek_api_base IS NULL THEN user_settings.deepseek_api_base ELSE NULLIF(excluded.deepseek_api_base, '') END,

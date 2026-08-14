@@ -1,9 +1,6 @@
-// ====== Antifield Cloud Service Worker v13 ======
-// v13 变更：预缓存公开壳 /login 取代 '/'（安装时若已登录，dashboard HTML 含用户名会被
-//          烤进 CacheStorage，跨会话泄漏）；移除未生效的运行时缓存死代码（RUNTIME_CACHE /
-//          evictStaleRuntimeEntries——无任何写入方，activate 又整体清空）；503 兜底统一
-//          text/plain + X-Content-Type-Options（base.html 按状态码处理，不再依赖 content-type）
-const CACHE_NAME = 'antifield-v13';
+// ====== Antifield Cloud Service Worker v14 ======
+// v14 变更：预缓存新增 /assets/app.js（业务脚本全部外置，CSP 不再依赖 unsafe-inline）
+const CACHE_NAME = 'antifield-v14';
 
 // 资源全部本地化（HTMX/Alpine/marked/DOMPurify 均在 assets/）
 // 注：版本号与 HTML 引用（base.html ?v=）严格对齐，保证预缓存命中
@@ -12,6 +9,7 @@ const PRE_CACHE_URLS = [
   '/assets/css/tailwind.min.css?v=18',
   '/assets/htmx.min.js?v=1',
   '/assets/alpine.min.js?v=1',
+  '/assets/app.js?v=1',
   '/assets/marked.min.js?v=1',
   '/assets/purify.min.js?v=1',
   '/assets/manifest.json?v=1',
@@ -19,7 +17,7 @@ const PRE_CACHE_URLS = [
 
 // ====== Install ======
 self.addEventListener('install', (event) => {
-  console.log('[SW] v13 安装中...');
+  console.log('[SW] v14 安装中...');
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(PRE_CACHE_URLS).catch((err) => {
@@ -31,7 +29,7 @@ self.addEventListener('install', (event) => {
 
 // ====== Activate: 清理旧缓存，通知客户端 ======
 self.addEventListener('activate', (event) => {
-  console.log('[SW] v13 已激活，清理旧缓存');
+  console.log('[SW] v14 已激活，清理旧缓存');
   event.waitUntil(
     caches.keys().then((keys) => {
       return Promise.all(
