@@ -17,6 +17,8 @@ macro_rules! page_struct {
             is_admin: bool,
             current_page: String,
             nav: Vec<NavItem>,
+            // dsh Harness 入口（未配置 dsh_public_host 时为空串，导航不渲染）
+            harness_url: String,
         }
     };
 }
@@ -46,13 +48,17 @@ fn page_context(session: &UserSession, page: &str) -> (String, bool, String) {
 
 macro_rules! page_handler {
     ($func:ident, $PageType:ident, $page:expr) => {
-        pub async fn $func(Extension(session): Extension<UserSession>) -> impl IntoResponse {
+        pub async fn $func(
+            Extension(session): Extension<UserSession>,
+            Extension(config): Extension<crate::config::Config>,
+        ) -> impl IntoResponse {
             let (username, is_admin, current_page) = page_context(&session, $page);
             AppTemplate($PageType {
                 username,
                 is_admin,
                 current_page,
                 nav: nav_items(is_admin),
+                harness_url: crate::templates::dsh_public_url(&config),
             })
         }
     };

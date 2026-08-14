@@ -57,6 +57,15 @@ pub struct NavItem {
     pub page: &'static str,
 }
 
+/// dsh Harness 入口 URL（配置了 dsh_public_host 时返回 https://{host}，否则空串不渲染导航项）
+pub fn dsh_public_url(config: &crate::config::Config) -> String {
+    config
+        .dsh_public_host
+        .as_ref()
+        .map(|h| format!("https://{}", h))
+        .unwrap_or_default()
+}
+
 /// 生成导航栏条目（admin 项按权限过滤），页面模板统一消费
 pub fn nav_items(is_admin: bool) -> Vec<NavItem> {
     let mut items = vec![

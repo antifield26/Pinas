@@ -107,6 +107,14 @@ fn extract_auth_token(headers: &HeaderMap) -> Option<String> {
 
 /// Cookie 是否带 Secure 标志：默认强制 Secure（部署于 CF 隧道后，公网 HTTPS）。
 /// 仅纯 HTTP 局域网场景需显式配置 PINAS_COOKIE_SECURE=false
+/// Cookie Domain 属性：统一登录（drive/dsh 同注册域共享会话）
+fn cookie_domain_flag(config: &Config) -> String {
+    match &config.cookie_domain {
+        Some(d) => format!("; Domain={}", d),
+        None => String::new(),
+    }
+}
+
 fn should_secure_cookie(config: &Config) -> bool {
     config.cookie_secure.unwrap_or(true)
 }
@@ -252,8 +260,11 @@ pub async fn login(
                 ""
             };
             let cookie = format!(
-                "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-                token, max_age, secure_flag
+                "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}{}",
+                token,
+                max_age,
+                cookie_domain_flag(&config),
+                secure_flag
             );
 
             let mut resp = (
@@ -544,8 +555,11 @@ pub async fn change_password(
         ""
     };
     let cookie = format!(
-        "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
-        new_token, max_age, secure_flag
+        "auth_token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}{}",
+        new_token,
+        max_age,
+        cookie_domain_flag(&config),
+        secure_flag
     );
 
     let mut resp = (StatusCode::OK, "密码修改成功").into_response();
@@ -614,7 +628,8 @@ pub async fn logout(
     resp.headers_mut().insert(
         axum::http::header::SET_COOKIE,
         format!(
-            "auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+            "auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}{}",
+            cookie_domain_flag(&config),
             secure_flag
         )
         .parse()

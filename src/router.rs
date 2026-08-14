@@ -47,6 +47,9 @@ use crate::constants::*;
 use crate::handlers;
 use crate::middleware::security_headers;
 
+/// 构建 dsh 反代 Router（第二监听专用）
+pub use handlers::build_dsh_router;
+
 /// 构建完整的 Axum Router（注入 pool + config）
 pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
     let body_limit_bytes = (config.upload_limit_mb as usize) * 1024 * 1024;

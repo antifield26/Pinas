@@ -44,6 +44,21 @@ pub struct Config {
     /// AI 每日配额：每用户每日最多 AI 请求次数（防 guest 等账户烧光全局 API 额度）
     #[serde(default = "default_agent_daily_quota")]
     pub agent_daily_quota: u32,
+    /// dsh 反代端口：Some(port) 时在 127.0.0.1 起第二监听，反代 DeepSeek Harness Web UI
+    #[serde(default)]
+    pub dsh_port: Option<u16>,
+    /// dsh 上游地址（仅本地环回，信任栅栏要求）
+    #[serde(default = "default_dsh_upstream_url")]
+    pub dsh_upstream_url: String,
+    /// dsh 公网主机名（如 dsh.antifield.work）：代理注入 Host 头 + 未登录重定向目标
+    #[serde(default)]
+    pub dsh_public_host: Option<String>,
+    /// pinas 公网入口（如 https://drive.antifield.work）：dsh 域下未登录重定向的绝对目标
+    #[serde(default)]
+    pub drive_public_url: Option<String>,
+    /// Cookie Domain 属性：统一登录（drive/dsh 同注册域共享会话）
+    #[serde(default)]
+    pub cookie_domain: Option<String>,
 }
 
 // serde default 函数
@@ -86,6 +101,9 @@ fn default_allow_registration() -> bool {
 fn default_agent_daily_quota() -> u32 {
     200
 }
+fn default_dsh_upstream_url() -> String {
+    "http://127.0.0.1:3080".into()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -109,6 +127,11 @@ impl Default for Config {
             cookie_secure: None,
             sync_passwords: false,
             agent_daily_quota: default_agent_daily_quota(),
+            dsh_port: None,
+            dsh_upstream_url: default_dsh_upstream_url(),
+            dsh_public_host: None,
+            drive_public_url: None,
+            cookie_domain: None,
         }
     }
 }

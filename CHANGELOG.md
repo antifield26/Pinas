@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.8.0 (2026-08-14)
+
+### Added
+- **DeepSeek Harness 反代入口**：第二监听 127.0.0.1:3100（`PINAS_DSH_PORT`），把
+  `pidsh.antifield.work`（cloudflared 本地接入）经 pinas admin 会话认证后全量 HTTP/WS 转发到
+  本地 dsh（127.0.0.1:3080）。WS 仅放行事件下行路径 `/api/events.mux`、`/api/events.host`；
+  dsh 配置平面特权方法（settings/credentials 等 15 项）转发时剥 Origin 并回指环回 Host
+  （对齐 dsh 环回信任栅栏）；未登录经 dsh 域访问时 302 至 drive 登录页（带 redirect）。
+- **统一登录**：`PINAS_COOKIE_DOMAIN`（如 `antifield.work`）让 drive/dsh 同注册域共享会话
+  Cookie；导航栏与首页新增 Harness 入口（仅 admin 可见，新标签打开）。
+- dsh 集成测试：admin-only、Host 注入、坏网关 502、cookie Domain 门控。
+
 ## v1.7.3 (2026-08-13)
 
 ### Changed

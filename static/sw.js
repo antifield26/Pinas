@@ -9,7 +9,7 @@ const RUNTIME_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 运行时缓存条目最长 2
 // 注：版本号与 HTML 引用（base.html ?v=）严格对齐，保证预缓存命中
 const PRE_CACHE_URLS = [
   '/',
-  '/assets/css/tailwind.min.css?v=16',
+  '/assets/css/tailwind.min.css?v=17',
   '/assets/htmx.min.js?v=1',
   '/assets/alpine.min.js?v=1',
   '/assets/marked.min.js?v=1',

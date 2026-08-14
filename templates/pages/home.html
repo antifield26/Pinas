@@ -22,47 +22,14 @@
     </div>
   </div>
 
-  <!-- AI 快速对话 -->
-  <div class="card overflow-hidden">
-    <div class="p-4 border-b border-gray-100 dark:border-gray-800 bg-gradient-to-r from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 flex justify-between items-center">
-      <div>
-        <h2 class="text-base font-semibold text-gray-700 dark:text-gray-300">AI Chat</h2>
-        <p class="text-xs text-gray-400 dark:text-gray-400">由 DeepSeek 驱动</p>
-      </div>
-      <a href="/agent" hx-boost="true" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 transition bg-indigo-100/80 dark:bg-indigo-900/40 hover:bg-indigo-200 dark:hover:bg-indigo-900/60 px-3 py-1.5 rounded-lg">完整对话</a>
-    </div>
-    <div class="p-4">
-      <form hx-post="/agent/chat" hx-target="#home-chat-messages" hx-swap="beforeend" hx-on:after-request="this.reset()">
-        <div id="home-chat-messages" class="mb-3 space-y-2 max-h-48 overflow-y-auto text-sm">
-          <div class="text-center text-gray-400 dark:text-gray-400 py-4">
-            <p class="text-sm font-medium text-gray-500 dark:text-gray-400">AI Chat</p>
-            <p class="text-xs">可回答各类问题，或基于待办/日程生成每日简报</p>
-          </div>
-        </div>
-        <div class="flex gap-2">
-          <input type="text" name="message" placeholder="输入问题或点击快捷操作..." required
-                 class="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg text-sm bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500">
-          <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition">发送</button>
-        </div>
-      </form>
-      <div class="flex gap-2 mt-2 flex-wrap">
-        <button hx-post="/agent/briefing" hx-target="#home-chat-messages" hx-swap="beforeend"
-                class="text-xs bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 hover:bg-purple-200 dark:hover:bg-purple-900/50 px-3 py-1 rounded-lg transition font-medium">
-          生成每日简报
-        </button>
-        <button hx-post="/agent/chat" hx-target="#home-chat-messages" hx-swap="beforeend"
-                hx-vals='{"message":"帮我整理今天的待办事项，按优先级排序并给出建议"}'
-                class="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 px-3 py-1 rounded-lg transition">
-          整理待办
-        </button>
-        <button hx-post="/agent/chat" hx-target="#home-chat-messages" hx-swap="beforeend"
-                hx-vals='{"message":"根据我的日程安排，建议今天的时间规划"}'
-                class="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 px-3 py-1 rounded-lg transition">
-          时间规划
-        </button>
-      </div>
-    </div>
-  </div>
+  <!-- Harness 入口（仅 admin 可见；配置了 dsh_public_host 时显示；新标签打开，不列入功能导航模块） -->
+  {% if harness_url != "" && is_admin %}
+  <a href="{{ harness_url }}" target="_blank" rel="noopener" data-cfasync="false"
+     class="block rounded-2xl p-6 sm:p-8 bg-gradient-to-r from-indigo-600 to-violet-600 dark:from-indigo-700 dark:to-violet-700 text-white shadow-md hover:shadow-lg hover:scale-[1.01] transition cursor-pointer text-center group">
+    <h3 class="text-lg font-bold mb-1">DeepSeek Harness</h3>
+    <p class="text-xs text-indigo-100 dark:text-indigo-200/90">AI 智能体工作台 — 文件操作、待办管理、插件生态（新标签打开）</p>
+  </a>
+  {% endif %}
 
   <!-- 功能导航 -->
   <div class="text-center space-y-1.5 pt-4">
@@ -77,10 +44,6 @@
     <a href="/todos" hx-boost="true" class="card p-6 sm:p-8 hover:border-amber-500 dark:hover:border-amber-400 hover:shadow-md transition cursor-pointer text-center group">
       <h3 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-1">待办/日程</h3>
       <p class="text-xs text-gray-400 dark:text-gray-400">管理待办事项与日程安排，支持优先级排序</p>
-    </a>
-    <a href="/agent" hx-boost="true" class="card p-6 sm:p-8 hover:border-purple-500 dark:hover:border-purple-400 hover:shadow-md transition cursor-pointer text-center group">
-      <h3 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-1">AI Chat</h3>
-      <p class="text-xs text-gray-400 dark:text-gray-400">DeepSeek 驱动，问答、简报生成与对话导出</p>
     </a>
     <a href="/links" hx-boost="true" class="card p-6 sm:p-8 hover:border-blue-500 dark:hover:border-blue-400 hover:shadow-md transition cursor-pointer text-center group">
       <h3 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-1">链接库</h3>

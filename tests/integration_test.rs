@@ -3089,3 +3089,311 @@ async fn test_password_form_fragment() {
         resp.status()
     );
 }
+
+// ====== dsh 反代（统一登录 + HTTP/WS 转发） ======
+
+/// 极简 mock 上游：接收一个请求，记录原始请求文本，返回 "OK host=<Host头>"
+async fn mock_dsh_upstream(seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+            seen.lock().unwrap().push(req_str.clone());
+            let host = req_str
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .starts_with("host: ")
+                        .then(|| l.trim_start_matches("host: ").to_string())
+                })
+                .unwrap_or_default();
+            let body = format!("OK host={}", host);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        }
+    });
+    addr.to_string()
+}
+
+/// 配置 cookie_domain 时 Set-Cookie 携带 Domain 属性；默认不携带
+#[tokio::test]
+async fn test_cookie_domain_flag() {
+    // 配置了 Domain
+    let config = Config {
+        cookie_domain: Some("antifield.work".into()),
+        ..Default::default()
+    };
+    let (_pool, app) = test_app_with_config(config).await;
+    let (token, _) = register_and_login_with_username(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/logout")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sc = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        sc.contains("Domain=antifield.work"),
+        "配置 cookie_domain 后 Set-Cookie 应含 Domain: {}",
+        sc
+    );
+
+    // 默认配置不含 Domain（host-only cookie 语义不变）
+    let (_pool, app) = test_app_with_config(Config::default()).await;
+    let (token, _) = register_and_login_with_username(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/logout")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sc = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        !sc.contains("Domain="),
+        "默认配置 Set-Cookie 不应含 Domain: {}",
+        sc
+    );
+}
+
+/// 未登录访问 dsh 反代：导航 302 到 drive 绝对登录地址，API 401 JSON
+#[tokio::test]
+async fn test_dsh_gate_unauthenticated() {
+    ensure_test_cwd();
+    let pool = test_pool().await;
+    db::init_test_db(&pool).await.unwrap();
+    let config = Config {
+        dsh_public_host: Some("dsh.antifield.work".into()),
+        drive_public_url: Some("https://drive.antifield.work".into()),
+        dsh_upstream_url: "http://127.0.0.1:1".into(),
+        ..Default::default()
+    };
+    let app = router::build_dsh_router(config, pool);
+
+    // 导航请求 → 302 绝对 drive 登录地址（redirect 回 dsh）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let loc = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        loc,
+        "https://drive.antifield.work/login?redirect=https://dsh.antifield.work/"
+    );
+
+    // API 请求（Accept json）→ 401 JSON
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/foo")
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"], "unauthorized");
+}
+
+/// 已登录请求：路径/查询透传 + Host 头注入为 dsh 公网主机名（信任栅栏要求）
+#[tokio::test]
+async fn test_dsh_proxy_forwards_and_injects_host() {
+    ensure_test_cwd();
+    let pool = test_pool().await;
+    db::init_test_db(&pool).await.unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = mock_dsh_upstream(seen.clone()).await;
+    let config = Config {
+        dsh_upstream_url: format!("http://{}", upstream),
+        dsh_public_host: Some("dsh.antifield.work".into()),
+        ..Default::default()
+    };
+    let app = router::build_dsh_router(config, pool.clone());
+    let main_app = router::build_router(Config::default(), pool);
+    let (token, _) = register_and_login_with_username(&main_app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/assets/index.js?rev=1")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).starts_with("OK host="),
+        "mock 响应: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let seen = seen.lock().unwrap();
+    let req_str = seen.first().expect("mock 应收到请求");
+    assert!(
+        req_str.starts_with("GET /assets/index.js?rev=1"),
+        "路径与查询应透传: {}",
+        req_str
+    );
+    assert!(
+        req_str.to_ascii_lowercase().contains("host: dsh.antifield.work"),
+        "Host 头应注入为公网主机名: {}",
+        req_str
+    );
+}
+
+/// 上游不可达：API 502 JSON，导航 502 HTML
+#[tokio::test]
+async fn test_dsh_proxy_bad_gateway() {
+    ensure_test_cwd();
+    let pool = test_pool().await;
+    db::init_test_db(&pool).await.unwrap();
+    let config = Config {
+        dsh_upstream_url: "http://127.0.0.1:1".into(),
+        dsh_public_host: Some("dsh.antifield.work".into()),
+        ..Default::default()
+    };
+    let app = router::build_dsh_router(config, pool.clone());
+    let main_app = router::build_router(Config::default(), pool);
+    let (token, _) = register_and_login_with_username(&main_app).await;
+
+    // API → 502 JSON
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/foo")
+                .header("authorization", format!("Bearer {}", token))
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    // 导航 → 502 HTML
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// dsh 反代仅 admin 可见：普通用户 403，admin 200
+#[tokio::test]
+async fn test_dsh_admin_only() {
+    ensure_test_cwd();
+    let pool = test_pool().await;
+    db::init_test_db(&pool).await.unwrap();
+    let upstream = mock_dsh_upstream(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))).await;
+    let config = Config {
+        dsh_upstream_url: format!("http://{}", upstream),
+        dsh_public_host: Some("pidsh.antifield.work".into()),
+        ..Default::default()
+    };
+    let app = router::build_dsh_router(config, pool.clone());
+    let main_app = router::build_router(Config::default(), pool.clone());
+    let (user_token, username) = register_and_login_with_username(&main_app).await;
+    // 注册的首个用户自动为 admin，显式降为普通用户再断言
+    sqlx::query("UPDATE users SET role = 'user' WHERE username = ?")
+        .bind(&username)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 普通用户 → 403
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("authorization", format!("Bearer {}", user_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 提升为 admin → 200（代理到达 mock 上游）
+    sqlx::query("UPDATE users SET role = 'admin' WHERE username = ?")
+        .bind(&username)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("authorization", format!("Bearer {}", user_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

@@ -52,9 +52,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. 构建路由并启动 HTTP 服务（优雅关闭，支持 SIGINT + SIGTERM）
     let addr = format!("{}:{}", config.server_host, config.server_port);
-    let app = router::build_router(config, pool);
+    let app = router::build_router(config.clone(), pool.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("网盘核心服务已启动，监听: {}", addr);
+
+    // 6.5 第二监听：dsh 反代（仅绑定环回；cloudflared 本地接入，认证走 pinas 会话）
+    if let Some(dsh_port) = config.dsh_port {
+        let dsh_app = router::build_dsh_router(config.clone(), pool.clone());
+        let dsh_listener = tokio::net::TcpListener::bind(("127.0.0.1", dsh_port)).await?;
+        info!("dsh 反代已启动，监听: 127.0.0.1:{}", dsh_port);
+        let dsh_shutdown = cancel_token.clone();
+        tokio::spawn(async move {
+            axum::serve(dsh_listener, dsh_app)
+                .with_graceful_shutdown(async move {
+                    dsh_shutdown.cancelled().await;
+                })
+                .await
+                .expect("dsh 反代服务异常退出");
+        });
+    }
 
     let shutdown_token = cancel_token.clone();
     // 注入 ConnectInfo<SocketAddr>：auth 限速据此区分可信隧道(回环)与直连来源

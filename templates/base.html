@@ -7,7 +7,7 @@
   <script>(function(){var d=localStorage.getItem('theme');if(d==='dark'||(!d&&window.matchMedia('(prefers-color-scheme:dark)').matches)){document.documentElement.classList.add('dark');}})();</script>
   <title>{% block title %}Antifield Cloud{% endblock %}</title>
 
-  <meta name="description" content="自托管 NAS 网盘 — 文件管理、待办日程、AI Chat">
+  <meta name="description" content="自托管 NAS 网盘 — 文件管理、待办日程、AI 智能体">
   <meta name="theme-color" content="#4f46e5" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1b4b" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -17,7 +17,7 @@
 
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
   <link rel="manifest" href="/assets/manifest.json?v=1">
-  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=16">
+  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=17">
 
   <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
   <script src="/assets/htmx.min.js?v=1" data-cfasync="false"></script>
@@ -74,6 +74,10 @@
           <a href="{{ item.href }}" hx-boost="true"
              class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}</a>
           {% endfor %}
+          {% if harness_url != "" && is_admin %}
+          <a href="{{ harness_url }}" target="_blank" rel="noopener" data-cfasync="false"
+             class="px-3 py-1.5 rounded-lg text-sm font-medium transition text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800" title="DeepSeek Harness">Harness</a>
+          {% endif %}
         </div>
 
         <div class="flex items-center gap-2">
@@ -97,6 +101,10 @@
         <a href="{{ item.href }}" hx-boost="true" @click="open = false"
            class="block px-3 py-2 rounded-lg text-sm font-medium {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}</a>
         {% endfor %}
+        {% if harness_url != "" && is_admin %}
+        <a href="{{ harness_url }}" target="_blank" rel="noopener" @click="open = false" data-cfasync="false"
+           class="block px-3 py-2 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800">Harness</a>
+        {% endif %}
         <button hx-get="/account/password-form" hx-target="#modal-container" hx-swap="innerHTML" @click="open = false"
            class="block w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800">账号设置（修改密码）</button>
       </div>
