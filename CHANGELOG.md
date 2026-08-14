@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.8.3 (2026-08-14)
+
+### Fixed（前端与运维卫生）
+- **hx-boost 脚本重执行守卫（H7）**：整页导航把 base.html 内联脚本随 innerHTML 重复执行，
+  document.body 事件监听器层层累积（重复请求/重复 toast/重复模态逻辑）
+  → window.__antifieldInitOnce 一次性守卫，全局初始化只执行一次
+- **表单错误不再静默吞掉**：drive 建夹/重命名/移动/删除失败恒返回 200 列表 + 无差别关弹窗，
+  用户看到"操作成功"假象 → 失败返回列表 + HX-Trigger toastError（base.html 弹错误 Toast），
+  建夹片段同步 M11 INSERT 先行语义（同名 409 提示）
+- **check-versions.sh 正则修复**：字符类不含 / 与 json，CSS/manifest 校验形同虚设
+  （login/change_password/share 曾漂移 ?v=16 未被 CI 拦截）→ 含嵌套路径 + manifest；
+  统一 ?v=18（重建 CSS 补 sr-only）
+- **PWA SW v13**：预缓存公开壳 /login 取代 /（已登录 dashboard 的用户名曾被烤进
+  CacheStorage）；移除 RUNTIME_CACHE 死代码；503 兜底统一 text/plain（base.html 按状态码处理）
+- **marked/purify 懒加载**：两库合计 ~70KB 全站每页加载，仅 AI 聊天与 .md 预览需要
+  → App.renderMarkdown 首次调用动态注入，就绪前纯文本占位、加载完成统一回填
+- **部署纪律**：deploy.sh 脏树默认拒绝（--allow-dirty 显式豁免）、覆盖前自动备份
+  pi_nas.bak.pre-{版本}、systemd unit Description 随版本同步（daemon-reload）；
+  历史事故：未提交 dsh 反代以旧版本号上线、VERSION 与二进制对不上
+- **/health 缓存**：公开端点每请求探 DB 可被免费放大 → 5s TTL 结果缓存（失败不缓存，
+  时间戳每响应刷新）
+- **logout 配置韧性**：Set-Cookie .parse().unwrap() 在 cookie_domain 配置异常时
+  panic=abort 整站崩溃 → 降级为空 Cookie 不崩溃
+- 可访问性：login/change_password/share 输入框补 sr-only label（WCAG 表单关联）
+- extract_ip 信任边界写入文档注释（回环=本地进程信任域；多租户时需收敛）
+- 文档同步：CLAUDE.md 的隧道主机名（cloud/pidsh/mc）、部署方式（systemd 直跑）、
+  fs_journal 表、PWA 离线声明、marked/purify 懒加载
+
 ## v1.8.2 (2026-08-14)
 
 ### Fixed（数据与集成，审计驱动）

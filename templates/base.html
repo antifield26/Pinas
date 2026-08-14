@@ -17,14 +17,14 @@
 
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
   <link rel="manifest" href="/assets/manifest.json?v=1">
-  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=17">
+  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=18">
 
   <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
   <script src="/assets/htmx.min.js?v=1" data-cfasync="false"></script>
   <script defer src="/assets/alpine.min.js?v=1" data-cfasync="false"></script>
-  <!-- Marked + DOMPurify（AI 回复 markdown 渲染 + 文件 markdown 预览；marked v15 无内置 sanitize，必须配 DOMPurify） -->
-  <script defer src="/assets/marked.min.js?v=1" data-cfasync="false"></script>
-  <script defer src="/assets/purify.min.js?v=1" data-cfasync="false"></script>
+  <!-- Marked + DOMPurify 改为按需懒加载（App.renderMarkdown 首次调用时动态注入）：
+       两库合计 ~70KB，历史上全站每页加载，而仅 AI 聊天与 .md 预览需要（marked v15 无内置
+       sanitize，必须配 DOMPurify） -->
 
   {% block head_extra %}{% endblock %}
 
@@ -119,6 +119,11 @@
   <div id="offline-banner" class="hidden fixed bottom-0 sm:bottom-auto left-0 right-0 bg-red-600 text-white text-center text-sm py-2 z-50 font-medium">网络连接已断开</div>
 
   <script>
+    // H7：初始化守卫——hx-boost 整页导航会把本内联脚本随 innerHTML 重复执行，
+    // 历史实现导致 document.body 上的事件监听器层层累积（点击触发重复请求/重复 toast）。
+    // 所有全局初始化只允许执行一次（window 级标志跨导航持久）。
+    if (!window.__antifieldInitOnce) {
+    window.__antifieldInitOnce = true;
     // ====== Antifield App 命名空间 ======
     window.App = {
       showToast: function(msg, type) {
@@ -151,13 +156,35 @@
         if (el) el.remove();
         if (fallback) fallback.classList.remove('hidden');
       },
-      // Markdown 渲染（AI 回复 / 文件预览共用）：marked.parse 后必须经 DOMPurify 消毒，杜绝 XSS
+      // Markdown 渲染（AI 回复 / 文件预览共用）：marked.parse 后必须经 DOMPurify 消毒，杜绝 XSS。
+      // marked/purify 懒加载：首次渲染时动态注入（70KB 不再全站加载）；就绪前先显示纯文本占位，
+      // 两库均加载完成后统一回填渲染（动态脚本异步执行，不可依赖插入顺序）
       renderMarkdown: function(el, raw) {
-        if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
-          el.textContent = raw; // 库未加载（离线首启）时降级纯文本
+        var apply = function() { el.innerHTML = DOMPurify.sanitize(marked.parse(raw)); };
+        if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+          apply();
           return;
         }
-        el.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+        el.textContent = raw;
+        if (!window.__mdPending) window.__mdPending = [];
+        window.__mdPending.push(apply);
+        if (window.__mdLoading) return;
+        window.__mdLoading = true;
+        var tryRun = function() {
+          if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+            var q = window.__mdPending || [];
+            window.__mdPending = null;
+            window.__mdLoading = false;
+            q.forEach(function(f) { f(); });
+          }
+        };
+        ['/assets/marked.min.js?v=1', '/assets/purify.min.js?v=1'].forEach(function(src) {
+          var s = document.createElement('script');
+          s.src = src;
+          s.onload = tryRun;
+          s.onerror = function() { window.__mdLoading = false; };
+          document.head.appendChild(s);
+        });
       }
     };
     // 向后兼容别名（preview.html 的 onerror="showMediaError(this)" 在全局作用域解析，必须有此别名）
@@ -186,7 +213,7 @@
 
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=12', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=13', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;
@@ -210,12 +237,17 @@
         e.detail.shouldSwap = false;
         return;
       }
-      // 离线降级：SW 返回 503 JSON 时保留旧内容 + 提示（不把 JSON 原文 swap 进容器）
-      if (e.detail.xhr && e.detail.xhr.status === 503 &&
-          (e.detail.xhr.getResponseHeader('content-type') || '').indexOf('application/json') !== -1) {
+      // 离线降级：SW 兜底返回 503（text/plain）时保留旧内容 + 提示（不把错误文案 swap 进容器）
+      if (e.detail.xhr && e.detail.xhr.status === 503) {
         e.detail.shouldSwap = false;
         App.showToast('网络连接已断开，请检查网络后重试', 'error');
       }
+    });
+
+    // 服务端文件操作失败提示：HX-Trigger: {"toastError": "..."} → 错误 Toast
+    // （历史实现错误被 fallback 列表静默吞掉，用户看到"操作成功"的假象）
+    document.body.addEventListener('toastError', function(e) {
+      App.showToast((e.detail && e.detail.value) ? e.detail.value : '操作失败', 'error');
     });
 
     // Alpine Toast component
@@ -598,6 +630,7 @@
         }
       }
     };
+    } // end __antifieldInitOnce guard
   </script>
 
   <!-- 拖拽上传覆盖层 -->

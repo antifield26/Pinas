@@ -1,15 +1,15 @@
-// ====== Antifield Cloud Service Worker v12 ======
-// v12 变更：/api/ 响应不再缓存（敏感 JSON 曾永久滞留 CacheStorage 且离线显示陈旧数据）；
-//          activate 时清空运行时缓存；manifest 加入预缓存清单（无版本则永不更新）
-const CACHE_NAME = 'antifield-v12';
-const RUNTIME_CACHE = 'antifield-runtime-v12';
-const RUNTIME_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 运行时缓存条目最长 24h
+// ====== Antifield Cloud Service Worker v13 ======
+// v13 变更：预缓存公开壳 /login 取代 '/'（安装时若已登录，dashboard HTML 含用户名会被
+//          烤进 CacheStorage，跨会话泄漏）；移除未生效的运行时缓存死代码（RUNTIME_CACHE /
+//          evictStaleRuntimeEntries——无任何写入方，activate 又整体清空）；503 兜底统一
+//          text/plain + X-Content-Type-Options（base.html 按状态码处理，不再依赖 content-type）
+const CACHE_NAME = 'antifield-v13';
 
 // 资源全部本地化（HTMX/Alpine/marked/DOMPurify 均在 assets/）
 // 注：版本号与 HTML 引用（base.html ?v=）严格对齐，保证预缓存命中
 const PRE_CACHE_URLS = [
-  '/',
-  '/assets/css/tailwind.min.css?v=17',
+  '/login',
+  '/assets/css/tailwind.min.css?v=18',
   '/assets/htmx.min.js?v=1',
   '/assets/alpine.min.js?v=1',
   '/assets/marked.min.js?v=1',
@@ -19,7 +19,7 @@ const PRE_CACHE_URLS = [
 
 // ====== Install ======
 self.addEventListener('install', (event) => {
-  console.log('[SW] v12 安装中...');
+  console.log('[SW] v13 安装中...');
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(PRE_CACHE_URLS).catch((err) => {
@@ -29,9 +29,9 @@ self.addEventListener('install', (event) => {
   );
 });
 
-// ====== Activate: 清理旧缓存（含旧运行时缓存），通知客户端 ======
+// ====== Activate: 清理旧缓存，通知客户端 ======
 self.addEventListener('activate', (event) => {
-  console.log('[SW] v12 已激活，清理旧缓存');
+  console.log('[SW] v13 已激活，清理旧缓存');
   event.waitUntil(
     caches.keys().then((keys) => {
       return Promise.all(
@@ -80,7 +80,10 @@ async function cacheFirst(request) {
     }
     return response;
   } catch (e) {
-    return new Response('离线状态，请检查网络连接', { status: 503 });
+    return new Response('离线状态，请检查网络连接', {
+      status: 503,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
   }
 }
 
@@ -95,28 +98,7 @@ async function networkFirst(request) {
   }
 }
 
-// 运行时缓存条目老化清理（防体积无界增长；activate 已整体清空，此为运行期兜底）
-async function evictStaleRuntimeEntries() {
-  try {
-    const cache = await caches.open(RUNTIME_CACHE);
-    const keys = await cache.keys();
-    const now = Date.now();
-    for (const key of keys) {
-      const meta = await cache.match(key);
-      if (!meta) continue;
-      const dateHeader = meta.headers.get('date');
-      const ts = dateHeader ? Date.parse(dateHeader) : 0;
-      if (!ts || now - ts > RUNTIME_MAX_AGE_MS) {
-        await cache.delete(key);
-      }
-    }
-  } catch (e) {
-    /* 清理失败无碍主流程 */
-  }
-}
-
 self.addEventListener('message', (event) => {
   if (event.data === 'SKIP_WAITING') self.skipWaiting();
   if (event.data === 'CHECK_UPDATE') self.registration.update();
-  if (event.data === 'EVICT_RUNTIME') evictStaleRuntimeEntries();
 });

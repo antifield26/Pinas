@@ -121,7 +121,10 @@ fn should_secure_cookie(config: &Config) -> bool {
 
 /// 从请求提取限速键（客户端 IP）。
 /// - 直连(对端非回环):忽略一切客户端头,用真实对端 IP —— 杜绝伪造 X-Forwarded-For 绕过限速
-/// - 回环(cloudflared 本地隧道):信任 CF-Connecting-IP > X-Real-IP > X-Forwarded-For 最左侧
+/// - 回环(cloudflared 本地隧道):信任 CF-Connecting-IP > X-Real-IP > X-Forwarded-For 最左侧。
+///   **信任边界（审计记录）**：回环=本地进程信任域——本机任何进程都能伪造这些头，
+///   远程攻击者无法直接触达回环端口（3000 仅被 cloudflared 本地接入）。若未来有
+///   低权限本机多租户，需收敛为仅信任来自 CF 边缘 IP 段的 CF-Connecting-IP
 /// - 无 ConnectInfo(测试场景):回退信任头,无头则 None(调用方按用户名限速)
 pub fn extract_ip(peer_ip: Option<std::net::IpAddr>, headers: &HeaderMap) -> Option<String> {
     match peer_ip {
@@ -644,16 +647,17 @@ pub async fn logout(
         ""
     };
     let mut resp = (StatusCode::OK, "已退出登录").into_response();
-    resp.headers_mut().insert(
-        axum::http::header::SET_COOKIE,
-        format!(
-            "auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}{}",
-            cookie_domain_flag(&config),
-            secure_flag
-        )
-        .parse()
-        .unwrap(),
-    );
+    // cookie_domain 来自 .env 配置：格式异常时 parse 会失败——panic=abort 下 .unwrap()
+    // 会把整站打死（配置错误放大为全站崩溃），降级为空 Set-Cookie 而非崩溃
+    let clear_cookie = format!(
+        "auth_token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}{}",
+        cookie_domain_flag(&config),
+        secure_flag
+    )
+    .parse()
+    .unwrap_or_else(|_| axum::http::HeaderValue::from_static(""));
+    resp.headers_mut()
+        .insert(axum::http::header::SET_COOKIE, clear_cookie);
     // 通知 HTMX 整页跳转到登录页
     resp.headers_mut()
         .insert("HX-Redirect", "/login".parse().unwrap());

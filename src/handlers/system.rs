@@ -80,10 +80,29 @@ async fn calc_cpu_usage() -> f32 {
     }
 }
 
+/// /health 结果缓存（5s TTL）：公开端点 + 每请求探 DB = 免费 DoS 放大面；
+/// 缓存后同一窗口内的探活不触碰数据库（时间戳字段保持新鲜，版本静态）
+static HEALTH_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time::Instant, String)>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
 #[tracing::instrument(skip_all)]
 pub async fn health_check(
     Extension(pool): Extension<sqlx::SqlitePool>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let cache_ttl = std::time::Duration::from_secs(5);
+    {
+        let cached = HEALTH_CACHE.lock().await;
+        if let Some((at, body)) = cached.as_ref()
+            && at.elapsed() < cache_ttl
+        {
+            let mut v: serde_json::Value = serde_json::from_str(body).unwrap_or_else(
+                |_| serde_json::json!({ "status": "healthy", "database": "connected" }),
+            );
+            v["timestamp"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+            return Ok(Json(v));
+        }
+    }
+
     let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&pool)
         .await
@@ -99,6 +118,13 @@ pub async fn health_check(
     });
 
     if db_ok {
+        // 缓存字符串（不含时间戳，读缓存时单独刷新时间戳）
+        let mut cache_body = body.clone();
+        cache_body["timestamp"] = serde_json::json!("");
+        *HEALTH_CACHE.lock().await = Some((
+            std::time::Instant::now(),
+            serde_json::to_string(&cache_body).unwrap_or_default(),
+        ));
         Ok(Json(body))
     } else {
         Err(AppError::service_unavailable("数据库连接失败"))

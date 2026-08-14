@@ -296,12 +296,13 @@ async fn query_files(
     }
 }
 
-/// HTMX 错误恢复：重新查询文件列表并返回模板，同时触发配额刷新
+/// HTMX 错误恢复：重新查询文件列表并返回模板，同时触发配额刷新。
+/// 返回具体类型 Response（两个 fallback 变体供同一 handler 分支共用，opaque impl Trait 会冲突）
 async fn fallback_file_list(
     pool: sqlx::SqlitePool,
     username: String,
     path: String,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let files = query_files(&pool, &username, &path, None, None).await;
     let mut resp = AppTemplate(FileTableFragment {
         files,
@@ -313,6 +314,34 @@ async fn fallback_file_list(
     resp.headers_mut().insert(
         "HX-Trigger",
         axum::http::HeaderValue::from_static("quotaRefresh"),
+    );
+    resp
+}
+
+/// HTMX 错误恢复 + 错误提示：列表照常刷新，同时经 HX-Trigger(JSON) 派发 toastError 事件
+/// （base.html 监听并弹错误 Toast）——历史实现错误被静默吞掉，用户看到"操作成功"的假象
+async fn fallback_file_list_with_error(
+    pool: sqlx::SqlitePool,
+    username: String,
+    path: String,
+    msg: &str,
+) -> axum::response::Response {
+    let files = query_files(&pool, &username, &path, None, None).await;
+    let mut resp = AppTemplate(FileTableFragment {
+        files,
+        current_path: path,
+        has_global_search: false,
+        search: String::new(),
+    })
+    .into_response();
+    let trigger = format!(
+        "{{\"toastError\": {}}}",
+        serde_json::to_string(msg).unwrap_or_else(|_| "\"操作失败\"".to_string())
+    );
+    resp.headers_mut().insert(
+        "HX-Trigger",
+        axum::http::HeaderValue::from_str(&trigger)
+            .unwrap_or(axum::http::HeaderValue::from_static("quotaRefresh")),
     );
     resp
 }
@@ -1258,7 +1287,13 @@ pub async fn drive_create_folder(
     let display = normalize_display_path(&raw);
     let parent = user_dir_path(Some(raw));
     if name.is_empty() {
-        return fallback_file_list(pool.clone(), session.username.clone(), display.clone()).await;
+        return fallback_file_list_with_error(
+            pool.clone(),
+            session.username.clone(),
+            display.clone(),
+            "文件夹名不能为空",
+        )
+        .await;
     }
     let target = match create_folder_common(
         &session.username,
@@ -1268,22 +1303,65 @@ pub async fn drive_create_folder(
     ) {
         Ok(p) => p,
         Err(_) => {
-            return fallback_file_list(pool.clone(), session.username.clone(), display.clone())
-                .await;
+            return fallback_file_list_with_error(
+                pool.clone(),
+                session.username.clone(),
+                display.clone(),
+                "文件夹名包含非法字符",
+            )
+            .await;
         }
     };
+    // M11 一致性：INSERT 先行——UNIQUE 冲突即同名（绝不删除他人目录），成功后再建物理目录
+    match sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
+        .bind(&session.username)
+        .bind(&name)
+        .bind(&parent)
+        .execute(&pool)
+        .await
+    {
+        Ok(_) => {}
+        Err(e)
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation()) =>
+        {
+            return fallback_file_list_with_error(
+                pool.clone(),
+                session.username.clone(),
+                display.clone(),
+                "同名文件夹已存在",
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::error!("[Drive] 文件夹行登记失败: {}", e);
+            return fallback_file_list_with_error(
+                pool.clone(),
+                session.username.clone(),
+                display.clone(),
+                "创建文件夹失败",
+            )
+            .await;
+        }
+    }
     if let Err(e) = tokio::fs::create_dir_all(&target).await {
         tracing::error!("[Drive] 创建目录失败: {}", e);
-        return fallback_file_list(pool.clone(), session.username.clone(), display.clone()).await;
+        let _ = sqlx::query(
+            "DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ? AND is_dir = 1",
+        )
+        .bind(&session.username)
+        .bind(&name)
+        .bind(&parent)
+        .execute(&pool)
+        .await;
+        return fallback_file_list_with_error(
+            pool.clone(),
+            session.username.clone(),
+            display.clone(),
+            "创建文件夹失败",
+        )
+        .await;
     }
-    let _ = sqlx::query(
-        "INSERT OR IGNORE INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)",
-    )
-    .bind(&session.username)
-    .bind(&name)
-    .bind(&parent)
-    .execute(&pool)
-    .await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -1314,7 +1392,16 @@ pub async fn drive_delete_item(
         return fallback_file_list(pool.clone(), session.username.clone(), current_path.clone())
             .await;
     }
-    let _ = delete_to_trash(&pool, &session.username, &parent, &name).await;
+    if let Err(e) = delete_to_trash(&pool, &session.username, &parent, &name).await {
+        tracing::error!("[Drive] 删除失败: {}", e);
+        return fallback_file_list_with_error(
+            pool.clone(),
+            session.username.clone(),
+            current_path.clone(),
+            "删除失败，请稍后重试",
+        )
+        .await;
+    }
     let _ = update_user_used_mb(&pool, &session.username).await;
     let _ = log_audit(
         &pool,
@@ -1365,18 +1452,28 @@ pub async fn drive_rename_item(
     }
     if let Err(e) = rename_core(&pool, &session.username, parent, &old_name, &new_name).await {
         tracing::error!("[Drive] 重命名失败: {}", e);
-    } else {
-        let _ = log_audit(
-            &pool,
-            &session.username,
-            "rename",
-            Some(&logical_path(parent, &old_name)),
-            Some(&format!("-> {}", new_name)),
-            None,
-            None,
+        let msg = match e {
+            AppError::Conflict(m) | AppError::BadRequest(m) => m,
+            _ => "重命名失败，请稍后重试".to_string(),
+        };
+        return fallback_file_list_with_error(
+            pool.clone(),
+            session.username.clone(),
+            current_path.clone(),
+            &msg,
         )
         .await;
     }
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "rename",
+        Some(&logical_path(parent, &old_name)),
+        Some(&format!("-> {}", new_name)),
+        None,
+        None,
+    )
+    .await;
     fallback_file_list(pool.clone(), session.username.clone(), current_path.clone()).await
 }
 
@@ -1439,18 +1536,28 @@ pub async fn drive_move_item(
     }
     if let Err(e) = move_core(&pool, &session.username, src, dst, &name).await {
         tracing::error!("[Drive] 移动失败: {}", e);
-    } else {
-        let _ = log_audit(
-            &pool,
-            &session.username,
-            "move",
-            Some(&logical_path(src, &name)),
-            Some(&format!("-> {}", dst)),
-            None,
-            None,
+        let msg = match e {
+            AppError::Conflict(m) | AppError::BadRequest(m) => m,
+            _ => "移动失败，请稍后重试".to_string(),
+        };
+        return fallback_file_list_with_error(
+            pool.clone(),
+            session.username.clone(),
+            current_path.clone(),
+            &msg,
         )
         .await;
     }
+    let _ = log_audit(
+        &pool,
+        &session.username,
+        "move",
+        Some(&logical_path(src, &name)),
+        Some(&format!("-> {}", dst)),
+        None,
+        None,
+    )
+    .await;
     fallback_file_list(pool.clone(), session.username.clone(), current_path.clone()).await
 }
 

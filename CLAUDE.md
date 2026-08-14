@@ -13,7 +13,7 @@
 | Markdown | marked.js + DOMPurify (AI 聊天渲染) |
 | 数据库 | SQLite WAL 模式 (`cloud_disk.db`) |
 | 目标平台 | `aarch64-unknown-linux-gnu`, `cortex-a76` |
-| 部署 | Docker (多阶段构建) + systemd |
+| 部署 | systemd 直跑二进制（Dockerfile 仅作 CI 冒烟构建） |
 
 ## 架构
 
@@ -87,7 +87,7 @@ Browser                      Axum Server
 │   ├── components/          # 可复用 HTMX 片段 (22 个，含 upload_queue.html)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v11
+├── static/sw.js             # PWA Service Worker v13
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -157,7 +157,7 @@ Browser                      Axum Server
 
 ## 数据库
 
-14 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `media_tokens`, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）
+15 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `media_tokens`, `fs_journal`（文件操作意图日志，启动重放）, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）
 
 - **WAL 模式** (`Normal` synchronous)，连接池 16
 - **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
@@ -231,8 +231,10 @@ MINECRAFT_PORT=25565
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v12 预缓存全部本地资源（含 marked/purify/manifest；`/api/` 一律不缓存防敏感 JSON 滞留；
-  版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验），离线可用
+- PWA：SW v13 预缓存公开壳 `/login` + 全部本地资源（`/api/` 一律不缓存防敏感 JSON 滞留；
+  预缓存登录壳而非 `/`，避免已登录 dashboard 的用户名被烤进 CacheStorage；
+  版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验含嵌套路径与 manifest）；
+  离线仅静态壳/登录页兜底，HTMX 片段与页面离线不可用
 - 版本对齐：Cargo.toml → `/health` version；`?v=` 与 sw.js 预缓存 URL 严格一致（check-versions.sh 强制）
 
 ### UI 规范（v1.5 起）
@@ -296,14 +298,14 @@ curl -s http://localhost:3000/health
 **systemd 服务**: `antifield-cloud.service`，已启用自动启动。
 
 **Cloudflare 隧道**（`cloudflared.service`，公网入口，`/etc/cloudflared/config.yml`）：
-- `drive.antifield.work → http://localhost:3000`；`mc.antifield.work → tcp://localhost:25565`
+- `cloud.antifield.work → http://localhost:3000`；`pidsh.antifield.work → http://localhost:3100`（dsh 反代，admin 会话门禁）；`mc.antifield.work → tcp://localhost:25565`
 - **`protocol: auto`**（QUIC 优先，UDP 失败自动退化 HTTP/2）——曾因 UDP 被 QoS 触发 502 改为 http2，
   TCP 又被限速导致 TLS 5-15s；QUIC 无队头阻塞 + 0-RTT，为当前最优
 - 边缘节点 LAX/SJC（回环 RTT ~200ms），应用本地 TTFB 1ms，瓶颈全在运营商链路
 - 本机 nginx 为默认站点，未参与反代
 
 **性能要点**（2026-08 实测）：
-- 全部前端依赖本地化（htmx/alpine 原走 unpkg，国内链路不可控）；marked/purify 仅 AI 页按需加载
+- 全部前端依赖本地化（htmx/alpine 原走 unpkg，国内链路不可控）；marked/purify 由 `App.renderMarkdown` 首次调用时动态注入（懒加载，全站不预载 70KB）
 - 脚本加 `data-cfasync="false"` 防 Rocket Loader 异步化破坏 htmx 同步时序
 - login/change_password 公开页带 `Cache-Control: public, max-age=60`（浏览器缓存；
   CF 边缘缓存 HTML 需面板 Cache Everything 规则）

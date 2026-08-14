@@ -8,12 +8,14 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FAIL=0
 
 # 提取模板中所有 /assets/xxx?v=N 引用
+# 注：字符类必须含 /（嵌套路径如 /assets/css/tailwind.min.css）与 json（manifest）——
+# 历史正则漏掉二者，CSS 版本校验形同虚设（login/change_password/share 曾漂移 v16 未被拦截）
 echo "==> 模板 ?v= 引用:"
-TEMPLATE_VERSIONS="$(grep -rhoE '/assets/[a-zA-Z0-9._-]+\.(css|js)\?v=[0-9]+' "$PROJECT_DIR/templates" | sort -u)"
+TEMPLATE_VERSIONS="$(grep -rhoE '/assets/[a-zA-Z0-9._/-]+\.(css|js|json)\?v=[0-9]+' "$PROJECT_DIR/templates" | sort -u)"
 echo "$TEMPLATE_VERSIONS"
 
 echo "==> sw.js 预缓存:"
-SW_VERSIONS="$(grep -oE '/assets/[a-zA-Z0-9._-]+\.(css|js)\?v=[0-9]+' "$PROJECT_DIR/static/sw.js" | sort -u)"
+SW_VERSIONS="$(grep -oE '/assets/[a-zA-Z0-9._/-]+\.(css|js|json)\?v=[0-9]+' "$PROJECT_DIR/static/sw.js" | sort -u)"
 echo "$SW_VERSIONS"
 
 # 每项模板引用必须在 SW 预缓存中存在,且版本号一致
