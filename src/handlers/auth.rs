@@ -344,8 +344,22 @@ pub async fn register(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "服务内部错误").into_response(),
     };
 
-    let count = queries::count_users(&pool).await.unwrap_or(0);
-    let role = if count == 0 { ROLE_ADMIN } else { ROLE_USER };
+    // 首个注册者成为 admin：必须放在写事务内判定（SQLite 写锁串行化并发注册）——
+    // 历史实现先 count_users 再 INSERT，两个并发注册同时读到 count==0 会双双成为 admin
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("注册事务失败: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "注册失败").into_response();
+        }
+    };
+    let admin_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE role = ?)")
+            .bind(ROLE_ADMIN)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(true); // DB 异常保守：视为已有 admin，只授 user 角色
+    let role = if admin_exists { ROLE_USER } else { ROLE_ADMIN };
 
     // 直接 INSERT，依赖 UNIQUE 约束防止 TOCTOU 竞态
     // quota_mb 显式写入默认配额（否则 NULL 被当作 0，注册用户将无法上传）
@@ -355,16 +369,21 @@ pub async fn register(
             .bind(&hashed_password)
             .bind(role)
             .bind(config.default_quota_mb)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await;
 
     if let Err(e) = insert_result {
+        let _ = tx.rollback().await;
         if let Some(db_err) = e.as_database_error()
             && db_err.is_unique_violation()
         {
             return (StatusCode::CONFLICT, "用户已被注册").into_response();
         }
         tracing::error!("注册用户失败: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "注册失败").into_response();
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!("注册提交失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "注册失败").into_response();
     }
 

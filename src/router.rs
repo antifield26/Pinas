@@ -34,7 +34,10 @@ impl Predicate for SkipStreamingCompression {
             && let Ok(ct) = ct.to_str()
         {
             let ct = ct.to_ascii_lowercase();
-            if ct.starts_with("video/") || ct.starts_with("audio/") {
+            if ct.starts_with("video/")
+                || ct.starts_with("audio/")
+                || ct.starts_with("text/event-stream")
+            {
                 return false;
             }
         }

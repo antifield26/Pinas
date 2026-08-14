@@ -2230,6 +2230,354 @@ async fn test_chunk_dir_isolated_per_user() {
     );
 }
 
+// ====== 10.2 MR-2 数据与集成回归 (v1.8.2) ======
+
+/// M1 回归：rename 崩溃窗口重放——物理已改、DB 未动，启动重放必须补齐 DB
+#[tokio::test]
+async fn test_journal_replay_rename() {
+    let (pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/docs/a.txt",
+        Some(&auth),
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
+
+    // 模拟崩溃现场：物理已改名、DB 未动、意图日志仍在
+    std::fs::rename(
+        format!("uploads/{}/docs/a.txt", username),
+        format!("uploads/{}/docs/b.txt", username),
+    )
+    .unwrap();
+    sqlx::query("INSERT INTO fs_journal (username, op, src, dst) VALUES (?, 'rename', ?, ?)")
+        .bind(&username)
+        .bind("docs/a.txt")
+        .bind("docs/b.txt")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    pi_nas::handlers::replay_fs_journal(&pool).await;
+
+    let name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM files WHERE username = ? AND parent_path = 'docs'")
+            .bind(&username)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(name.as_deref(), Some("b.txt"), "重放应把 DB 行改为新名");
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fs_journal")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "重放完成后意图日志应清空");
+}
+
+/// M1 回归：trash 崩溃窗口重放——物理已进回收站、DB 未动，重放必须补 trash 行 + 删 files 行
+#[tokio::test]
+async fn test_journal_replay_trash() {
+    let (pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(&app, "PUT", "/dav/t.txt", Some(&auth), b"x".to_vec(), &[]).await;
+
+    let uuid = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all("uploads/.trash").unwrap();
+    std::fs::rename(
+        format!("uploads/{}/t.txt", username),
+        format!("uploads/.trash/{}", uuid),
+    )
+    .unwrap();
+    sqlx::query("INSERT INTO fs_journal (username, op, src, dst) VALUES (?, 'trash', 't.txt', ?)")
+        .bind(&username)
+        .bind(&uuid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    pi_nas::handlers::replay_fs_journal(&pool).await;
+
+    let trash_row: Option<String> =
+        sqlx::query_scalar("SELECT original_path FROM trash WHERE trash_uuid = ?")
+            .bind(&uuid)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(trash_row.as_deref(), Some("t.txt"), "重放应补 trash 行");
+    let files_cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE username = ?")
+        .bind(&username)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files_cnt, 0, "重放应删除 files 行");
+}
+
+/// M5 回归：删除名为 a%b 的文件夹不得误删兄弟目录 aXb 的 DB 行
+#[tokio::test]
+async fn test_delete_wildcard_name_does_not_kill_siblings() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    // 两个兄弟文件夹：a%b 与 aXb（% 是 LIKE 通配符）
+    for name in ["a%b", "aXb"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/create_folder")
+                    .header("authorization", format!("Bearer {}", token))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"name":"{}","current_path":""}}"#,
+                        name
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "建夹失败: {}", name);
+    }
+
+    // 删除 a%b
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/files/delete")
+                .header("authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"a%b","current_path":""}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "删除应成功");
+
+    let sibling: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE username = ? AND name = 'aXb'")
+            .bind(&username)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sibling, 1, "aXb 的 DB 行不得被误删（M5）");
+}
+
+/// M11 回归：并发同名建夹——恰一个成功、一个 409，目录与 DB 行都只有一份
+#[tokio::test]
+async fn test_concurrent_create_folder_same_name() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    let req = |app: &axum::Router| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/files/create_folder")
+                .header("authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"race","current_path":""}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    let (r1, r2) = tokio::join!(req(&app), req(&app));
+    let (s1, s2) = (r1.unwrap().status(), r2.unwrap().status());
+    let ok = i32::from(s1.is_success()) + i32::from(s2.is_success());
+    let conflict = i32::from(s1 == StatusCode::CONFLICT) + i32::from(s2 == StatusCode::CONFLICT);
+    assert_eq!((ok, conflict), (1, 1), "应恰一个成功一个 409");
+
+    assert!(
+        std::path::Path::new(&format!("uploads/{}/race", username)).is_dir(),
+        "物理目录必须存在且只一份（M11）"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE username = ? AND name = 'race'")
+            .bind(&username)
+            .fetch_one(&_pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1, "DB 行必须恰一份（M11）");
+}
+
+/// M10 回归：超配额合并必须保留分片（清理空间后可重试）
+#[tokio::test]
+async fn test_merge_over_quota_keeps_chunks() {
+    let (_pool, app) = test_app().await;
+    let (token_admin, _a) = register_and_login_with_username(&app).await; // 首注册=admin
+    let (token_b, username_b) = register_and_login_with_username(&app).await;
+
+    let identifier = format!("quota-keep-{}", std::process::id());
+    upload_one_chunk(&app, &token_b, &identifier, 0, 1, &vec![0x63u8; CHUNK_SIZE]).await;
+
+    // admin 把 B 的配额压到 0 → 合并必然超配
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/quota")
+                .header("authorization", format!("Bearer {}", token_admin))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"username":"{}","quota_mb":0}}"#,
+                    username_b
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "设置配额失败");
+
+    // 合并 → 必须拒绝
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/files/merge")
+                .header("authorization", format!("Bearer {}", token_b))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"file_name":"out.bin","identifier":"{}","parent_path":"","total_chunks":1}}"#,
+                    identifier
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success(), "超配额合并必须被拒绝");
+
+    // 分片必须还在（M10）
+    assert!(
+        std::path::Path::new(&format!("uploads/tmp/{}/{}/0", username_b, identifier)).is_file(),
+        "超配额拒绝不得删除分片（M10）"
+    );
+}
+
+/// M2 回归：zip 打包跳过符号链接（防递归环/越界打包）
+#[tokio::test]
+async fn test_zip_skips_symlinks() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    dav_send(
+        &app,
+        "PUT",
+        "/dav/real.txt",
+        Some(&auth),
+        b"real".to_vec(),
+        &[],
+    )
+    .await;
+    // 指向目录外的符号链接
+    std::os::unix::fs::symlink("/etc/passwd", format!("uploads/{}/evil.txt", username)).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/files/download_zip")
+                .header("authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"names":["real.txt","evil.txt"],"current_path":""}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref())).expect("zip 应可解析");
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert!(names.iter().any(|n| n == "real.txt"), "常规文件应被打包");
+    assert!(
+        !names.iter().any(|n| n == "evil.txt"),
+        "符号链接必须跳过（M2）"
+    );
+}
+
+/// M3 回归：截断的分片必须在 merge 时被拒绝，不得产出损坏文件
+#[tokio::test]
+async fn test_merge_rejects_truncated_chunk() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    let identifier = format!("trunc-{}", std::process::id());
+    upload_one_chunk(&app, &token, &identifier, 0, 1, &vec![0x64u8; CHUNK_SIZE]).await;
+
+    // 模拟崩溃截断：把分片文件改写为一半大小（check 会误报已传）
+    std::fs::write(
+        format!("uploads/tmp/{}/{}/0", username, identifier),
+        vec![0x64u8; CHUNK_SIZE / 2],
+    )
+    .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/files/merge")
+                .header("authorization", format!("Bearer {}", token))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"file_name":"out.bin","identifier":"{}","parent_path":"","total_chunks":1}}"#,
+                    identifier
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "截断分片必须被拒绝");
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("损坏"),
+        "错误信息应说明分片损坏"
+    );
+}
+
+/// 首注册 admin 竞态回归：并发注册两个用户，必须恰一个 admin
+/// （历史实现先 count 后 INSERT，并发可双双拿到 admin）
+#[tokio::test]
+async fn test_concurrent_first_registrations_single_admin() {
+    let (pool, app) = test_app().await;
+    let reg = |name: &str| {
+        app.clone().oneshot(post_json(
+            "/api/register",
+            &format!(r#"{{"username":"{}","password":"testpass123"}}"#, name),
+        ))
+    };
+    let (r1, r2) = tokio::join!(reg("race_admin_a"), reg("race_admin_b"));
+    assert!(r1.unwrap().status().is_success(), "注册 A 应成功");
+    assert!(r2.unwrap().status().is_success(), "注册 B 应成功");
+
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(admins, 1, "并发首注册只能产生一个 admin");
+}
+
 /// PUT 到不存在的子目录 → 目录行自动创建（ensure_dir_rows）
 #[tokio::test]
 async fn test_dav_put_creates_dir_rows() {
@@ -3387,9 +3735,29 @@ async fn test_dsh_gate_unauthenticated() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    // M12：redirect 参数 percent-encode——路径与查询串不得裸拼进 Location
     assert_eq!(
         loc,
-        "https://drive.antifield.work/login?redirect=https://dsh.antifield.work/"
+        "https://drive.antifield.work/login?redirect=https://dsh.antifield.work%2F"
+    );
+
+    // 带查询串的路径：& 必须被编码，否则 drive 侧 URLSearchParams 解析截断
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/docs?x=1&y=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert_eq!(
+        loc,
+        "https://drive.antifield.work/login?redirect=https://dsh.antifield.work%2Fdocs%3Fx%3D1%26y%3D2",
+        "查询串中的 & 必须编码（M12）"
     );
 
     // API 请求（Accept json）→ 401 JSON
@@ -3435,6 +3803,7 @@ async fn test_dsh_proxy_forwards_and_injects_host() {
                 .method("GET")
                 .uri("/assets/index.js?rev=1")
                 .header("authorization", format!("Bearer {}", token))
+                .header("cookie", format!("auth_token={}", token))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3460,6 +3829,18 @@ async fn test_dsh_proxy_forwards_and_injects_host() {
             .to_ascii_lowercase()
             .contains("host: dsh.antifield.work"),
         "Host 头应注入为公网主机名: {}",
+        req_str
+    );
+    // H6 回归：pinas 会话凭据不得跨进程边界透传
+    let lower = req_str.to_ascii_lowercase();
+    assert!(
+        !lower.contains("authorization:"),
+        "Authorization 头不得转发上游（H6）: {}",
+        req_str
+    );
+    assert!(
+        !lower.contains("cookie:"),
+        "Cookie 头不得转发上游（H6）: {}",
         req_str
     );
 }

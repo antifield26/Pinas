@@ -966,10 +966,16 @@ async fn run_tool_loop(
     username: &str,
     is_admin: bool,
     resolved: &ResolvedAgentConfig,
+    config: &Config,
     messages: &mut Vec<DeepSeekMessage>,
 ) -> Result<(), (StatusCode, String)> {
     let tools = build_tool_defs();
     for _ in 0..5 {
+        // M7：按真实上游调用计费——一次工具循环最多 5 次非流式 + 1 次流式调用，
+        // 历史实现整轮只计 1 次额度，实际 API 消耗被严重低估
+        if let Err(e) = agent_check_rate(config, username, 10).await {
+            return Err((StatusCode::TOO_MANY_REQUESTS, e.to_string()));
+        }
         let resp = call_deepseek(
             &resolved.api_base,
             &resolved.api_key,
@@ -989,25 +995,42 @@ async fn run_tool_loop(
             if let Some(content) = &choice.message.content {
                 let invokes = parse_text_invokes(content);
                 if !invokes.is_empty() {
+                    // M6：文本 <invoke> 转为结构化 assistant.tool_calls + role="tool" 结果——
+                    // 工具结果不再以 role="user" 回注（user 对模型权威更高，恶意文件内容可
+                    // 诱导下一轮真实工具调用）；结构化 role="tool" 是 API 语义正确的注入边界
+                    let calls: Vec<ToolCall> = invokes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (tname, targs))| ToolCall {
+                            id: format!("text-invoke-{i}"),
+                            r#type: "function".to_string(),
+                            function: ToolCallFunction {
+                                name: tname.clone(),
+                                arguments: targs.clone(),
+                            },
+                        })
+                        .collect();
+                    messages.push(DeepSeekMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content.clone()),
+                        tool_calls: Some(calls.clone()),
+                        ..Default::default()
+                    });
                     let ctx = ToolContext {
                         pool,
                         username,
                         is_admin,
                     };
-                    let mut results = String::new();
-                    for (tname, targs) in invokes {
-                        let result = execute_tool(&tname, &targs, &ctx)
-                            .await
-                            .unwrap_or_else(|e| e);
-                        results.push_str(&format!(
-                            "<invoke-result name=\"{tname}\">\n{result}\n</invoke-result>\n"
-                        ));
+                    for (call, (tname, targs)) in calls.iter().zip(invokes.iter()) {
+                        let result = execute_tool(tname, targs, &ctx).await.unwrap_or_else(|e| e);
+                        messages.push(DeepSeekMessage {
+                            role: "tool".to_string(),
+                            content: Some(result),
+                            tool_call_id: Some(call.id.clone()),
+                            name: Some(tname.clone()),
+                            ..Default::default()
+                        });
                     }
-                    messages.push(DeepSeekMessage {
-                        role: "user".to_string(),
-                        content: Some(results),
-                        ..Default::default()
-                    });
                     continue; // 继续工具循环
                 }
                 // 普通回复：保留供流式段继续（避免模型重复生成）
@@ -1181,9 +1204,6 @@ pub async fn agent_chat_stream(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<ChatRequest>,
 ) -> Response {
-    if let Err(e) = agent_check_rate(&config, &session.username, 10).await {
-        return e.into_response();
-    }
     let resolved = match resolve_agent_config(&pool, &config, &session, payload.model.clone()).await
     {
         Ok(r) => r,
@@ -1197,9 +1217,20 @@ pub async fn agent_chat_stream(
         c.push_str(TOOL_INSTRUCTIONS);
     }
     let is_admin = session.role == crate::constants::ROLE_ADMIN;
-    if let Err(e) =
-        run_tool_loop(&pool, &session.username, is_admin, &resolved, &mut messages).await
+    if let Err(e) = run_tool_loop(
+        &pool,
+        &session.username,
+        is_admin,
+        &resolved,
+        &config,
+        &mut messages,
+    )
+    .await
     {
+        return e.into_response();
+    }
+    // M7：最终流式调用也按真实调用计费（工具循环内部已逐次计费）
+    if let Err(e) = agent_check_rate(&config, &session.username, 10).await {
         return e.into_response();
     }
     let upstream = match call_deepseek_stream(
@@ -1237,8 +1268,20 @@ pub async fn agent_chat_stream(
             match upstream.next().await {
                 Some(Ok(bytes)) => {
                     buf.extend_from_slice(&bytes);
-                    while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-                        let raw: Vec<u8> = buf.drain(..pos + 2).collect();
+                    // M14：同时兼容 \n\n 与 \r\n\r\n 分帧——历史只匹配 LF 分隔，
+                    // 上游/兼容网关用 CRLF 时 data 行解析恒失败，客户端零事件且持久化空消息
+                    loop {
+                        let delim = buf
+                            .windows(2)
+                            .position(|w| w == b"\n\n")
+                            .map(|p| (p, 2))
+                            .or_else(|| {
+                                buf.windows(4)
+                                    .position(|w| w == b"\r\n\r\n")
+                                    .map(|p| (p, 4))
+                            });
+                        let Some((pos, len)) = delim else { break };
+                        let raw: Vec<u8> = buf.drain(..pos + len).collect();
                         let text = String::from_utf8_lossy(&raw);
                         let data: String = text
                             .lines()
@@ -1293,13 +1336,29 @@ pub async fn agent_chat_stream(
         stream::poll_fn(move |cx| rx.poll_recv(cx)).map(Ok::<_, std::convert::Infallible>);
     let tail = stream::once(async { Ok(Event::default().data("[DONE]")) });
 
-    Sse::new(event_stream.chain(tail))
+    // M8：SSE 必须显式声明不缓存、不禁缓冲——经 CF 隧道/中间代理时，
+    // 缺 no-cache 可能被边缘缓存，gzip 缓冲会让流式体验"伪卡死"（压缩豁免见 router.rs）
+    let mut resp = Sse::new(event_stream.chain(tail))
         .keep_alive(
             KeepAlive::new()
                 .interval(std::time::Duration::from_secs(15))
                 .text("keep-alive"),
         )
-        .into_response()
+        .into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    h.insert(
+        "x-accel-buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    h.insert(
+        axum::http::header::CONNECTION,
+        axum::http::HeaderValue::from_static("keep-alive"),
+    );
+    resp
 }
 
 /// POST /api/agent/chat — AI 对话（代理到 DeepSeek API）

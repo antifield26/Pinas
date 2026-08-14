@@ -219,6 +219,7 @@ pub async fn upload_chunk(
                         &pool,
                         &session.username,
                         &params.identifier,
+                        params.chunk_index,
                         prev_chunk_len,
                     )
                     .await;
@@ -241,6 +242,7 @@ pub async fn upload_chunk(
                         &pool,
                         &session.username,
                         &params.identifier,
+                        params.chunk_index,
                         prev_chunk_len,
                     )
                     .await;
@@ -252,14 +254,28 @@ pub async fn upload_chunk(
 
     if total_written == 0 {
         let _ = tokio::fs::remove_file(&chunk_path).await;
-        rollback_chunk_counter(&pool, &session.username, &params.identifier, prev_chunk_len).await;
+        rollback_chunk_counter(
+            &pool,
+            &session.username,
+            &params.identifier,
+            params.chunk_index,
+            prev_chunk_len,
+        )
+        .await;
         return Err(AppError::bad_request("分片数据流为空"));
     }
 
     // 首分片 MIME 安全校验
     if is_first_chunk && !is_allowed_mime(&mime_buf[..mime_read]) {
         let _ = tokio::fs::remove_file(&chunk_path).await;
-        rollback_chunk_counter(&pool, &session.username, &params.identifier, prev_chunk_len).await;
+        rollback_chunk_counter(
+            &pool,
+            &session.username,
+            &params.identifier,
+            params.chunk_index,
+            prev_chunk_len,
+        )
+        .await;
         return Err(AppError::forbidden("非法执行文件伪装漏洞防护阻断"));
     }
 
@@ -286,15 +302,42 @@ pub async fn upload_chunk(
     .execute(&pool)
     .await;
 
+    // 记录该片实际字节数（merge 完整性校验依据，M3）：JSON map { "idx": bytes }
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT chunk_sizes FROM upload_chunks WHERE username = ? AND identifier = ?",
+    )
+    .bind(&session.username)
+    .bind(&params.identifier)
+    .fetch_optional(&pool)
+    .await
+    .unwrap_or(None);
+    let mut sizes: serde_json::Map<String, serde_json::Value> = row
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    sizes.insert(
+        params.chunk_index.to_string(),
+        serde_json::json!(total_written),
+    );
+    let _ = sqlx::query(
+        "UPDATE upload_chunks SET chunk_sizes = ? WHERE username = ? AND identifier = ?",
+    )
+    .bind(serde_json::to_string(&sizes).unwrap_or_default())
+    .bind(&session.username)
+    .bind(&params.identifier)
+    .execute(&pool)
+    .await;
+
     Ok((StatusCode::OK, "分片暂存成功"))
 }
 
-/// 分片文件被删除后的计数回滚：该片的旧贡献应从 bytes_received 中扣除
+/// 分片文件被删除后的计数回滚：该片的旧贡献应从 bytes_received 扣除，
+/// 并同步移除 chunk_sizes 中的尺寸记录
 /// （写失败/超限/空流/MIME 阻断路径都会 remove_file，磁盘贡献归零）
 async fn rollback_chunk_counter(
     pool: &sqlx::SqlitePool,
     username: &str,
     identifier: &str,
+    chunk_index: i32,
     prev_len: i64,
 ) {
     if prev_len <= 0 {
@@ -308,6 +351,28 @@ async fn rollback_chunk_counter(
     .bind(identifier)
     .execute(pool)
     .await;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT chunk_sizes FROM upload_chunks WHERE username = ? AND identifier = ?",
+    )
+    .bind(username)
+    .bind(identifier)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if let Some(s) = row
+        && let Ok(mut sizes) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s)
+    {
+        sizes.remove(&chunk_index.to_string());
+        let _ = sqlx::query(
+            "UPDATE upload_chunks SET chunk_sizes = ? WHERE username = ? AND identifier = ?",
+        )
+        .bind(serde_json::to_string(&sizes).unwrap_or_default())
+        .bind(username)
+        .bind(identifier)
+        .execute(pool)
+        .await;
+    }
 }
 
 // --- 5. 分片合并（读取所有已上传分片，按索引排序合并）---
@@ -370,6 +435,34 @@ pub async fn merge_chunks(
             chunks.len(),
             total
         )));
+    }
+
+    // M3：分片尺寸校验——历史只校验索引连续，进程崩溃留下的截断分片会被
+    // 静默合并成损坏文件。chunk_sizes 记录了每片上传时的实际字节数，逐一比对。
+    if let Some(row) = sqlx::query_scalar::<_, String>(
+        "SELECT chunk_sizes FROM upload_chunks WHERE username = ? AND identifier = ?",
+    )
+    .bind(username)
+    .bind(&payload.identifier)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| AppError::internal_log("查询分片尺寸", e))?
+        && let Ok(sizes) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&row)
+    {
+        for idx in &chunks {
+            let expected = sizes.get(&idx.to_string()).and_then(|v| v.as_u64());
+            let actual = tokio::fs::metadata(format!("{}/{}", tmp_dir, idx))
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Some(exp) = expected
+                && exp != actual
+            {
+                return Err(AppError::bad_request(format!(
+                    "分片 {idx} 损坏或不完整（记录 {exp} 字节，实际 {actual} 字节），请重新上传该分片"
+                )));
+            }
+        }
     }
 
     let parent_path = user_dir_path(Some(payload.parent_path));
@@ -443,18 +536,14 @@ pub async fn merge_chunks(
     }
     let _ = out_file.flush().await;
 
-    // 合并后清理临时分片目录和数据库记录
-    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-    let _ = sqlx::query("DELETE FROM upload_chunks WHERE username = ? AND identifier = ?")
-        .bind(username)
-        .bind(&payload.identifier)
-        .execute(&pool)
-        .await;
-
     // 获取文件元数据
     let meta = target_file_path.metadata().map(|m| m.len()).unwrap_or(0);
     let file_size_mb_exact = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
     let file_size_mb_ceil = bytes_to_mb_ceil(meta);
+
+    // M10：配额复核必须先于分片清理——历史顺序先删分片后复核，超配时用户
+    // 连可重试的分片都没了。从此处起手工管理清理：任何失败只删目标文件、保留分片。
+    cleanup.disarm();
 
     // 使用事务避免 TOCTOU 竞态：在事务内原子地检查并扣减配额
     let mut tx = pool
@@ -472,8 +561,10 @@ pub async fn merge_chunks(
             .ok_or_else(|| AppError::not_found("用户不存在"))?;
 
     if current_used + file_size_mb_ceil > quota {
+        drop(tx);
+        let _ = tokio::fs::remove_file(&target_file_path).await;
         return Err(AppError::forbidden(format!(
-            "存储空间不足，配额 {} MB，已使用 {} MB",
+            "存储空间不足，配额 {} MB，已使用 {} MB（分片已保留，清理空间后可重试合并）",
             quota, current_used
         )));
     }
@@ -483,6 +574,8 @@ pub async fn merge_chunks(
         .await
         .map_err(|e| AppError::internal_log("文件完整性检测", e))?
     {
+        drop(tx);
+        let _ = tokio::fs::remove_file(&target_file_path).await;
         return Err(AppError::forbidden("完整文件安全检测未通过：非法内容"));
     }
 
@@ -509,8 +602,13 @@ pub async fn merge_chunks(
         .await
         .map_err(|e| AppError::internal_log("提交配额事务", e))?;
 
-    // 提交成功 — 取消自动清理
-    cleanup.disarm();
+    // 提交成功后清理临时分片目录和数据库记录（此刻才允许删除分片）
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    let _ = sqlx::query("DELETE FROM upload_chunks WHERE username = ? AND identifier = ?")
+        .bind(username)
+        .bind(&payload.identifier)
+        .execute(&pool)
+        .await;
 
     // 审计日志：记录上传操作
     let target = if parent_path.is_empty() {

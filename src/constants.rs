@@ -8,6 +8,9 @@ pub const TMP_DIR: &str = "uploads/tmp";
 pub const TRASH_DIR: &str = "uploads/.trash";
 /// 旧版回收站位置（v1.6.0 及以前），启动迁移用
 pub const LEGACY_TRASH_DIR: &str = "uploads/tmp/trash";
+/// WebDAV MOVE 覆盖的位移目标暂存区（不在 TMP_DIR 内——24h 临时清扫不得触碰；
+/// 崩溃残留由启动恢复任务 recover_dav_disp 还原）
+pub const DAV_DISP_DIR: &str = "uploads/.dav_disp";
 pub const LOGS_DIR: &str = "logs";
 pub const STATIC_DIR: &str = "static";
 pub const ASSETS_DIR: &str = "assets";

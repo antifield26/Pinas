@@ -6,6 +6,7 @@ mod conversations;
 mod dav;
 mod dsh;
 mod file_ops;
+mod journal;
 mod links;
 mod media;
 mod minecraft;
@@ -38,6 +39,9 @@ pub use todos::*;
 pub use trash::*;
 pub use upload::*;
 pub use utils::*;
+
+// 启动时重放文件操作意图日志（main 调用，先于后台清理任务）
+pub use journal::replay as replay_fs_journal;
 
 // 公共 DTO
 use serde::Deserialize;

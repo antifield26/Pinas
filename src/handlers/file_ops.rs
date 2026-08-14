@@ -202,6 +202,13 @@ fn rollback_rename(src: &std::path::Path, dst: &std::path::Path) {
     let _ = std::fs::rename(dst, src);
 }
 
+/// 批量移动回滚：逆序把已移动的条目移回原位（同步 fs，回滚路径可接受阻塞）
+fn rollback_batch_moves(moved: &[(String, std::path::PathBuf, std::path::PathBuf)]) {
+    for (_, s, d) in moved.iter().rev() {
+        let _ = std::fs::rename(d, s);
+    }
+}
+
 // ====== 文件列表查询 ======
 
 /// 查询文件列表并过滤磁盘缺失项
@@ -479,34 +486,37 @@ pub async fn create_folder(
         &name,
         std::path::Path::new(crate::constants::UPLOADS_DIR),
     )?;
-    // 重复预检：先建目录再 INSERT 会在 UNIQUE 冲突时留下孤儿目录 + 返回误导性 500
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE username = ? AND name = ? AND parent_path = ?)",
-    )
-    .bind(&session.username)
-    .bind(&name)
-    .bind(&parent)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(true);
-    if exists {
-        return Err(AppError::conflict("同名文件夹已存在"));
-    }
-    tokio::fs::create_dir_all(&target).await.map_err(|e| {
-        tracing::error!("[Files] 创建目录失败: {}", e);
-        AppError::internal("操作失败")
-    })?;
-    if let Err(e) =
-        sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
-            .bind(&session.username)
-            .bind(&name)
-            .bind(&parent)
-            .execute(&pool)
-            .await
+    // M11：INSERT 先行——UNIQUE 约束是唯一真相源。历史顺序「预检 → 建目录 → INSERT」
+    // 存在并发竞态：两个同名请求都过预检，后到者 INSERT 冲突后 remove_dir 会删掉
+    // 先到者刚建好的目录、留下幽灵行。INSERT 失败直接 conflict，绝不触碰目录。
+    match sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
+        .bind(&session.username)
+        .bind(&name)
+        .bind(&parent)
+        .execute(&pool)
+        .await
     {
-        // INSERT 失败回收刚建的物理目录，不留孤儿
-        let _ = tokio::fs::remove_dir(&target).await;
-        return Err(e.into());
+        Ok(_) => {}
+        Err(e)
+            if e.as_database_error()
+                .is_some_and(|d| d.is_unique_violation()) =>
+        {
+            return Err(AppError::conflict("同名文件夹已存在"));
+        }
+        Err(e) => return Err(e.into()),
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&target).await {
+        // 物理创建失败：回收刚登记的 DB 行，不留幽灵行（DB→磁盘方向，reconcile 可修复）
+        let _ = sqlx::query(
+            "DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ? AND is_dir = 1",
+        )
+        .bind(&session.username)
+        .bind(&name)
+        .bind(&parent)
+        .execute(&pool)
+        .await;
+        tracing::error!("[Files] 创建目录失败: {}", e);
+        return Err(AppError::internal("操作失败"));
     }
     let _ = log_audit(
         &pool,
@@ -550,7 +560,8 @@ pub(crate) async fn ensure_dir_rows(
 
 // ====== 3. 重命名（共享核心逻辑） ======
 
-/// 核心重命名逻辑：文件系统 + 事务内数据库更新 + 子路径更新 + 失败回滚
+/// 核心重命名逻辑：意图日志（M1）先行 → 物理 rename → DB 事务 → 删除日志。
+/// 崩溃于任一步骤时，启动重放补齐/回滚，消除「FS 与 DB 两步非原子」的孤儿窗口
 pub(crate) async fn rename_core(
     pool: &sqlx::SqlitePool,
     username: &str,
@@ -581,43 +592,32 @@ pub(crate) async fn rename_core(
         return Err(AppError::conflict("目标名称已存在，请先移动或删除"));
     }
 
-    tokio::fs::rename(&old_p, &new_p)
-        .await
-        .map_err(|e| AppError::internal_log("文件系统重命名", e))?;
+    let old_logical = logical_path(parent, old_name);
+    let new_logical = logical_path(parent, new_name);
+    let jid =
+        crate::handlers::journal::insert(pool, username, "rename", &old_logical, &new_logical)
+            .await?;
 
-    let mut tx = pool.begin().await.map_err(|e| {
-        let _ = std::fs::rename(&new_p, &old_p);
-        AppError::internal_log("开启事务", e)
-    })?;
+    if let Err(e) = tokio::fs::rename(&old_p, &new_p).await {
+        crate::handlers::journal::remove(pool, jid).await;
+        return Err(AppError::internal_log("文件系统重命名", e));
+    }
 
-    sqlx::query("UPDATE files SET name = ? WHERE username = ? AND name = ? AND parent_path = ?")
-        .bind(new_name)
-        .bind(username)
-        .bind(old_name)
-        .bind(parent)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            rollback_rename(&old_p, &new_p);
-            AppError::internal_log("数据库更新", e)
-        })?;
-
-    update_child_parent_paths(
-        &mut tx,
+    if let Err(e) = crate::handlers::journal::apply_db_rename_move(
+        pool,
         username,
-        &logical_path(parent, old_name),
-        &logical_path(parent, new_name),
+        "rename",
+        &old_logical,
+        &new_logical,
     )
     .await
-    .map_err(|e| {
+    {
         rollback_rename(&old_p, &new_p);
-        AppError::internal_log("子路径更新", e)
-    })?;
+        crate::handlers::journal::remove(pool, jid).await;
+        return Err(e);
+    }
 
-    tx.commit().await.map_err(|e| {
-        rollback_rename(&old_p, &new_p);
-        AppError::internal_log("提交事务", e)
-    })?;
+    crate::handlers::journal::remove(pool, jid).await;
     Ok(())
 }
 
@@ -692,45 +692,32 @@ pub(crate) async fn move_core(
         return Err(AppError::conflict("目标目录存在同名文件，请先移动或删除"));
     }
 
-    tokio::fs::rename(&src_p, &dst_p)
-        .await
-        .map_err(|e| AppError::internal_log("文件系统移动", e))?;
+    // 意图日志先行（M1）：崩溃后启动重放补齐
+    let src_logical = logical_path(src_parent, name);
+    let dst_logical = logical_path(dst_parent, name);
+    let jid = crate::handlers::journal::insert(pool, username, "move", &src_logical, &dst_logical)
+        .await?;
 
-    let mut tx = pool.begin().await.map_err(|e| {
-        let _ = std::fs::rename(&dst_p, &src_p);
-        AppError::internal_log("开启事务", e)
-    })?;
+    if let Err(e) = tokio::fs::rename(&src_p, &dst_p).await {
+        crate::handlers::journal::remove(pool, jid).await;
+        return Err(AppError::internal_log("文件系统移动", e));
+    }
 
-    sqlx::query(
-        "UPDATE files SET parent_path = ? WHERE username = ? AND name = ? AND parent_path = ?",
-    )
-    .bind(dst_parent)
-    .bind(username)
-    .bind(name)
-    .bind(src_parent)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        let _ = std::fs::rename(&dst_p, &src_p);
-        AppError::internal_log("数据库更新", e)
-    })?;
-
-    update_child_parent_paths(
-        &mut tx,
+    if let Err(e) = crate::handlers::journal::apply_db_rename_move(
+        pool,
         username,
-        &logical_path(src_parent, name),
-        &logical_path(dst_parent, name),
+        "move",
+        &src_logical,
+        &dst_logical,
     )
     .await
-    .map_err(|e| {
-        let _ = std::fs::rename(&dst_p, &src_p);
-        AppError::internal_log("子路径更新", e)
-    })?;
+    {
+        rollback_rename(&src_p, &dst_p);
+        crate::handlers::journal::remove(pool, jid).await;
+        return Err(e);
+    }
 
-    tx.commit().await.map_err(|e| {
-        let _ = std::fs::rename(&dst_p, &src_p);
-        AppError::internal_log("提交事务", e)
-    })?;
+    crate::handlers::journal::remove(pool, jid).await;
     Ok(())
 }
 
@@ -777,28 +764,53 @@ pub async fn move_batch(
     let dst = user_dir_path(Some(payload.target_path));
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
     let mut moved: Vec<(String, std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    // 意图日志（M1）：每个条目在物理移动前落一条记录，崩溃后逐条重放
+    let mut jids: Vec<i64> = Vec::new();
 
     for name in &payload.names {
         let sp = match safe_join_sandbox(base, &user_file_path(&session.username, &src, name)) {
             Ok(p) => p,
-            Err(_) => return (StatusCode::BAD_REQUEST, "包含非法路径").into_response(),
+            Err(_) => {
+                rollback_batch_moves(&moved);
+                crate::handlers::journal::remove_many(&pool, &jids).await;
+                return (StatusCode::BAD_REQUEST, "包含非法路径").into_response();
+            }
         };
         let dp = match safe_join_sandbox(base, &user_file_path(&session.username, &dst, name)) {
             Ok(p) => p,
-            Err(_) => return (StatusCode::BAD_REQUEST, "包含非法路径").into_response(),
+            Err(_) => {
+                rollback_batch_moves(&moved);
+                crate::handlers::journal::remove_many(&pool, &jids).await;
+                return (StatusCode::BAD_REQUEST, "包含非法路径").into_response();
+            }
         };
         // 目标冲突预检：fs rename 覆盖已存在目标即永久销毁其内容（同 rename_core/move_core）
         if tokio::fs::try_exists(&dp).await.unwrap_or(true) {
-            for (_, s, d) in moved.iter().rev() {
-                let _ = tokio::fs::rename(d, s).await;
-            }
+            rollback_batch_moves(&moved);
+            crate::handlers::journal::remove_many(&pool, &jids).await;
             return (StatusCode::CONFLICT, format!("目标存在同名文件: {}", name)).into_response();
         }
+        let jid = match crate::handlers::journal::insert(
+            &pool,
+            &session.username,
+            "move",
+            &logical_path(&src, name),
+            &logical_path(&dst, name),
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(_) => {
+                rollback_batch_moves(&moved);
+                crate::handlers::journal::remove_many(&pool, &jids).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
+            }
+        };
+        jids.push(jid);
         if let Err(e) = tokio::fs::rename(&sp, &dp).await {
             tracing::error!("[Files] 批量移动 '{}' 失败: {}", name, e);
-            for (_, s, d) in moved.iter().rev() {
-                let _ = tokio::fs::rename(d, s).await;
-            }
+            rollback_batch_moves(&moved);
+            crate::handlers::journal::remove_many(&pool, &jids).await;
             return (StatusCode::INTERNAL_SERVER_ERROR, "移动失败，操作已回滚").into_response();
         }
         moved.push((name.clone(), sp, dp));
@@ -807,9 +819,8 @@ pub async fn move_batch(
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
-            for (_, s, d) in moved.iter().rev() {
-                let _ = std::fs::rename(d, s);
-            }
+            rollback_batch_moves(&moved);
+            crate::handlers::journal::remove_many(&pool, &jids).await;
             tracing::error!("[Files] 批量移动事务失败: {}", e);
             return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
         }
@@ -826,9 +837,9 @@ pub async fn move_batch(
         .execute(&mut *tx)
         .await
         {
-            for (_, s, d) in moved.iter().rev() {
-                let _ = std::fs::rename(d, s);
-            }
+            drop(tx);
+            rollback_batch_moves(&moved);
+            crate::handlers::journal::remove_many(&pool, &jids).await;
             tracing::error!("[Files] 批量移动数据库更新失败: {}", e);
             return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
         }
@@ -840,20 +851,22 @@ pub async fn move_batch(
         )
         .await
         {
-            for (_, s, d) in moved.iter().rev() {
-                let _ = std::fs::rename(d, s);
-            }
+            drop(tx);
+            rollback_batch_moves(&moved);
+            crate::handlers::journal::remove_many(&pool, &jids).await;
             tracing::error!("[Files] 批量移动子路径更新失败: {}", e);
             return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
         }
     }
     if let Err(e) = tx.commit().await {
-        for (_, s, d) in moved.iter().rev() {
-            let _ = std::fs::rename(d, s);
-        }
+        rollback_batch_moves(&moved);
+        crate::handlers::journal::remove_many(&pool, &jids).await;
         tracing::error!("[Files] 批量移动提交失败: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "操作失败，请稍后重试").into_response();
     }
+
+    // 全部成功：清除意图日志
+    crate::handlers::journal::remove_many(&pool, &jids).await;
 
     let _ = log_audit(
         &pool,
@@ -885,21 +898,54 @@ pub(crate) async fn delete_to_trash(
         let trash_uuid = Uuid::new_v4().to_string();
         let trash_dir = std::path::Path::new(crate::constants::TRASH_DIR);
         let _ = tokio::fs::create_dir_all(trash_dir).await;
-        tokio::fs::rename(&physical, trash_dir.join(&trash_uuid))
-            .await
-            .map_err(|e| {
-                tracing::error!("[Files] 回收失败: {}", e);
-                AppError::internal("操作失败")
-            })?;
-        let _ =
-            sqlx::query("INSERT INTO trash (username, original_path, trash_uuid) VALUES (?, ?, ?)")
-                .bind(username)
-                .bind(&full)
-                .bind(&trash_uuid)
-                .execute(pool)
-                .await;
+
+        // 意图日志先行（M1）：崩溃后启动重放补齐 trash 行 + files 行删除
+        let jid =
+            crate::handlers::journal::insert(pool, username, "trash", &full, &trash_uuid).await?;
+
+        if let Err(e) = tokio::fs::rename(&physical, trash_dir.join(&trash_uuid)).await {
+            crate::handlers::journal::remove(pool, jid).await;
+            tracing::error!("[Files] 回收失败: {}", e);
+            return Err(AppError::internal("操作失败"));
+        }
+
+        let db_result = async {
+            let _ = sqlx::query(
+                "INSERT INTO trash (username, original_path, trash_uuid) VALUES (?, ?, ?)",
+            )
+            .bind(username)
+            .bind(&full)
+            .bind(&trash_uuid)
+            .execute(pool)
+            .await?;
+            db_delete_file_rows(pool, username, parent_path, name).await
+        }
+        .await;
+
+        if let Err(e) = db_result {
+            // 回滚物理移动 + 清除日志（不留下半截状态）
+            let _ = std::fs::rename(trash_dir.join(&trash_uuid), &physical);
+            crate::handlers::journal::remove(pool, jid).await;
+            return Err(e);
+        }
+        crate::handlers::journal::remove(pool, jid).await;
+    } else {
+        // 物理不存在：仅清理 DB 行（纯 DB 操作，天然原子，无需日志）
+        db_delete_file_rows(pool, username, parent_path, name).await?;
     }
-    // 清理 DB 记录（目录子树一并清理）
+    Ok(())
+}
+
+/// 删除 files 表中的目标行及其子路径行。
+/// 子路径前缀必须 escape_like 转义（配合 ESCAPE '\'）——文件名含 %/_ 时
+/// 历史实现会误删兄弟目录的 DB 行（M5 修复）。
+pub(crate) async fn db_delete_file_rows(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    parent_path: &str,
+    name: &str,
+) -> Result<(), AppError> {
+    use crate::db::queries::escape_like;
     sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
         .bind(username)
         .bind(name)
@@ -907,11 +953,11 @@ pub(crate) async fn delete_to_trash(
         .execute(pool)
         .await?;
     let child_prefix = if parent_path.is_empty() {
-        format!("{}/%", name)
+        format!("{}/%", escape_like(name))
     } else {
-        format!("{}/{}/%", parent_path, name)
+        format!("{}/{}/%", escape_like(parent_path), escape_like(name))
     };
-    let _ = sqlx::query("DELETE FROM files WHERE username = ? AND parent_path LIKE ?")
+    let _ = sqlx::query("DELETE FROM files WHERE username = ? AND parent_path LIKE ? ESCAPE '\\'")
         .bind(username)
         .bind(&child_prefix)
         .execute(pool)

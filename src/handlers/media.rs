@@ -425,23 +425,33 @@ pub async fn download_zip(
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::DEFLATE)
             .unix_permissions(0o644);
+        // M2：打包预算——总字节 + 条目数双重上限，防反向 zip bomb（超大目录/符号链接环
+        // 打爆 tmpfs 或 SD 卡）；符号链接一律跳过（不跟随，杜绝递归环与越界打包）
+        let mut budget = ZipBudget::new();
 
         for (name, full_path) in items {
             // 条目名净化：跳过 "."/".."（防 zip-slip 解压穿越）
             if name == "." || name == ".." {
                 continue;
             }
-            if full_path.is_file() {
+            let meta = std::fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
+            if meta.file_type().is_symlink() {
+                tracing::warn!("[Media] zip 跳过符号链接: {:?}", full_path);
+                continue;
+            }
+            if meta.is_file() {
+                budget.charge(meta.len())?;
                 let mut file = std::fs::File::open(&full_path).map_err(|e| e.to_string())?;
                 zip_writer
                     .start_file(&name, options)
                     .map_err(|e| e.to_string())?;
                 std::io::copy(&mut file, &mut zip_writer).map_err(|e| e.to_string())?;
-            } else if full_path.is_dir() {
+            } else if meta.is_dir() {
+                budget.charge(0)?;
                 zip_writer
                     .add_directory(&name, SimpleFileOptions::default())
                     .map_err(|e| e.to_string())?;
-                add_dir_to_zip_sync(&mut zip_writer, &full_path, &name, options)?;
+                add_dir_to_zip_sync(&mut zip_writer, &full_path, &name, options, &mut budget)?;
             }
         }
         zip_writer.finish().map_err(|e| e.to_string())?;
@@ -512,12 +522,46 @@ impl Drop for DeleteOnDropFile {
     }
 }
 
-// 辅助：同步递归添加目录到 ZIP
+// M2：打包预算上限（总字节 + 条目数），防反向 zip bomb 打爆 tmpfs/SD 卡
+const ZIP_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ZIP_MAX_ENTRIES: usize = 10_000;
+
+struct ZipBudget {
+    total_bytes: u64,
+    entries: usize,
+}
+
+impl ZipBudget {
+    fn new() -> Self {
+        Self {
+            total_bytes: 0,
+            entries: 0,
+        }
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<(), String> {
+        if self.entries + 1 > ZIP_MAX_ENTRIES {
+            return Err(format!("打包条目数超过上限 {ZIP_MAX_ENTRIES}"));
+        }
+        if self.total_bytes.saturating_add(bytes) > ZIP_MAX_TOTAL_BYTES {
+            return Err(format!(
+                "打包总大小超过上限 {} GB",
+                ZIP_MAX_TOTAL_BYTES / 1024 / 1024 / 1024
+            ));
+        }
+        self.entries += 1;
+        self.total_bytes += bytes;
+        Ok(())
+    }
+}
+
+// 辅助：同步递归添加目录到 ZIP（符号链接跳过，预算逐条扣减）
 fn add_dir_to_zip_sync(
     zip_writer: &mut zip::ZipWriter<std::fs::File>,
     dir_path: &std::path::Path,
     zip_prefix: &str,
     options: SimpleFileOptions,
+    budget: &mut ZipBudget,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir_path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -527,18 +571,27 @@ fn add_dir_to_zip_sync(
         if name == "." || name == ".." {
             continue;
         }
+        // dirent 的 file_type 不跟随符号链接：符号链接一律跳过（防递归环/越界打包）
+        let ftype = entry.file_type().map_err(|e| e.to_string())?;
+        if ftype.is_symlink() {
+            tracing::warn!("[Media] zip 跳过符号链接: {:?}", path);
+            continue;
+        }
         let zip_name = format!("{}/{}", zip_prefix, name);
-        if path.is_file() {
+        if ftype.is_file() {
+            let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+            budget.charge(meta.len())?;
             let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
             zip_writer
                 .start_file(&zip_name, options)
                 .map_err(|e| e.to_string())?;
             std::io::copy(&mut file, zip_writer).map_err(|e| e.to_string())?;
-        } else if path.is_dir() {
+        } else if ftype.is_dir() {
+            budget.charge(0)?;
             zip_writer
                 .add_directory(&zip_name, SimpleFileOptions::default())
                 .map_err(|e| e.to_string())?;
-            add_dir_to_zip_sync(zip_writer, &path, &zip_name, options)?;
+            add_dir_to_zip_sync(zip_writer, &path, &zip_name, options, budget)?;
         }
     }
     Ok(())

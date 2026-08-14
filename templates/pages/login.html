@@ -74,10 +74,26 @@
           if (data.must_change_pwd) {
             window.location.href = '/change-password';
           } else {
-            // redirect 仅允许站内绝对路径：拒绝 https://、//evil.com、javascript: 等（开放重定向/XSS）
+            // redirect 校验（M12）：站内绝对路径照旧；绝对 URL 仅允许同注册域
+            // （dsh 统一登录回跳 https://pidsh.antifield.work/...）；
+            // 拒绝 //evil.com、javascript:、跨域、反斜杠形式等（开放重定向/XSS）
             var params = new URLSearchParams(window.location.search);
             var target = params.get('redirect') || '/';
-            if (target.charAt(0) !== '/' || target.charAt(1) === '/') target = '/';
+            if (target.charAt(0) === '/') {
+              if (target.charAt(1) === '/') target = '/';
+            } else {
+              try {
+                var u = new URL(target);
+                var host = window.location.hostname;
+                var regDomain = host.split('.').slice(-2).join('.');
+                var sameRegDomain = u.hostname === host ||
+                  u.hostname === regDomain ||
+                  u.hostname.endsWith('.' + regDomain);
+                if (u.protocol !== 'https:' || !sameRegDomain) target = '/';
+              } catch (e) {
+                target = '/';
+              }
+            }
             window.location.href = target;
           }
         } else {

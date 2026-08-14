@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.8.2 (2026-08-14)
+
+### Fixed（数据与集成，审计驱动）
+- **文件操作意图日志（M1）**：rename/move/delete 的 FS 与 DB 两步非原子，崩溃产生孤儿文件/
+  幽灵记录且孤儿永不恢复 → 新增 fs_journal 表（迁移 v10）：物理操作前落意图，完成后删除；
+  启动时重放（FS 完成补 DB / FS 未动重做 / 双方缺失告警），单条失败保留待下次重试。
+  覆盖 rename_core/move_core/move_batch/delete_to_trash（dav MOVE 复用同一核心自动受益）
+- **WebDAV MOVE 覆盖位移恢复（M9）**：位移目标存 uploads/tmp 会被 24h 清扫销毁 →
+  迁至 uploads/.dav_disp + JSON 元数据（目标路径 + 暂存 DB 行），启动任务
+  recover_dav_disp 按现场还原（覆盖完成则清理，中断则还原文件 + 重建 DB 行）
+- **ZIP 打包上限与符号链接防护（M2）**：无总量/条目上限 + is_file/is_dir 跟随符号链接
+  （递归环/反向 zip bomb）→ 2GB/1 万条目预算逐条扣减，symlink 一律跳过（含顶层与递归）
+- **分片完整性校验（M3）**：断点续传只校验索引连续，截断分片被静默合并成损坏文件 →
+  upload_chunks.chunk_sizes 记录每片实际字节，merge 逐一比对，损坏即拒绝并提示重传
+- **merge 配额顺序（M10）**：先删分片后复核配额，超配即永久丢失分片 → 复核（事务内）前移，
+  超配/MIME 拒绝只删目标文件、保留分片供清理空间后重试
+- **建夹并发竞态（M11）**：预检→建目录→INSERT 的顺序下，后到者冲突后删掉先到者刚建的目录
+  → INSERT 先行（UNIQUE 冲突即 409，绝不触碰目录），建目录失败回收 DB 行
+- **删除子路径 LIKE 转义（M5）**：文件名含 %/_ 时 delete_to_trash 误删兄弟目录 DB 行 →
+  child_prefix 全段 escape_like + ESCAPE '\'（与 dav/update_child_paths 对齐）
+- **AI 工具结果结构化回注（M6）**：文本 <invoke> 的工具结果以 role="user" 回注（权威过高，
+  恶意文件内容可诱导二次工具调用）→ 转为结构化 assistant.tool_calls + role="tool"
+  （合成 tool_call_id，与结构化路径语义一致）
+- **AI 配额按真实调用计费（M7）**：一次工具循环最多 6 次上游调用只计 1 次额度 →
+  循环内与最终流式调用逐次 agent_check_rate
+- **SSE 响应加固（M8）**：补 Cache-Control: no-cache + X-Accel-Buffering: no +
+  Connection: keep-alive；压缩谓词豁免 text/event-stream（防边缘缓存/gzip 缓冲破坏流式）
+- **SSE 分帧兼容 CRLF（M14）**：上游用 \r\n\r\n 分帧时 data 行解析恒失败（零事件 + 空消息持久化）
+  → 同时匹配 \n\n 与 \r\n\r\n
+- **统一登录回跳修复（M12）**：drive 登录页拒绝绝对 https redirect，dsh 域登录后落到首页
+  而非返回 harness；redirect 参数未编码、& 截断 → 登录页放行同注册域绝对 URL（跨域仍拒绝），
+  dsh 侧 redirect 参数百分号编码
+- **首注册 admin 竞态**：count 后 INSERT 的顺序下并发注册可双双成为 admin →
+  写事务内判定 admin 存在性（SQLite 写锁串行化），恰一个 admin
+- **dsh 路由 body limit（L8）**：axum 默认 2MB 先于上游 160MB 限制拒绝大附件 → 256MB
+
+### Tests
+- 集成测试 62 → 70(+8)：journal 重放（rename/trash）、% 通配符删除隔离、并发建夹、
+  超配额保留分片、zip 跳过符号链接、截断分片拒绝、dsh 凭据剥离与 redirect 编码、
+  并发首注册单 admin
+
 ## v1.8.1 (2026-08-14)
 
 ### Security（审计驱动的关键修复）

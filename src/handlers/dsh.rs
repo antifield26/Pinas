@@ -461,7 +461,14 @@ pub async fn dsh_auth_gate(
             {
                 let drive = drive.trim_end_matches('/');
                 let new_loc = if loc.starts_with("/login") {
-                    format!("{}/login?redirect=https://{}{}", drive, public_host, uri)
+                    // M12：redirect 参数必须 percent-encode——dsh 路径中的 &/? 会截断
+                    // drive 侧对 redirect 的 URLSearchParams 解析
+                    format!(
+                        "{}/login?redirect=https://{}{}",
+                        drive,
+                        public_host,
+                        pct_encode(&uri.to_string())
+                    )
                 } else if loc.starts_with("/change-password") {
                     format!("{}/change-password", drive)
                 } else {
@@ -484,11 +491,29 @@ pub async fn dsh_auth_gate(
     Ok(resp)
 }
 
+/// 最小 percent-encoding（RFC 3986 unreserved 之外全部编码）：Location 头参数注入前必用，
+/// 防路径中的 &/?# 截断或注入目标站点参数
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// 构建 dsh 反代 Router（第二监听专用，不挂 pinas 的 CSP/压缩层）
 pub fn build_dsh_router(config: Config, pool: sqlx::SqlitePool) -> Router {
     Router::new()
         .route("/{*path}", any(dsh_entry))
         .route("/", any(dsh_entry))
+        // dsh 上游 maxRequestBodyBytes 默认 ~160MB：本地 body limit 覆盖 axum 默认 2MB，
+        // 防大附件/文档上传被 413 卡死（L8）
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         // 后加的 layer 先执行：gate(外层) → auth_middleware(内层) → handler
         .layer(middleware::from_fn(auth_middleware))
         .layer(middleware::from_fn(dsh_auth_gate))

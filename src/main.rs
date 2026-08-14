@@ -46,6 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db::init(&pool, &config).await?;
     tokio::fs::create_dir_all(TRASH_DIR).await?;
 
+    // 4.5 文件操作意图日志重放（崩溃恢复）：必须先于后台清理任务——
+    // 重放需要以崩溃时刻的磁盘/DB 状态为准，清扫任务不得先行改变现场
+    pi_nas::handlers::replay_fs_journal(&pool).await;
+
     // 5. 创建全局取消令牌，并启动后台清理任务
     let cancel_token = CancellationToken::new();
     tasks::cleanup::spawn_all(&pool, &config, cancel_token.clone());

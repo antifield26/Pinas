@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 9;
+const CURRENT_VERSION: i32 = 10;
 
 /// 执行所有待迁移的 schema 变更。
 /// SQLite DDL 事务化：整批迁移一个事务，失败整体回滚，杜绝半迁移状态；
@@ -94,6 +94,14 @@ pub async fn run(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
             .execute(&mut *tx)
             .await?;
         tracing::info!("[DB] Schema 迁移到 v9 完成");
+    }
+
+    if current < 10 {
+        apply_v10_migrations(&mut tx).await?;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (10)")
+            .execute(&mut *tx)
+            .await?;
+        tracing::info!("[DB] Schema 迁移到 v10 完成");
     }
 
     tx.commit().await?;
@@ -310,6 +318,38 @@ async fn apply_v4_migrations(
     .await
     .ok();
     tracing::info!("[DB] v4 迁移: upload_chunks 添加 bytes_received 列与 created_at 索引");
+    Ok(())
+}
+
+/// v10: 文件操作意图日志（fs_journal）+ 分片尺寸记录（upload_chunks.chunk_sizes）。
+/// fs_journal 支撑 rename/move/trash 的崩溃恢复（FS 与 DB 两步非原子的修复）；
+/// chunk_sizes 供 merge 完整性校验（截断分片不再产出损坏文件）
+async fn apply_v10_migrations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS fs_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            op TEXT NOT NULL,
+            src TEXT NOT NULL,
+            dst TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(upload_chunks)")
+        .fetch_all(&mut **tx)
+        .await
+        .map(|rows| rows.iter().filter_map(|r| r.try_get("name").ok()).collect())
+        .unwrap_or_default();
+    if !cols.iter().any(|c| c == "chunk_sizes") {
+        sqlx::query("ALTER TABLE upload_chunks ADD COLUMN chunk_sizes TEXT")
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 

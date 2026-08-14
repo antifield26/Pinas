@@ -912,8 +912,9 @@ async fn move_or_copy(
         size_mb: f64,
         identifier: Option<String>,
     }
-    // (tmp_path, name, parent, logical, 暂存的 DB 行)
+    // (位移文件, 元数据文件, name, parent, logical, 暂存的 DB 行)
     let mut displaced: Option<(
+        std::path::PathBuf,
         std::path::PathBuf,
         String,
         String,
@@ -921,8 +922,14 @@ async fn move_or_copy(
         Vec<DisplacedFileRow>,
     )> = None;
     if dst_full.exists() {
-        let tmp = format!("{TMP_DIR}/dav_disp_{}", uuid::Uuid::new_v4());
-        if std::fs::rename(&dst_full, &tmp).is_err() {
+        // M9：位移目标放在 uploads/.dav_disp（不在 TMP_DIR 内——24h 临时清扫不得触碰），
+        // 并落一份 JSON 元数据（目标路径 + 暂存 DB 行），崩溃后由启动任务 recover_dav_disp 还原
+        let disp_uuid = uuid::Uuid::new_v4().to_string();
+        let disp_dir = std::path::Path::new(crate::constants::DAV_DISP_DIR);
+        let _ = std::fs::create_dir_all(disp_dir);
+        let disp_path = disp_dir.join(format!("{disp_uuid}.d"));
+        let meta_path = disp_dir.join(format!("{disp_uuid}.json"));
+        if std::fs::rename(&dst_full, &disp_path).is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         let child_prefix = if d_parent.is_empty() {
@@ -958,9 +965,23 @@ async fn move_or_copy(
                 .bind(&child_prefix)
                 .execute(pool)
                 .await;
+        let meta = serde_json::json!({
+            "username": user.username,
+            "parent": d_parent,
+            "name": d_name,
+            "rows": rows.iter().map(|r| serde_json::json!({
+                "name": r.name,
+                "parent_path": r.parent_path,
+                "is_dir": r.is_dir,
+                "size_mb": r.size_mb,
+                "identifier": r.identifier,
+            })).collect::<Vec<_>>(),
+        });
+        let _ = std::fs::write(&meta_path, meta.to_string());
         let displaced_logical = logical_path(&d_parent, &d_name);
         displaced = Some((
-            tmp.into(),
+            disp_path,
+            meta_path,
             d_name.clone(),
             d_parent.clone(),
             displaced_logical,
@@ -1020,9 +1041,10 @@ async fn move_or_copy(
 
     match result {
         Ok(()) => {
-            if let Some((tmp, name, parent, logical, _rows)) = displaced {
-                // 成功：DB 行已删，物理位移文件清掉
+            if let Some((tmp, meta_path, name, parent, logical, _rows)) = displaced {
+                // 成功：DB 行已删，物理位移文件 + 元数据清掉
                 let _ = std::fs::remove_dir_all(&tmp);
+                let _ = std::fs::remove_file(&meta_path);
                 let _ = crate::handlers::utils::log_audit(
                     pool,
                     &user.username,
@@ -1053,8 +1075,8 @@ async fn move_or_copy(
             StatusCode::CREATED.into_response()
         }
         Err(_) => {
-            // 失败：完整还原被移走的旧目标（物理文件 + DB 行）
-            if let Some((tmp, _, _, _, rows)) = displaced {
+            // 失败：完整还原被移走的旧目标（物理文件 + DB 行）+ 清理元数据
+            if let Some((tmp, meta_path, _, _, _, rows)) = displaced {
                 let _ = std::fs::rename(&tmp, &dst_full);
                 for r in rows {
                     let _ = sqlx::query(
@@ -1069,6 +1091,7 @@ async fn move_or_copy(
                     .execute(pool)
                     .await;
                 }
+                let _ = std::fs::remove_file(&meta_path);
             }
             StatusCode::CONFLICT.into_response()
         }
