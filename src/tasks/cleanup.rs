@@ -323,7 +323,10 @@ async fn clean_expired_temp_chunks(hours: u64) -> Result<(), std::io::Error> {
     clean_expired_temp_chunks_in(std::path::Path::new(TMP_DIR), hours).await
 }
 
-/// 同 clean_expired_temp_chunks，显式指定 tmp 目录（供测试注入临时路径，避免依赖进程 CWD）
+/// 同 clean_expired_temp_chunks，显式指定 tmp 目录（供测试注入临时路径，避免依赖进程 CWD）。
+/// 支持两级结构（H2 修复后）：tmp/{username}/{identifier}/{chunk_idx}——
+/// 用户名目录本身不按 mtime 整体判（写入已有分片不更新父目录 mtime），
+/// 必须下钻到 identifier 目录逐个判定；兼容旧版扁平 tmp/{identifier} 结构。
 async fn clean_expired_temp_chunks_in(
     tmp_dir: &std::path::Path,
     hours: u64,
@@ -336,22 +339,54 @@ async fn clean_expired_temp_chunks_in(
     let cutoff = now - std::time::Duration::from_secs(hours * 3600);
     while let Some(entry) = entries.next_entry().await? {
         let metadata = entry.metadata().await?;
-        if let Ok(modified) = metadata.modified()
-            && modified <= cutoff
-        {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !is_sweepable_temp_entry(&name) {
-                continue;
-            }
-            if path.is_dir() {
-                let _ = tokio::fs::remove_dir_all(&path).await;
-                info!("清理过期临时分片目录: {:?}", path);
-            } else if path.is_file() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_sweepable_temp_entry(&name) {
+            continue;
+        }
+        if path.is_file() {
+            // WebDAV 临时文件（dav_{uuid}）：按自身 mtime 判
+            if metadata.modified().is_ok_and(|m| m <= cutoff) {
                 let _ = tokio::fs::remove_file(&path).await;
                 info!("清理过期临时文件: {:?}", path);
             }
+            continue;
+        }
+        // 目录：下钻一层，区分「用户名目录（含 identifier 子目录）」与「旧版扁平 identifier 目录」
+        let Ok(mut sub) = tokio::fs::read_dir(&path).await else {
+            continue;
+        };
+        let mut children = Vec::new();
+        let mut has_subdirs = false;
+        while let Ok(Some(c)) = sub.next_entry().await {
+            let Ok(cmeta) = c.metadata().await else {
+                continue;
+            };
+            if cmeta.is_dir() {
+                has_subdirs = true;
+            }
+            children.push((c.path(), cmeta));
+        }
+        if has_subdirs {
+            // 用户名目录：对每个子条目（identifier 分片目录）按 mtime 逐个判定
+            for (cpath, cmeta) in children {
+                if !cmeta.modified().is_ok_and(|m| m <= cutoff) {
+                    continue;
+                }
+                if cmeta.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(&cpath).await;
+                    info!("清理过期临时分片目录: {:?}", cpath);
+                } else {
+                    let _ = tokio::fs::remove_file(&cpath).await;
+                    info!("清理过期临时文件: {:?}", cpath);
+                }
+            }
+            // 子项清空后移除空壳用户名目录（非空则静默失败）
+            let _ = tokio::fs::remove_dir(&path).await;
+        } else if metadata.modified().is_ok_and(|m| m <= cutoff) {
+            // 旧版扁平 identifier 目录（无子目录）：按自身 mtime 判
+            let _ = tokio::fs::remove_dir_all(&path).await;
+            info!("清理过期临时分片目录: {:?}", path);
         }
     }
     Ok(())

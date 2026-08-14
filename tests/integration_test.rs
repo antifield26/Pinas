@@ -2046,6 +2046,190 @@ async fn test_dav_put_overwrite() {
     assert_eq!(read_body_text(resp).await, "v2-longer");
 }
 
+// ====== 10.1 MR-1 安全回归 (v1.8.1) ======
+
+/// C1 回归：认证缓存必须绑定凭证指纹——正确密码认证成功后 60s 内，
+/// 同用户名 + 错误密码必须仍然 401（历史实现仅按 username 放行）
+#[tokio::test]
+async fn test_dav_auth_cache_requires_correct_password() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+
+    // 正确密码建立缓存
+    let good = basic_auth_header(&username, "testpass123");
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&good), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+
+    // 缓存窗口内：错误密码必须被拒绝
+    let bad = basic_auth_header(&username, "completely-wrong");
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&bad), vec![], &[]).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "缓存命中不得仅凭用户名放行（C1）"
+    );
+
+    // 正确密码仍可通过（缓存未被错误尝试污染）
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&good), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+}
+
+/// H4 回归：WebDAV 认证尝试按对端 IP 限速，连续失败超过阈值 → 429
+#[tokio::test]
+async fn test_dav_brute_force_rate_limited() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+
+    // 测试环境无 ConnectInfo → extract_ip 信任 x-forwarded-for；
+    // 用进程内唯一 IP 隔离限速桶，避免与其他测试共享 "loopback" 键
+    let ip = format!("10.99.{}.{}", std::process::id() % 250, 7);
+    let bad = basic_auth_header(&username, "wrong-password");
+
+    let mut got_429 = false;
+    for _ in 0..(pi_nas::constants::LOGIN_RATE_LIMIT_ATTEMPTS + 1) {
+        let resp = dav_send(
+            &app,
+            "PROPFIND",
+            "/dav/",
+            Some(&bad),
+            vec![],
+            &[("x-forwarded-for", &ip)],
+        )
+        .await;
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            got_429 = true;
+            break;
+        }
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "限速阈值之前应为 401"
+        );
+    }
+    assert!(got_429, "超过限速阈值后必须 429（H4）");
+}
+
+/// H3 回归：PUT 覆盖时内容策略失败（可执行 MIME）必须保留旧文件——
+/// 历史实现先删旧文件再校验，403 时新旧两文件皆毁
+#[tokio::test]
+async fn test_dav_put_overwrite_blocked_content_preserves_old() {
+    let (_pool, app) = test_app().await;
+    let (_, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    // 先正常写入一个文本文件
+    let resp = dav_send(
+        &app,
+        "PUT",
+        "/dav/notes.txt",
+        Some(&auth),
+        b"precious old content".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // ELF magic（>52 字节）→ infer 判定 application/x-executable → 内容策略拒绝
+    let mut exe = vec![0u8; 56];
+    exe[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    let resp = dav_send(&app, "PUT", "/dav/notes.txt", Some(&auth), exe, &[]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 旧内容必须原封不动
+    let resp = dav_send(&app, "GET", "/dav/notes.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        read_body_text(resp).await,
+        "precious old content",
+        "策略拒绝的覆盖不得销毁旧文件（H3）"
+    );
+}
+
+/// H1 回归：bytes_received 必须累计（历史实现截断后才读旧大小，恒为 0）
+/// 且同片重传不重复计数（5GB 上限核算依据）
+#[tokio::test]
+async fn test_chunk_bytes_received_accumulates() {
+    let (pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    let identifier = format!("bytes-received-{}", std::process::id());
+    let data = vec![0x61u8; CHUNK_SIZE];
+
+    upload_one_chunk(&app, &token, &identifier, 0, 1, &data).await;
+
+    let sum: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes_received), 0) FROM upload_chunks WHERE username = ? AND identifier = ?",
+    )
+    .bind(&username)
+    .bind(&identifier)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sum as usize, CHUNK_SIZE,
+        "bytes_received 应累计实际字节（H1）"
+    );
+
+    // 同片重传：计数保持单份（先减旧值再加新值）
+    upload_one_chunk(&app, &token, &identifier, 0, 1, &data).await;
+    let sum2: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes_received), 0) FROM upload_chunks WHERE username = ? AND identifier = ?",
+    )
+    .bind(&username)
+    .bind(&identifier)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sum2 as usize, CHUNK_SIZE, "同片重传不得重复计数（H1）");
+}
+
+/// H2 回归：分片临时目录按用户隔离——用户 B 的 check 看不到 A 已上传的分片
+#[tokio::test]
+async fn test_chunk_dir_isolated_per_user() {
+    let (_pool, app) = test_app().await;
+    let (token_a, _u) = register_and_login_with_username(&app).await;
+    let (token_b, _v) = register_and_login_with_username(&app).await;
+
+    let identifier = format!("isolation-{}", std::process::id());
+    let data = vec![0x62u8; CHUNK_SIZE];
+
+    // A 上传分片 0
+    upload_one_chunk(&app, &token_a, &identifier, 0, 2, &data).await;
+
+    // A 自己能看到
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/files/check?identifier={}", identifier),
+            &token_a,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    let check: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        check["uploaded_chunks"].as_array().unwrap().len(),
+        1,
+        "上传者应看到自己的分片"
+    );
+
+    // B 必须看不到（H2：目录按用户隔离）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/files/check?identifier={}", identifier),
+            &token_b,
+        ))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+    let check: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        check["uploaded_chunks"].as_array().unwrap().is_empty(),
+        "其他用户不得看到他人分片（H2）"
+    );
+}
+
 /// PUT 到不存在的子目录 → 目录行自动创建（ensure_dir_rows）
 #[tokio::test]
 async fn test_dav_put_creates_dir_rows() {
@@ -3145,12 +3329,7 @@ async fn test_cookie_domain_flag() {
         )
         .await
         .unwrap();
-    let sc = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let sc = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
     assert!(
         sc.contains("Domain=antifield.work"),
         "配置 cookie_domain 后 Set-Cookie 应含 Domain: {}",
@@ -3172,12 +3351,7 @@ async fn test_cookie_domain_flag() {
         )
         .await
         .unwrap();
-    let sc = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let sc = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
     assert!(
         !sc.contains("Domain="),
         "默认配置 Set-Cookie 不应含 Domain: {}",
@@ -3212,12 +3386,7 @@ async fn test_dsh_gate_unauthenticated() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-    let loc = resp
-        .headers()
-        .get("location")
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
     assert_eq!(
         loc,
         "https://drive.antifield.work/login?redirect=https://dsh.antifield.work/"
@@ -3287,7 +3456,9 @@ async fn test_dsh_proxy_forwards_and_injects_host() {
         req_str
     );
     assert!(
-        req_str.to_ascii_lowercase().contains("host: dsh.antifield.work"),
+        req_str
+            .to_ascii_lowercase()
+            .contains("host: dsh.antifield.work"),
         "Host 头应注入为公网主机名: {}",
         req_str
     );

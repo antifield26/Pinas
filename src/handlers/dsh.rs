@@ -9,19 +9,19 @@
 use crate::config::Config;
 use crate::core::auth::auth_middleware;
 use axum::{
+    Extension, Router,
     body::Body,
     extract::{
-        ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
         FromRequestParts, Request,
+        ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
     },
     http::{
-        header::{self, HeaderValue},
         HeaderMap, StatusCode,
+        header::{self, HeaderValue},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
-    Extension, Router,
 };
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde_json::json;
@@ -63,7 +63,7 @@ fn is_ws_upgrade(headers: &HeaderMap) -> bool {
         && headers
             .get(header::UPGRADE)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_ascii_lowercase() == "websocket")
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false)
 }
 
@@ -86,51 +86,44 @@ async fn dsh_entry(
 
     if is_ws_upgrade(&parts.headers) {
         // 快照握手头（on_upgrade 闭包需要所有权；dsh 栅栏检查 Origin.host == Host.host）
-        let origin = parts
-            .headers
-            .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let sec_fetch_site = parts
-            .headers
-            .get("sec-fetch-site")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let sec_fetch_mode = parts
-            .headers
-            .get("sec-fetch-mode")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        // 透传浏览器握手凭据（tungstenite 对已构造的 Request 不会自动补 Sec-WebSocket-*）
-        let sec_ws_key = parts
-            .headers
-            .get("sec-websocket-key")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let sec_ws_version = parts
-            .headers
-            .get("sec-websocket-version")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let ws_ctx = WsHandshakeCtx {
+            origin: parts
+                .headers
+                .get(header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            sec_fetch_site: parts
+                .headers
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            sec_fetch_mode: parts
+                .headers
+                .get("sec-fetch-mode")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            // 透传浏览器握手凭据（tungstenite 对已构造的 Request 不会自动补 Sec-WebSocket-*）
+            sec_ws_key: parts
+                .headers
+                .get("sec-websocket-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            sec_ws_version: parts
+                .headers
+                .get("sec-websocket-version")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        };
         let upstream_addr = upstream_addr(&config);
         let public_host = config.dsh_public_host.clone();
 
-        match <WebSocketUpgrade as FromRequestParts<()>>::from_request_parts(&mut parts, &()).await {
+        match <WebSocketUpgrade as FromRequestParts<()>>::from_request_parts(&mut parts, &()).await
+        {
             Ok(ws) => {
                 let path = parts.uri.path().to_string();
                 return ws
                     .on_upgrade(move |socket| {
-                        dsh_ws_loop(
-                            socket,
-                            path,
-                            upstream_addr,
-                            public_host,
-                            origin,
-                            sec_fetch_site,
-                            sec_fetch_mode,
-                            sec_ws_key,
-                            sec_ws_version,
-                        )
+                        dsh_ws_loop(socket, path, upstream_addr, public_host, ws_ctx)
                     })
                     .into_response();
             }
@@ -205,9 +198,18 @@ async fn dsh_proxy(config: Config, req: Request<Body>) -> Response {
     let mut builder = DSH_CLIENT.request(method, &upstream);
     for (name, value) in parts.headers.iter() {
         let name_lc = name.as_str().to_ascii_lowercase();
-        // 特权方法：Origin 一并剥除（环回检查要求 Origin.host == Host.host，二者同为环回）
+        // 敏感凭据一律不跨进程边界：pinas 会话 Cookie / Bearer 令牌必须留在本进程
+        // （上游是独立应用，泄漏 admin 会话令牌即全盘沦陷）；X-Forwarded-* 由 pinas 掌控，
+        // 不透传客户端伪造值。特权方法：Origin 一并剥除（环回检查要求 Origin.host == Host.host）
         if name_lc == "host"
             || name_lc == "content-length"
+            || name_lc == "cookie"
+            || name_lc == "authorization"
+            || name_lc == "proxy-authorization"
+            || name_lc == "x-forwarded-for"
+            || name_lc == "x-forwarded-proto"
+            || name_lc == "x-forwarded-host"
+            || name_lc == "x-real-ip"
             || (privileged && name_lc == "origin")
             || HOP_BY_HOP.contains(&name_lc.as_str())
         {
@@ -228,8 +230,7 @@ async fn dsh_proxy(config: Config, req: Request<Body>) -> Response {
     builder = builder.header(header::HOST, host_value);
     // 透传 body（流式，避免缓冲大文件）
     builder = builder.body(reqwest::Body::wrap_stream(
-        body.into_data_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        body.into_data_stream().map_err(std::io::Error::other),
     ));
 
     match builder.send().await {
@@ -237,7 +238,13 @@ async fn dsh_proxy(config: Config, req: Request<Body>) -> Response {
             let status = res.status();
             let mut rb = Response::builder().status(status);
             for (name, value) in res.headers().iter() {
-                if HOP_BY_HOP.contains(&name.as_str().to_ascii_lowercase().as_str()) {
+                let name_lc = name.as_str().to_ascii_lowercase();
+                // Set-Cookie 不透传：上游注入的 cookie 与 pinas 会话同注册域（cookie_domain），
+                // 透传即可覆盖/污染 auth_token（会话固定）。上游如需自有会话应走独立域名前缀。
+                if name_lc == "set-cookie" || name_lc == "set-cookie2" {
+                    continue;
+                }
+                if HOP_BY_HOP.contains(&name_lc.as_str()) {
                     continue;
                 }
                 rb = rb.header(name, value);
@@ -287,17 +294,22 @@ h1{font-size:20px;margin:0 0 8px} p{color:#9ca3af;margin:0;font-size:14px}
         .into_response()
 }
 
+/// WebSocket 握手快照（on_upgrade 闭包需要所有权）
+struct WsHandshakeCtx {
+    origin: Option<String>,
+    sec_fetch_site: Option<String>,
+    sec_fetch_mode: Option<String>,
+    sec_ws_key: Option<String>,
+    sec_ws_version: Option<String>,
+}
+
 /// WebSocket 双向泵：浏览器 ↔ dsh 上游，仅放行事件下行路径
 async fn dsh_ws_loop(
     socket: WebSocket,
     path: String,
     upstream_addr: String,
     public_host: Option<String>,
-    origin: Option<String>,
-    sec_fetch_site: Option<String>,
-    sec_fetch_mode: Option<String>,
-    sec_ws_key: Option<String>,
-    sec_ws_version: Option<String>,
+    ctx: WsHandshakeCtx,
 ) {
     // 信任面最小化：只允许事件下行通道，其余 WS 路径一律拒绝
     if path != "/api/events.mux" && path != "/api/events.host" {
@@ -307,27 +319,29 @@ async fn dsh_ws_loop(
 
     // 上游握手：Host 必须为公网名（栅栏），Origin/sec-fetch 透传（Origin.host == Host.host 校验）
     let upstream_url = format!("ws://{}{}", upstream_addr, path);
-    let mut handshake = axum::http::Request::builder().method("GET").uri(&upstream_url);
+    let mut handshake = axum::http::Request::builder()
+        .method("GET")
+        .uri(&upstream_url);
     if let Some(h) = &public_host {
         handshake = handshake.header(header::HOST, h);
     }
-    if let Some(o) = &origin {
+    if let Some(o) = &ctx.origin {
         handshake = handshake.header(header::ORIGIN, o);
     }
-    if let Some(s) = &sec_fetch_site {
+    if let Some(s) = &ctx.sec_fetch_site {
         handshake = handshake.header("sec-fetch-site", s);
     }
-    if let Some(m) = &sec_fetch_mode {
+    if let Some(m) = &ctx.sec_fetch_mode {
         handshake = handshake.header("sec-fetch-mode", m);
     }
     // tungstenite 对已构造的 Request 不做任何自动补全：升级头 + 浏览器原始 Key/Version 都要
     handshake = handshake
         .header(header::CONNECTION, "Upgrade")
         .header(header::UPGRADE, "websocket");
-    if let Some(k) = &sec_ws_key {
+    if let Some(k) = &ctx.sec_ws_key {
         handshake = handshake.header("sec-websocket-key", k);
     }
-    if let Some(v) = &sec_ws_version {
+    if let Some(v) = &ctx.sec_ws_version {
         handshake = handshake.header("sec-websocket-version", v);
     }
     let Ok(handshake) = handshake.body(()) else {
@@ -342,13 +356,14 @@ async fn dsh_ws_loop(
             return;
         }
     };
-    let (ws_up, _resp) = match tokio_tungstenite::client_async_with_config(handshake, tcp, None).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("[dsh] WS 上游握手失败: {}", e);
-            return;
-        }
-    };
+    let (ws_up, _resp) =
+        match tokio_tungstenite::client_async_with_config(handshake, tcp, None).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[dsh] WS 上游握手失败: {}", e);
+                return;
+            }
+        };
     info!("[dsh] WS 通道已建立: {}", path);
 
     let (mut axum_tx, mut axum_rx) = socket.split();
@@ -368,7 +383,9 @@ async fn dsh_ws_loop(
 
     // 上游 → 浏览器（主任务收尾）
     while let Some(Ok(msg)) = up_rx.next().await {
-        let Some(axum_msg) = ws_to_axum(msg) else { break };
+        let Some(axum_msg) = ws_to_axum(msg) else {
+            break;
+        };
         let is_close = matches!(axum_msg, AxumMessage::Close(_));
         if axum_tx.send(axum_msg).await.is_err() || is_close {
             break;
@@ -383,10 +400,16 @@ fn axum_to_ws(m: AxumMessage) -> Option<WsMessage> {
         AxumMessage::Binary(b) => WsMessage::Binary(b),
         AxumMessage::Ping(p) => WsMessage::Ping(p),
         AxumMessage::Pong(p) => WsMessage::Pong(p),
-        AxumMessage::Close(c) => WsMessage::Close(c.map(|c| tokio_tungstenite::tungstenite::protocol::CloseFrame {
-            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(c.code),
-            reason: c.reason.to_string().into(),
-        })),
+        AxumMessage::Close(c) => {
+            WsMessage::Close(
+                c.map(|c| tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(
+                        c.code,
+                    ),
+                    reason: c.reason.to_string().into(),
+                }),
+            )
+        }
     })
 }
 
@@ -449,14 +472,12 @@ pub async fn dsh_auth_gate(
                 }
             }
         }
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            if accept_json {
-                return Ok((
-                    StatusCode::UNAUTHORIZED,
-                    axum::Json(json!({ "error": "unauthorized" })),
-                )
-                    .into_response());
-            }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if accept_json => {
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({ "error": "unauthorized" })),
+            )
+                .into_response());
         }
         _ => {}
     }
@@ -473,10 +494,8 @@ pub fn build_dsh_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .layer(middleware::from_fn(dsh_auth_gate))
         .layer(Extension(pool))
         .layer(Extension(config))
-        .layer(
-            tower_http::set_header::SetResponseHeaderLayer::overriding(
-                header::X_FRAME_OPTIONS,
-                HeaderValue::from_static("DENY"),
-            ),
-        )
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
 }

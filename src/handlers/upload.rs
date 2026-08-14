@@ -98,8 +98,13 @@ pub async fn check_chunk(
         }));
     }
 
-    // 扫描临时分片目录，获取已上传的分片索引
-    let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, identifier);
+    // 扫描临时分片目录，获取已上传的分片索引（H2：目录按用户隔离，互不可见）
+    let tmp_dir = format!(
+        "{}/{}/{}",
+        crate::constants::TMP_DIR,
+        session.username,
+        identifier
+    );
     let mut uploaded_chunks = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -176,10 +181,23 @@ pub async fn upload_chunk(
         ));
     }
 
-    // 确保临时目录存在
-    let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, params.identifier);
+    // 确保临时目录存在（H2：按用户隔离——历史实现全局共享 tmp/{identifier}，
+    // 低权限用户可窃取/污染他人未合并上传、抢占 merge）
+    let tmp_dir = format!(
+        "{}/{}/{}",
+        crate::constants::TMP_DIR,
+        session.username,
+        params.identifier
+    );
     let _ = tokio::fs::create_dir_all(&tmp_dir).await;
     let chunk_path = format!("{}/{}", tmp_dir, params.chunk_index);
+
+    // 重传语义：必须在截断之前读取旧大小——历史实现 create 之后才 metadata，
+    // 读到的是新大小，UPDATE 恒为 bytes_received - N + N（5GB 上限形同虚设，H1 修复）
+    let prev_chunk_len = tokio::fs::metadata(&chunk_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0) as i64;
 
     // 直接创建文件，流式写入
     let mut file = tokio::fs::File::create(&chunk_path)
@@ -197,6 +215,13 @@ pub async fn upload_chunk(
                 total_written += chunk.len() as u64;
                 if total_written > MAX_CHUNK_SIZE {
                     let _ = tokio::fs::remove_file(&chunk_path).await;
+                    rollback_chunk_counter(
+                        &pool,
+                        &session.username,
+                        &params.identifier,
+                        prev_chunk_len,
+                    )
+                    .await;
                     return Err(AppError::payload_too_large("分片超过 100 MB 上限"));
                 }
 
@@ -212,6 +237,13 @@ pub async fn upload_chunk(
 
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
                     let _ = tokio::fs::remove_file(&chunk_path).await;
+                    rollback_chunk_counter(
+                        &pool,
+                        &session.username,
+                        &params.identifier,
+                        prev_chunk_len,
+                    )
+                    .await;
                     return Err(AppError::internal_log("写入分片", e));
                 }
             }
@@ -220,12 +252,14 @@ pub async fn upload_chunk(
 
     if total_written == 0 {
         let _ = tokio::fs::remove_file(&chunk_path).await;
+        rollback_chunk_counter(&pool, &session.username, &params.identifier, prev_chunk_len).await;
         return Err(AppError::bad_request("分片数据流为空"));
     }
 
     // 首分片 MIME 安全校验
     if is_first_chunk && !is_allowed_mime(&mime_buf[..mime_read]) {
         let _ = tokio::fs::remove_file(&chunk_path).await;
+        rollback_chunk_counter(&pool, &session.username, &params.identifier, prev_chunk_len).await;
         return Err(AppError::forbidden("非法执行文件伪装漏洞防护阻断"));
     }
 
@@ -241,11 +275,7 @@ pub async fn upload_chunk(
 
     // 累计分片字节（磁盘上限/配额核算依据）。
     // 同索引重传（断点重试/覆盖）会先截断再写：必须减去该片旧大小再累加新值，
-    // 否则重复计入导致 5GB 上限被提前触发
-    let prev_chunk_len = tokio::fs::metadata(&chunk_path)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0) as i64;
+    // 否则重复计入导致 5GB 上限被提前触发。prev_chunk_len 在截断之前读取（H1）。
     let _ = sqlx::query(
         "UPDATE upload_chunks SET bytes_received = MAX(0, bytes_received - ? + ?) WHERE username = ? AND identifier = ?",
     )
@@ -257,6 +287,27 @@ pub async fn upload_chunk(
     .await;
 
     Ok((StatusCode::OK, "分片暂存成功"))
+}
+
+/// 分片文件被删除后的计数回滚：该片的旧贡献应从 bytes_received 中扣除
+/// （写失败/超限/空流/MIME 阻断路径都会 remove_file，磁盘贡献归零）
+async fn rollback_chunk_counter(
+    pool: &sqlx::SqlitePool,
+    username: &str,
+    identifier: &str,
+    prev_len: i64,
+) {
+    if prev_len <= 0 {
+        return;
+    }
+    let _ = sqlx::query(
+        "UPDATE upload_chunks SET bytes_received = MAX(0, bytes_received - ?) WHERE username = ? AND identifier = ?",
+    )
+    .bind(prev_len)
+    .bind(username)
+    .bind(identifier)
+    .execute(pool)
+    .await;
 }
 
 // --- 5. 分片合并（读取所有已上传分片，按索引排序合并）---
@@ -286,7 +337,13 @@ pub async fn merge_chunks(
     .await
     .map_err(|e| AppError::internal_log("查询分片记录", e))?;
 
-    let tmp_dir = format!("{}/{}", crate::constants::TMP_DIR, payload.identifier);
+    // H2：临时分片目录按用户隔离（与 check/upload 一致）
+    let tmp_dir = format!(
+        "{}/{}/{}",
+        crate::constants::TMP_DIR,
+        username,
+        payload.identifier
+    );
     // 读取目录下所有分片文件
     let mut chunks = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {

@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.8.1 (2026-08-14)
+
+### Security（审计驱动的关键修复）
+- **WebDAV 认证缓存绕过修复（C1, Critical）**：AUTH_CACHE 仅按 username 放行，60s 窗口内
+  任意密码可通过认证 → 缓存键值改为 sha256(username\0password) 凭证指纹，命中必须指纹一致
+- **WebDAV 认证限速（H4）**：/dav 公开无限制，Argon2 ~100ms 可被公网 CPU DoS/爆破
+  → 未命中缓存（必须跑 argon2）的尝试按对端 IP 限速（复用登录限速 10 次/60s；
+  成功路径 60s 内走缓存不消耗额度）
+- **WebDAV PUT 覆盖原子化（H3）**：先删旧文件再 rename，且内容策略校验在 rename 之后，
+  策略失败/崩溃即永久丢失旧文件 → rename(2) 直接原子替换；扩展名+MIME 校验前置到 tmp；
+  覆盖走 UPDATE 保留行元数据；配额复核按增量（旧大小释放）
+- **MIME 黑名单补全**：infer 0.19 对 Windows EXE/DLL 报
+  application/vnd.microsoft.portable-executable，原黑名单（x-executable/x-sharedlib）
+  拦不住改名穿透 → 补 PE/wasm/mach
+
+### Fixed（数据完整性）
+- **分片磁盘上限失效（H1）**：File::create 截断后才读旧大小，bytes_received 恒 0，
+  5GB 防耗尽上限形同虚设 → 截断前读取；写失败/超限/空流/MIME 阻断路径回滚计数
+- **分片临时目录按用户隔离（H2）**：uploads/tmp/{identifier} 全局共享，可窃取/污染他人
+  未合并上传 → tmp/{username}/{identifier}；清扫任务下钻一层逐个判定（防用户名目录 mtime
+  失真误删活跃分片）
+- **WebDAV COPY 事务解耦（H5）**：磁盘复制包在 SQLite 写事务内 + std::fs 阻塞 async worker，
+  大目录 COPY 冻结全站写操作 → 磁盘复制移出事务并 spawn_blocking，DB 登记走短事务，
+  失败回滚并清理已复制目标
+- **dsh 反代凭据隔离（H6）**：浏览器 Cookie/Authorization 原样透传上游（admin 会话令牌
+  暴露给独立应用）+ 上游 Set-Cookie 可污染同注册域会话 → 转发前剥除
+  Cookie/Authorization/Proxy-Authorization/X-Forwarded-*/X-Real-IP，响应剥除 Set-Cookie
+
+### Tests
+- 集成测试 57 → 62(+5)：dav 缓存凭证绑定、dav 限速 429、PUT 覆盖策略失败保旧文件、
+  bytes_received 累计与重传不重复计数、分片目录跨用户隔离
+
 ## v1.8.0 (2026-08-14)
 
 ### Added

@@ -143,8 +143,14 @@ pub fn is_allowed_mime(data: &[u8]) -> bool {
     }
     if let Some(kind) = infer::get(data) {
         let mime = kind.mime_type();
+        // infer 0.19 的 MIME 家族（map.rs）：ELF/COFF → x-executable，PE EXE/DLL →
+        // vnd.microsoft.portable-executable。历史上只拦 x-executable/x-sharedlib，
+        // Windows EXE 改名 .txt 即可穿透 MIME 层——补齐 PE/wasm/mach
         if mime.starts_with("application/x-executable")
             || mime.starts_with("application/x-sharedlib")
+            || mime == "application/vnd.microsoft.portable-executable"
+            || mime == "application/wasm"
+            || mime == "application/x-mach-binary"
         {
             return false;
         }

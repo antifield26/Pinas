@@ -32,8 +32,10 @@ pub struct DavUser {
     pub is_admin: bool,
 }
 
-/// 认证成功缓存（username → (通过, 验证时间)）；仅缓存通过态，失败即时校验
-static AUTH_CACHE: LazyLock<Mutex<HashMap<String, (bool, Instant)>>> =
+/// 认证成功缓存：username → (凭证指纹, 验证时间)。仅缓存通过态，失败即时校验。
+/// 指纹 = sha256(username\0password)——命中必须指纹一致，绝不允许仅凭用户名放行
+/// （历史缺陷：60s 窗口内任意密码可通过认证，C1 修复）。
+static AUTH_CACHE: LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn unauthorized() -> Response {
@@ -46,8 +48,13 @@ fn unauthorized() -> Response {
 }
 
 /// 手动 Basic 认证（WebDAV 单 handler 内调用）：成功 → DavUser；失败 → 401 响应。
-/// 60s 成功缓存防每请求 argon2；角色实时查（权限变更即时生效）。
-async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Response> {
+/// 60s 成功缓存防每请求 argon2（键值含凭证指纹，见 AUTH_CACHE）；角色实时查（权限变更即时生效）。
+/// 未命中缓存时先过限速：Argon2 ~100ms 是公网可用的 CPU DoS 面，必须按对端 IP 限频。
+async fn dav_auth(
+    headers: HeaderMap,
+    peer_ip: Option<std::net::IpAddr>,
+    pool: &SqlitePool,
+) -> Result<DavUser, Response> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -63,13 +70,15 @@ async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Res
         .ok_or_else(unauthorized)?;
     let (user, pass) = creds.split_once(':').ok_or_else(unauthorized)?;
 
-    // 命中缓存（60s）时跳过 argon2 验证；角色实时查。锁不得跨越 await（MutexGuard 非 Send）
+    // 命中缓存（60s）时跳过 argon2 验证；指纹必须与本次提交的凭证完全一致。角色实时查。
+    // 锁不得跨越 await（MutexGuard 非 Send）
     // 中毒恢复：panic=abort 下 Mutex 中毒的 unwrap 会把整站打死，必须 into_inner 恢复
+    let cred_fp = crate::core::hash_token(&format!("{user}\u{0}{pass}"));
     let cached_ok = {
         let cache = AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache
             .get(user)
-            .map(|(ok, t)| *ok && t.elapsed() < std::time::Duration::from_secs(60))
+            .map(|(fp, t)| *fp == cred_fp && t.elapsed() < std::time::Duration::from_secs(60))
             .unwrap_or(false)
     };
     if cached_ok {
@@ -82,6 +91,25 @@ async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Res
             username: user.to_string(),
             is_admin: role.as_deref() == Some(crate::constants::ROLE_ADMIN),
         });
+    }
+
+    // 限速：仅未命中缓存（即必须跑 argon2）的尝试计数——成功路径 60s 内走缓存不再消耗额度。
+    // 键与登录限速同源（回环信任 CF-Connecting-IP，直连用真实对端 IP）
+    let rate_key = crate::handlers::auth::extract_ip(peer_ip, &headers)
+        .unwrap_or_else(|| format!("dav:user:{user}"));
+    if !crate::handlers::rate_limit::check_rate_limit(
+        &rate_key,
+        crate::constants::LOGIN_RATE_LIMIT_ATTEMPTS,
+        std::time::Duration::from_secs(crate::constants::LOGIN_RATE_LIMIT_WINDOW_SECS),
+    )
+    .await
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"pi_nas\"")],
+            "请求过于频繁，请稍后再试",
+        )
+            .into_response());
     }
 
     // 用户不存在时用哑哈希等时校验（抹平用户枚举时序侧信道）
@@ -121,7 +149,7 @@ async fn dav_auth(headers: &HeaderMap, pool: &SqlitePool) -> Result<DavUser, Res
     AUTH_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(user.to_string(), (true, Instant::now()));
+        .insert(user.to_string(), (cred_fp, Instant::now()));
     Ok(DavUser {
         username: user.to_string(),
         is_admin: auth_row.1 == crate::constants::ROLE_ADMIN,
@@ -145,7 +173,12 @@ pub async fn dav_handler(
     if req.method() == Method::OPTIONS {
         return options_response();
     }
-    let user = match dav_auth(req.headers(), &pool).await {
+    // ConnectInfo 在 &req 持有期外提前取出（&Request 非 Send，跨 await 持引用会使 handler future 非 Send）
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let user = match dav_auth(req.headers().clone(), peer_ip, &pool).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -693,58 +726,74 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
     }
     drop(file);
 
-    // 配额复核（写盘后按实际字节）
-    let need = crate::handlers::utils::bytes_to_mb_ceil(written);
-    let (used_mb, quota_mb) = quota_info(pool, &user.username).await;
-    if used_mb + need > quota_mb {
+    // 内容策略前置（与分片上传一致）：扩展名黑名单 + 完整文件 MIME 检测（防 WebDAV 绕过）。
+    // 必须在触碰目标文件之前对 tmp 完成——历史上 rename 之后才校验，覆盖场景策略失败时
+    // 会连删新旧两个文件，旧文件永久丢失
+    if crate::handlers::utils::is_blocked_extension(&name) {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return StatusCode::INSUFFICIENT_STORAGE.into_response();
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !crate::handlers::utils::is_allowed_mime_streaming(&tmp)
+        .await
+        .unwrap_or(true)
+    {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return StatusCode::FORBIDDEN.into_response();
     }
 
-    // 覆盖语义：目标存在则物理替换 + 删除旧 DB 行
+    // 覆盖语义：rename(2) 对同文件系统原子替换，绝不先删旧文件再改名
+    // （先删后改存在崩溃/失败窗口：旧文件已删、新文件未就位 = 永久数据丢失）
     let target = absolute_uploads_path(&parent_full.join(&name));
     let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
+
+    // 配额复核（写盘后按实际字节；覆盖时按增量——旧文件大小将被释放，不算重复占用）
+    let mut need = crate::handlers::utils::bytes_to_mb_ceil(written) as f64;
+    let (used_mb, quota_mb) = quota_info(pool, &user.username).await;
     if existed {
-        if tokio::fs::remove_file(&target).await.is_err() {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        let _ =
-            sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
-                .bind(&user.username)
-                .bind(&name)
-                .bind(&parent)
-                .execute(pool)
-                .await;
+        let old_mb: f64 = sqlx::query_scalar(
+            "SELECT size_mb FROM files WHERE username = ? AND name = ? AND parent_path = ?",
+        )
+        .bind(&user.username)
+        .bind(&name)
+        .bind(&parent)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0.0);
+        need = (need - old_mb).max(0.0);
+    }
+    if used_mb as f64 + need > quota_mb as f64 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return StatusCode::INSUFFICIENT_STORAGE.into_response();
     }
     if tokio::fs::rename(&tmp, &target).await.is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // 内容策略（与分片上传一致）：扩展名黑名单 + 完整文件 MIME 检测（防 WebDAV 绕过）
-    if crate::handlers::utils::is_blocked_extension(&name) {
-        let _ = tokio::fs::remove_file(&target).await;
-        return StatusCode::FORBIDDEN.into_response();
+    // 登记：覆盖走 UPDATE（保留行元数据），新建走 INSERT；配额随后全量重算
+    let size_mb = (written as f64 / 1024.0 / 1024.0).ceil();
+    if existed {
+        let _ = sqlx::query(
+            "UPDATE files SET size_mb = ?, identifier = NULL WHERE username = ? AND name = ? AND parent_path = ?",
+        )
+        .bind(size_mb)
+        .bind(&user.username)
+        .bind(&name)
+        .bind(&parent)
+        .execute(pool)
+        .await;
+    } else {
+        let _ = sqlx::query(
+            "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)",
+        )
+        .bind(&user.username)
+        .bind(&name)
+        .bind(&parent)
+        .bind(size_mb)
+        .execute(pool)
+        .await;
     }
-    if !crate::handlers::utils::is_allowed_mime_streaming(&target)
-        .await
-        .unwrap_or(true)
-    {
-        let _ = tokio::fs::remove_file(&target).await;
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // 登记 + 配额重算
-    let _ = sqlx::query(
-        "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)",
-    )
-    .bind(&user.username)
-    .bind(&name)
-    .bind(&parent)
-    .bind((written as f64 / 1024.0 / 1024.0).ceil())
-    .execute(pool)
-    .await;
     let _ = update_user_used_mb(pool, &user.username).await;
     let _ = crate::handlers::utils::log_audit(
         pool,
@@ -1053,14 +1102,64 @@ async fn copy_recursive(
     .await
     .map_err(|e| format!("COPY 源查询失败: {e}"))?;
 
-    // 配额复核 + 登记统一进写事务：并发 COPY 之间由 SQLite 写锁串行化，
-    // 避免预检通过后互相穿插导致配额超额；失败回滚不留半截 DB 行
     let total_mb: f64 = rows
         .iter()
         .filter(|r| r.2 == 0)
         .map(|r| r.3)
         .sum::<f64>()
         .ceil();
+
+    // 阶段一：磁盘复制（无任何 DB 写入）。std::fs::copy 是阻塞 IO，必须移出 async worker
+    // 且移出写事务——历史实现把整个拷贝过程包在 SQLite 写事务里：大目录 COPY 会
+    // 占死一个 tokio worker + 持写锁数分钟，全站写操作 busy_timeout 后 500。
+    let base = std::path::Path::new(UPLOADS_DIR);
+    let mut disk_plan: Vec<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        bool,
+        String,
+        String,
+        f64,
+    )> = Vec::with_capacity(rows.len());
+    for (name, parent_path, is_dir, size_mb) in &rows {
+        // 根对象（源自身行）：落在目标父目录 d_parent 下、名取 d_name（Destination 可改名）；
+        // 子树对象：完整路径替换源前缀
+        let is_root = parent_path == s_parent && name == s_name;
+        let new_parent = if is_root {
+            d_parent.to_string()
+        } else {
+            parent_path.replacen(&format!("{s_prefix}/"), &format!("{d_prefix}/"), 1)
+        };
+        let target_name = if is_root { d_name } else { name };
+        let src = safe_join_sandbox(base, &format!("{username}/{parent_path}/{name}"))
+            .map_err(|_| "COPY 源路径非法".to_string())?;
+        let dst_parent = safe_join_sandbox(base, &format!("{username}/{new_parent}"))
+            .map_err(|_| "COPY 目标路径非法".to_string())?;
+        std::fs::create_dir_all(&dst_parent).map_err(|e| format!("COPY 创建目录失败: {e}"))?;
+        disk_plan.push((
+            src,
+            dst_parent.join(target_name),
+            *is_dir != 0,
+            new_parent,
+            target_name.to_string(),
+            *size_mb,
+        ));
+    }
+    for (src, dst, is_dir, _new_parent, _target_name, _size_mb) in &disk_plan {
+        if *is_dir {
+            std::fs::create_dir_all(dst).map_err(|e| format!("COPY 创建目录失败: {e}"))?;
+        } else {
+            let src = src.clone();
+            let dst = dst.clone();
+            tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
+                .await
+                .map_err(|_e| "COPY 复制任务失败".to_string())?
+                .map_err(|e| format!("COPY 复制文件失败: {e}"))?;
+        }
+    }
+
+    // 阶段二：短事务（配额复核 + 登记，无阻塞 IO）。并发 COPY 之间由 SQLite 写锁串行化，
+    // 避免预检通过后互相穿插导致配额超额；失败回滚不留半截 DB 行，并尽力清理已复制文件
     let mut tx = pool
         .begin()
         .await
@@ -1077,45 +1176,31 @@ async fn copy_recursive(
         }
     };
     if used_mb + total_mb as i64 > quota_mb {
+        drop(tx);
+        // 仅当目标根路径能安全解析时才清理（沙箱失败绝不触碰任何目录）
+        if let Ok(root) = safe_join_sandbox(base, &format!("{username}/{d_parent}/{d_name}")) {
+            let _ = std::fs::remove_dir_all(&root);
+        }
         return Err("存储空间不足".to_string());
     }
 
-    let base = std::path::Path::new(UPLOADS_DIR);
-    for (name, parent_path, is_dir, size_mb) in rows {
-        // 根对象（源自身行）：落在目标父目录 d_parent 下、名取 d_name（Destination 可改名）；
-        // 子树对象：完整路径替换源前缀
-        let is_root = parent_path == s_parent && name == s_name;
-        let new_parent = if is_root {
-            d_parent.to_string()
-        } else {
-            parent_path.replacen(&format!("{s_prefix}/"), &format!("{d_prefix}/"), 1)
-        };
-        let target_name = if is_root { d_name } else { &name };
-        let src = safe_join_sandbox(base, &format!("{username}/{parent_path}/{name}"))
-            .map_err(|_| "COPY 源路径非法".to_string())?;
-        let dst_parent = safe_join_sandbox(base, &format!("{username}/{new_parent}"))
-            .map_err(|_| "COPY 目标路径非法".to_string())?;
-        std::fs::create_dir_all(&dst_parent).map_err(|e| format!("COPY 创建目录失败: {e}"))?;
-        if is_dir != 0 {
-            std::fs::create_dir_all(dst_parent.join(target_name))
-                .map_err(|e| format!("COPY 创建目录失败: {e}"))?;
+    for (_src, _dst, is_dir, new_parent, target_name, size_mb) in &disk_plan {
+        if *is_dir {
             let _ = sqlx::query(
                 "INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)",
             )
             .bind(username)
             .bind(target_name)
-            .bind(&new_parent)
+            .bind(new_parent)
             .execute(&mut *tx)
             .await;
         } else {
-            std::fs::copy(&src, dst_parent.join(target_name))
-                .map_err(|e| format!("COPY 复制文件失败: {e}"))?;
             let _ = sqlx::query(
                 "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)",
             )
             .bind(username)
             .bind(target_name)
-            .bind(&new_parent)
+            .bind(new_parent)
             .bind(size_mb)
             .execute(&mut *tx)
             .await;
