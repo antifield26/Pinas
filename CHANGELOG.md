@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.9.0 (2026-08-15)
+
+### UI（视觉与动画优化）
+- **设计令牌**：缓动曲线/时长/交错步长 token 化（--ease-out-soft/--dur-*），动画统一引用
+- **组件类收敛**：btn（primary/secondary/ghost/danger/sm）、icon-btn、form-label、input-error、
+  badge 四色、empty-state、card-hover、row-hover——形状/交互/焦点环/按压反馈全站统一
+- **简约 SVG 图标系统**：partials/icons.html 提供 ~40 枚线性图标（24×24/stroke1.5/currentColor），
+  文件类型图标按扩展名映射（Rust 侧 icon_kind）；替换全部 emoji（🌓☰📁📄✕✓🎬✎♪）
+- **骨架屏**：系统监控/MC 状态/文件列表首载 shimmer 占位，替换纯文本 animate-pulse
+- **Toast 升级**：类型图标（alert/check/info）+ 左侧色条 + 4s 自动关闭倒计时条
+- **聊天体验**：AI 渐变头像块、流式光标（▍ blink）、思考中指示、usage 弱化
+- **批量工具栏**：显现淡入（hidden 硬切换 → animate-fade-in 重放）
+- **View Transitions（渐进增强）**：hx-boost 整页导航在支持时用浏览器原生交叉淡化
+  （reduced-motion/不支持自动回退 CSS 转场）
+- **配额条**：>90% 红色 / >70% 琥珀警示态；空状态统一组件；表单标签/错误态规范化
+- **prefers-reduced-data**：骨架扫光/进度条纹关闭
+
 ## v1.8.4 (2026-08-14)
 
 ### Security（遗留审计项收口）

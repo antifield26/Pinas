@@ -1,3 +1,4 @@
+{% import "partials/icons.html" as icons %}
 <div class="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-4xl shadow-2xl mx-auto max-h-[90vh] flex flex-col" data-modal-root>
   <div class="flex justify-between items-center p-5 border-b border-gray-100 dark:border-gray-800 shrink-0">
     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100 flex items-center gap-2">
@@ -20,7 +21,7 @@
              data-media-el>
         <source src="/api/media/{{ file_path }}?mt={{ media_token }}" type="{{ mime_type }}">
         <p class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
-          <span class="text-5xl">🎬</span>
+          <span class="text-5xl text-gray-300 dark:text-gray-600">{{ icons::icon("video", "w-12 h-12") }}</span>
           <span class="text-gray-600 dark:text-gray-400 text-sm">您的浏览器不支持此视频格式</span>
           <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"
              class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm mt-3">↓ 下载文件</a>
@@ -42,7 +43,7 @@
     </div>
     {% else if is_audio %}
     <div class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-4">
-      <span class="text-6xl">♪</span>
+      <span class="text-6xl text-gray-300 dark:text-gray-600">{{ icons::icon("music", "w-14 h-14") }}</span>
       <span class="text-lg font-medium text-gray-700 dark:text-gray-300">{{ file_name }}</span>
       <audio controls preload="metadata" class="w-full max-w-md">
         <source src="/api/media/{{ file_path }}?mt={{ media_token }}" type="{{ mime_type }}">
@@ -66,7 +67,7 @@
     </div>
     {% else %}
     <div class="flex flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
-      <span class="text-5xl">📄</span>
+      <span class="text-5xl text-gray-300 dark:text-gray-600">{{ icons::icon("file", "w-12 h-12") }}</span>
       <p class="text-gray-600 dark:text-gray-400 text-sm">此文件类型不支持在线预览</p>
       <p class="text-xs text-gray-400 font-mono">{{ mime_type }}</p>
       <div class="flex gap-2 mt-2">
@@ -79,7 +80,7 @@
     {% endif %}
     {# 媒体加载失败静态 fallback（showMediaError 只做类切换，JS 内不含任何用户数据） #}
     <div id="media-fallback" class="hidden flex-col items-center justify-center min-h-[200px] bg-gray-100 dark:bg-gray-800 rounded-lg p-8 gap-3">
-      <span class="text-5xl">🎬</span>
+      <span class="text-5xl text-gray-300 dark:text-gray-600">{{ icons::icon("video", "w-12 h-12") }}</span>
       <p class="text-gray-600 dark:text-gray-400 text-sm">媒体加载失败</p>
       <p class="text-xs text-gray-400 mt-1">可能是编码格式不兼容，请下载后使用本地播放器</p>
       <a href="/api/media/{{ file_path }}?mt={{ media_token }}" download="{{ file_name }}"

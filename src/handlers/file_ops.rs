@@ -293,6 +293,7 @@ async fn query_files(
             rows.into_iter()
                 .filter(|r| present.contains(&(r.name.clone(), r.parent_path.clone())))
                 .map(|r| FileRowData {
+                    icon_kind: file_icon_kind(&r.name, r.is_dir != 0).to_string(),
                     name: r.name,
                     is_dir: r.is_dir != 0,
                     size_display: fmt_size(r.size_mb.unwrap_or(0.0), r.is_dir != 0),
@@ -1095,6 +1096,30 @@ struct FileRowData {
     is_dir: bool,
     /// 所在逻辑路径（正常浏览 = 当前目录；全局搜索 = 各自所在目录）
     parent_path: String,
+    /// 图标类别（folder/image/video/audio/archive/code/file），
+    /// 与 partials/icons.html 的 icon 宏名称一一对应
+    icon_kind: String,
+}
+
+/// 按文件名/目录映射图标类别（与模板 icons.html 宏保持一致）
+fn file_icon_kind(name: &str, is_dir: bool) -> &'static str {
+    if is_dir {
+        return "folder";
+    }
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "ico" => "image",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => "video",
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" => "audio",
+        "zip" | "rar" | "7z" | "tar" | "gz" => "archive",
+        "rs" | "py" | "js" | "jsx" | "ts" | "tsx" | "sh" | "c" | "cpp" | "java" | "go" | "json"
+        | "yml" | "yaml" | "toml" => "code",
+        _ => "file",
+    }
 }
 
 struct BreadcrumbPart {

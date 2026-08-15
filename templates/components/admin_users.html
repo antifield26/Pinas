@@ -15,7 +15,7 @@
     {% for u in users %}
     <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
       <td class="p-4 font-medium text-gray-800 dark:text-gray-200">{{ u.username }}</td>
-      <td class="p-4"><span class="text-xs px-2 py-0.5 rounded-full font-medium {% if u.role == "admin" %}bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400{% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400{% endif %}">{{ u.role }}</span></td>
+      <td class="p-4"><span class="{% if u.role == "admin" %}badge-indigo{% else %}badge{% endif %}">{{ u.role }}</span></td>
       <td class="p-4 text-gray-500 dark:text-gray-400">{{ u.used_mb }} / {{ u.quota_mb }} MB</td>
       <td class="p-4 text-right">
         <button hx-post="/api/admin/user/reset_password" hx-vals='{"username":"{{ u.username }}"}'

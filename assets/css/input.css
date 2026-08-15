@@ -4,10 +4,33 @@
 /* 启用 class-based 暗色模式：JS 通过 .dark class 切换，不再仅依赖 prefers-color-scheme */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ====== 设计令牌（v1.9.0）====== */
+@theme {
+  /* 缓动曲线：出主动效柔软回弹、进出整体平滑 */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out-soft: cubic-bezier(0.65, 0, 0.35, 1);
+  /* 时长统一 ≤300ms（规范：大部分 ≤0.2s） */
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 300ms;
+  /* 列表交错入场步长 */
+  --stagger-step: 30ms;
+}
+
 /* ====== 自定义组件类 ====== */
 /* 卡片容器（暗色层级：页面底 950 → 卡片 900 → 输入/井面 800） */
 .card {
   @apply bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm;
+}
+
+/* 卡片 hover 抬升（功能入口类卡片） */
+.card-hover {
+  @apply transition-all duration-200 ease-out hover:-translate-y-0.5 hover:shadow-md;
+}
+
+/* 表格行 hover 背景（列表行统一） */
+.row-hover {
+  @apply transition-colors duration-100 hover:bg-gray-50 dark:hover:bg-gray-800/50;
 }
 
 /* 输入框 */
@@ -18,17 +41,120 @@
          placeholder-gray-400 dark:placeholder-gray-400 transition;
 }
 
-/* 按钮 - 主要（品牌渐变 indigo→violet） */
+/* 输入框错误态（表单校验失败时由 JS/服务端片段添加） */
+.input-error {
+  @apply border-red-400 dark:border-red-500 focus:ring-red-500;
+}
+
+/* 表单标签 */
+.form-label {
+  @apply block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1;
+}
+
+/* ====== 按钮体系 ====== */
+/* 基础（各变体自带完整声明——Tailwind v4 不支持 @apply 自定义类） */
+.btn {
+  @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium
+         transition-all duration-150 select-none
+         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-1
+         active:scale-[0.97] disabled:opacity-50 disabled:pointer-events-none;
+}
+.btn-sm {
+  @apply px-2.5 py-1 text-xs gap-1;
+}
+
+/* 主要（品牌渐变 indigo→violet，仅用于主行动） */
 .btn-primary {
-  @apply bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm;
+  @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium
+         transition-all duration-150 select-none
+         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-1
+         active:scale-[0.97] disabled:opacity-50 disabled:pointer-events-none
+         bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500
+         text-white shadow-sm hover:shadow;
 }
 
-/* 按钮 - 次要 */
+/* 次要 */
 .btn-secondary {
-  @apply bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-lg text-sm font-medium transition;
+  @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium
+         transition-all duration-150 select-none
+         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-1
+         active:scale-[0.97] disabled:opacity-50 disabled:pointer-events-none
+         bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-500
+         text-gray-700 dark:text-gray-200;
 }
 
-/* 自定义动画（时长统一 ≤0.2s，fill-mode both 支持交错入场延迟） */
+/* 幽灵（弱行动，常用在卡片/工具栏） */
+.btn-ghost {
+  @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium
+         transition-all duration-150 select-none
+         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-1
+         active:scale-[0.97] disabled:opacity-50 disabled:pointer-events-none
+         text-gray-600 dark:text-gray-400
+         hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-800 dark:hover:text-gray-200;
+}
+
+/* 危险 */
+.btn-danger {
+  @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium
+         transition-all duration-150 select-none
+         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-1
+         active:scale-[0.97] disabled:opacity-50 disabled:pointer-events-none
+         bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400
+         hover:bg-red-100 dark:hover:bg-red-900/50;
+}
+
+/* 图标按钮（导航/关闭/主题等纯图标操作，触控目标 ≥ 40px） */
+.icon-btn {
+  @apply inline-flex items-center justify-center w-9 h-9 rounded-lg text-gray-500 dark:text-gray-400
+         transition-colors duration-150 hover:bg-gray-100 dark:hover:bg-gray-800
+         hover:text-gray-800 dark:hover:text-gray-200
+         focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500;
+}
+
+/* ====== 徽章 ====== */
+.badge {
+  @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium
+         bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300;
+}
+.badge-indigo {
+  @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium
+         bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300;
+}
+.badge-emerald {
+  @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium
+         bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300;
+}
+.badge-amber {
+  @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium
+         bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300;
+}
+.badge-red {
+  @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium
+         bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300;
+}
+
+/* ====== 空状态 ====== */
+.empty-state {
+  @apply flex flex-col items-center justify-center gap-3 py-12 text-center;
+}
+.empty-state-icon {
+  @apply w-14 h-14 rounded-2xl flex items-center justify-center
+         bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500;
+}
+
+/* ====== 骨架屏（首载占位，shimmer 扫光） ====== */
+.skeleton {
+  @apply rounded-lg bg-gray-200 dark:bg-gray-700;
+  background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.2s ease-in-out infinite;
+}
+.dark .skeleton {
+  background: linear-gradient(90deg, #374151 25%, #4b5563 50%, #374151 75%);
+  background-size: 200% 100%;
+}
+
+/* ====== 自定义动画（时长统一 ≤0.2s，fill-mode both 支持交错入场延迟） ====== */
 @keyframes fade-in {
   from { opacity: 0; transform: translateY(-8px); }
   to { opacity: 1; transform: translateY(0); }
@@ -49,6 +175,10 @@
   from { opacity: 0; transform: scale(0.96); }
   to { opacity: 1; transform: scale(1); }
 }
+@keyframes backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 /* 页面整页导航（hx-boost）：离场浅淡（不白屏）+ 进场淡入上移 */
 @keyframes page-leave {
   to { opacity: 0.6; }
@@ -64,15 +194,35 @@
   from { background-position: 1rem 0; }
   to { background-position: 0 0; }
 }
+@keyframes skeleton-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+@keyframes toast-bar {
+  from { width: 100%; }
+  to { width: 0; }
+}
 
-@utility animate-fade-in { animation: fade-in 0.2s ease-out both; }
-@utility animate-slide-up { animation: slide-up 0.2s ease-out both; }
-@utility animate-toast-in { animation: toast-in 0.2s ease-out both; }
+@utility animate-fade-in { animation: fade-in var(--dur-base, 0.2s) var(--ease-out-soft, ease-out) both; }
+@utility animate-slide-up { animation: slide-up var(--dur-base, 0.2s) var(--ease-out-soft, ease-out) both; }
+@utility animate-toast-in { animation: toast-in var(--dur-base, 0.2s) var(--ease-out-soft, ease-out) both; }
 @utility animate-toast-out { animation: toast-out 0.25s ease-in forwards; }
-@utility animate-modal-in { animation: modal-in 0.15s ease-out both; }
+@utility animate-modal-in { animation: modal-in 0.15s var(--ease-out-soft, ease-out) both; }
+@utility animate-backdrop-in { animation: backdrop-in 0.15s ease-out both; }
+@utility animate-caret { animation: caret-blink 1s step-end infinite; }
+/* Toast 自动关闭倒计时条（宽度线性收缩，颜色由类型 utility 控制） */
+.toast-bar {
+  height: 2px;
+  animation: toast-bar 4s linear forwards;
+  border-radius: 0 0 0.375rem 0.375rem;
+}
 /* 页面导航动画类：仅 JS 动态添加（classList），无模板字面类，故用普通类而非 @utility（按需生成会遗漏） */
 .animate-page-leave { animation: page-leave 0.12s ease-in forwards; }
-.animate-page-enter { animation: page-in 0.2s ease-out both; }
+.animate-page-enter { animation: page-in var(--dur-base, 0.2s) var(--ease-out-soft, ease-out) both; }
 
 /* 自定义滚动条 */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -115,5 +265,13 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* 尊重系统"节省数据"偏好：关闭装饰性动画（骨架扫光/条纹） */
+@media (prefers-reduced-data: reduce) {
+  .skeleton, .progress-striped {
+    animation: none !important;
+    background-image: none;
   }
 }

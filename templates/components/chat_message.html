@@ -4,15 +4,15 @@
   <div class="bg-indigo-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 max-w-[80%] text-sm">
     <p class="whitespace-pre-wrap break-words">{{ user_message }}</p>
   </div>
-  <div class="text-xl shrink-0"></div>
+  <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white text-xs font-bold flex items-center justify-center shrink-0">{{ user_initial }}</div>
 </div>
 {% endif %}
 <div class="flex gap-3">
-  <div class="text-sm shrink-0 text-indigo-500 font-bold">AI</div>
+  <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white text-xs font-bold flex items-center justify-center shrink-0">AI</div>
   <div class="bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-bl-md px-4 py-2.5 max-w-[80%] text-sm text-gray-800 dark:text-gray-200">
     <div class="prose prose-sm dark:prose-invert max-w-none break-words">{{ assistant_reply }}</div>
     {% if !model.is_empty() %}
-    <div class="text-xs text-gray-400 dark:text-gray-400 mt-1">{{ model }}{% if !usage_info.is_empty() %} · {{ usage_info }}{% endif %}</div>
+    <div class="text-[11px] opacity-70 text-gray-400 dark:text-gray-500 mt-1">{{ model }}{% if !usage_info.is_empty() %} · {{ usage_info }}{% endif %}</div>
     {% endif %}
   </div>
 </div>

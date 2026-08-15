@@ -89,7 +89,7 @@
 
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=14', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=15', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;
@@ -162,6 +162,23 @@
     });
     document.body.addEventListener('htmx:afterRequest', function(e) {
       if (e.detail.boosted && !e.detail.successful) document.body.classList.remove('animate-page-leave');
+    });
+    // View Transitions API（v1.9.0 渐进增强）：支持时接管 hx-boost 整页 swap，
+    // 浏览器原生交叉淡化（含快照）；不支持/减少动态 → 回退既有 CSS 转场。
+    // 手动 swap：body innerHTML + htmx.process（本架构 body 内无内联脚本，无需重放脚本）
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      if (!e.detail.boosted || e.detail.isError) return;
+      if (typeof document.startViewTransition !== 'function') return;
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+      e.detail.shouldSwap = false;
+      var target = e.detail.target;
+      var html = e.detail.xhr.responseText;
+      document.startViewTransition(function() {
+        target.innerHTML = html;
+        htmx.process(target);
+      }).finished.then(function() {
+        document.body.classList.remove('animate-page-leave');
+      });
     });
     // 进场动画结束清理类，避免残留
     document.body.addEventListener('animationend', function(e) {
@@ -607,7 +624,10 @@
       const toolbar = document.getElementById('batch-toolbar');
       const count = document.getElementById('batch-count');
       if (checked.length > 0) {
-        toolbar.classList.remove('hidden');
+        // 显现时重放入场动画（v1.9.0：hidden 硬切换 → 淡入）
+        toolbar.classList.remove('hidden', 'animate-fade-in');
+        void toolbar.offsetWidth; // 强制回流以重启动画
+        toolbar.classList.add('animate-fade-in');
         count.textContent = '已选 ' + checked.length + ' 项';
         document.getElementById('select-all').checked = (checked.length === document.querySelectorAll('.file-checkbox').length);
       } else {
@@ -928,9 +948,10 @@
         var box = document.getElementById('agent-chat-messages');
         var wrapper = document.createElement('div');
         wrapper.className = 'flex gap-3 animate-slide-up';
-        var label = document.createElement('div');
-        label.className = 'text-sm shrink-0 text-indigo-500 font-bold';
-        label.textContent = 'AI';
+        // AI 头像块（v1.9.0：渐变方块，与历史消息模板一致）
+        var avatar = document.createElement('div');
+        avatar.className = 'w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white text-xs font-bold flex items-center justify-center shrink-0';
+        avatar.textContent = 'AI';
         var bubble = document.createElement('div');
         bubble.className = 'bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-bl-md px-4 py-2.5 max-w-[80%] text-sm text-gray-800 dark:text-gray-200';
         var p = document.createElement('p');
@@ -939,12 +960,18 @@
         thinking.className = 'text-gray-400';
         thinking.textContent = '思考中...';
         p.appendChild(thinking);
+        // 流式光标（v1.9.0）：生成期间闪烁，结束移除
+        var caret = document.createElement('span');
+        caret.className = 'animate-caret';
+        caret.textContent = '▍';
         bubble.appendChild(p);
-        wrapper.appendChild(label);
+        bubble.appendChild(caret);
+        wrapper.appendChild(avatar);
         wrapper.appendChild(bubble);
         box.appendChild(wrapper);
         box.scrollTop = box.scrollHeight;
         var full = '';
+        var caretAttached = true;
         return {
           append: function(delta) {
             if (!full) thinking.remove();
@@ -954,6 +981,7 @@
           },
           finish: function() {
             thinking.remove();
+            if (caretAttached) { caret.remove(); caretAttached = false; }
             if (full.trim()) {
               window.App.renderMarkdown(p, full);
             }

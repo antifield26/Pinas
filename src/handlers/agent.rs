@@ -1628,6 +1628,8 @@ struct ChatMessageFragment {
     assistant_reply: String,
     model: String,
     usage_info: String,
+    /// 用户头像首字（渐变方块头像块）
+    user_initial: String,
 }
 
 /// 简报结果 HTML 片段
@@ -1656,6 +1658,12 @@ pub async fn agent_chat_fragment(
             assistant_reply: "请输入消息".to_string(),
             model: String::new(),
             usage_info: String::new(),
+            user_initial: session
+                .username
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "U".to_string()),
         })
         .into_response();
     }
@@ -1671,6 +1679,12 @@ pub async fn agent_chat_fragment(
                 assistant_reply: format!("配置错误: {}", msg),
                 model: String::new(),
                 usage_info: String::new(),
+                user_initial: session
+                    .username
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "U".to_string()),
             })
             .into_response();
         }
@@ -1732,6 +1746,12 @@ pub async fn agent_chat_fragment(
                 assistant_reply: reply,
                 model,
                 usage_info: usage,
+                user_initial: session
+                    .username
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "U".to_string()),
             })
             .into_response()
         }
@@ -1740,6 +1760,12 @@ pub async fn agent_chat_fragment(
             assistant_reply: format!("请求失败: {}", msg),
             model,
             usage_info: String::new(),
+            user_initial: session
+                .username
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "U".to_string()),
         })
         .into_response(),
     }

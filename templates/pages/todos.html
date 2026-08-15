@@ -9,7 +9,7 @@
     <h2 class="text-xl font-bold text-gray-700 dark:text-gray-300">待办事项 & 日程</h2>
     <div class="flex-1"></div>
     <button hx-get="/todos/form" hx-target="#modal-container" hx-swap="innerHTML"
-            class="text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1.5 rounded-lg transition">
+            class="btn-primary btn-sm">
       + 新建
     </button>
     <button id="view-toggle" hx-get="/todos/calendar" hx-target="#todos-container" hx-swap="innerHTML"

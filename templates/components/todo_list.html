@@ -1,9 +1,10 @@
+{% import "partials/icons.html" as icons %}
 {# Todo list fragment — rendered by HTMX GET /todos/list #}
 {% if todos.is_empty() %}
-<div class="animate-fade-in text-center text-gray-400 dark:text-gray-400 p-8">
-  <p class="text-lg font-medium mb-2">暂无内容</p>
-  <p class="text-sm">暂无待办/日程</p>
-  <p class="text-xs mt-1 text-gray-300 dark:text-gray-500">点击"新建"创建</p>
+<div class="empty-state animate-fade-in">
+  <div class="empty-state-icon">{{ icons::icon("todos", "w-7 h-7") }}</div>
+  <p class="text-sm text-gray-500 dark:text-gray-400">暂无待办/日程</p>
+  <p class="text-xs text-gray-400 dark:text-gray-500">点击「新建」创建</p>
 </div>
 {% else %}
 <div class="grid gap-3 sm:grid-cols-2">
@@ -15,17 +16,17 @@
       <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 flex-wrap mb-1">
           {% if t.status == "completed" %}
-          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">已完成</span>
+          <span class="badge-emerald">已完成</span>
           {% else if t.status == "expired" %}
-          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">已过期</span>
+          <span class="badge-red">已过期</span>
           {% else if t.status == "in_progress" %}
-          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">进行中</span>
+          <span class="badge-indigo">进行中</span>
           {% else %}
-          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">待办</span>
+          <span class="badge">待办</span>
           {% endif %}
 
           {% if t.priority == "high" %}
-          <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">高</span>
+          <span class="badge-red">高</span>
           {% else if t.priority == "low" %}
           <span class="text-xs px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">低</span>
           {% else %}
@@ -58,15 +59,15 @@
       <div class="flex items-center gap-0.5 shrink-0">
         {% if t.category != "schedule" && t.status != "completed" %}
         <button hx-put="/todos/{{ t.id }}" hx-vals='{"status":"completed"}' hx-target="#todos-container" hx-swap="innerHTML"
-                class="w-8 h-8 flex items-center justify-center rounded-lg text-green-600 bg-gray-100 dark:bg-gray-800 hover:bg-green-50 dark:hover:bg-green-900/40 transition" title="完成">✓</button>
+                class="icon-btn w-8 h-8 text-green-600" title="完成">{{ icons::icon("check", "w-4 h-4") }}</button>
         <button hx-put="/todos/{{ t.id }}" hx-vals='{"status":"in_progress"}' hx-target="#todos-container" hx-swap="innerHTML"
                 class="w-8 h-8 flex items-center justify-center rounded-lg text-blue-600 bg-gray-100 dark:bg-gray-800 hover:bg-blue-50 dark:hover:bg-blue-900/40 transition" title="开始">▶</button>
         {% endif %}
         <button hx-get="/todos/form/{{ t.id }}" hx-target="#modal-container" hx-swap="innerHTML"
-                class="w-8 h-8 flex items-center justify-center rounded-lg text-amber-600 bg-gray-100 dark:bg-gray-800 hover:bg-amber-50 dark:hover:bg-amber-900/40 transition" title="编辑">✎</button>
+                class="icon-btn w-8 h-8 text-amber-600" title="编辑">{{ icons::icon("edit", "w-4 h-4") }}</button>
         <button hx-delete="/todos/{{ t.id }}" hx-target="#todos-container" hx-swap="innerHTML"
                 hx-confirm="确定删除？"
-                class="w-8 h-8 flex items-center justify-center rounded-lg text-red-600 bg-gray-100 dark:bg-gray-800 hover:bg-red-50 dark:hover:bg-red-900/40 transition" title="删除">✕</button>
+                class="icon-btn w-8 h-8 text-red-600" title="删除">{{ icons::icon("trash", "w-4 h-4") }}</button>
       </div>
     </div>
   </div>

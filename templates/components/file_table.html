@@ -1,12 +1,20 @@
 {# File listing table fragment with batch selection #}
+{% import "partials/icons.html" as icons %}
 <div id="batch-toolbar" class="hidden px-4 py-2 bg-indigo-50 dark:bg-indigo-900/20 border-b border-indigo-100 dark:border-indigo-800 flex items-center gap-2">
   <span id="batch-count" class="text-xs text-indigo-700 dark:text-indigo-300 font-medium">已选 0 项</span>
   <div class="flex-1"></div>
   <button data-batch-delete
-          class="text-xs bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 px-3 py-1 rounded hover:bg-red-100 dark:hover:bg-red-900/50 transition">删除选中</button>
+          class="btn-danger btn-sm">删除选中</button>
   <button data-batch-download
-          class="text-xs bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-3 py-1 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">下载选中</button>
+          class="btn-ghost btn-sm text-indigo-600 dark:text-indigo-400">下载选中</button>
 </div>
+{% if files.is_empty() && !has_global_search %}
+<div class="empty-state animate-fade-in">
+  <div class="empty-state-icon">{{ icons::icon("folder", "w-7 h-7") }}</div>
+  <p class="text-sm text-gray-500 dark:text-gray-400">此目录为空</p>
+  <p class="text-xs text-gray-400 dark:text-gray-500">拖拽文件到此处，或点击上方「上传」开始</p>
+</div>
+{% else %}
 <table class="w-full text-left border-collapse">
   <thead>
     <tr class="bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
@@ -26,15 +34,20 @@
   </thead>
   <tbody class="divide-y divide-gray-100 dark:divide-gray-800 text-sm">
     {% if files.is_empty() %}
-    <tr class="animate-fade-in"><td colspan="4" class="p-8 text-center text-gray-400">{% if has_global_search %}未找到匹配的文件{% else %}此目录为空{% endif %}</td></tr>
-    {% else %}
+    <tr class="animate-fade-in"><td colspan="4" class="p-10 text-center">
+      <div class="inline-flex flex-col items-center gap-2 text-gray-400 dark:text-gray-500">
+        {{ icons::icon("search", "w-8 h-8") }}
+        <span class="text-sm">未找到匹配的文件</span>
+      </div>
+    </td></tr>
+    {% endif %}
     {% for f in files %}
-    <tr class="animate-fade-in hover:bg-gray-50 dark:hover:bg-gray-800/50 transition"
+    <tr class="animate-fade-in row-hover"
         style="animation-delay: {% if loop.index0 > 8 %}240ms{% else %}{{ loop.index0 * 30 }}ms{% endif %};">
       {% if !has_global_search %}<td class="p-2"><input type="checkbox" class="file-checkbox rounded" value="{{ f.name }}"></td>{% endif %}
       <td class="p-4">
         <div class="flex items-center gap-3">
-          <span class="text-xs text-gray-400 w-8 shrink-0">{% if f.is_dir %}📁{% else %}📄{% endif %}</span>
+          <span class="shrink-0 {% if f.is_dir %}text-indigo-500 dark:text-indigo-400{% else %}text-gray-400 dark:text-gray-500{% endif %}">{{ icons::icon(f.icon_kind) }}</span>
           {% if f.is_dir %}
           <a href="#" data-nav-path="{{ f.parent_path }}/{{ f.name }}"
              class="text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 font-medium">{{ f.name }}{% if has_global_search %}<span class="text-xs text-gray-400 font-normal"> ({{ f.parent_path }})</span>{% endif %}</a>
@@ -48,21 +61,21 @@
         <div class="flex gap-1 justify-end whitespace-nowrap">
           {% if f.is_dir %}
           <button data-nav-path="{{ f.parent_path }}/{{ f.name }}"
-                  class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition">打开</button>
+                  class="btn-ghost btn-sm text-indigo-600 dark:text-indigo-300">打开</button>
           {% else %}
           <button hx-get="/drive/preview" hx-vals='{"path":{{ f.parent_path | json }},"name":{{ f.name | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
-                  class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition">预览</button>
+                  class="btn-ghost btn-sm text-emerald-600 dark:text-emerald-300">预览</button>
           {% endif %}
           <button hx-get="/drive/rename-form" hx-vals='{"name":{{ f.name | json }},"current_path":{{ f.parent_path | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
-                  class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition">重命名</button>
+                  class="btn-ghost btn-sm text-amber-600 dark:text-amber-300">重命名</button>
           <button hx-get="/drive/move-form" hx-vals='{"name":{{ f.name | json }},"current_path":{{ f.parent_path | json }}}' hx-target="#modal-container" hx-swap="innerHTML"
-                  class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-sky-50 dark:bg-sky-900/20 text-sky-600 dark:text-sky-300 hover:bg-sky-100 dark:hover:bg-sky-900/50 transition">移动</button>
+                  class="btn-ghost btn-sm text-sky-600 dark:text-sky-300">移动</button>
           <button hx-post="/drive/delete" hx-vals='{"name":{{ f.name | json }},"current_path":{{ f.parent_path | json }}}' hx-target="#drive-file-list"
-                  hx-confirm="确定删除？" class="shrink-0 text-xs font-medium px-2.5 py-1 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50 transition">删除</button>
+                  hx-confirm="确定删除？" class="btn-ghost btn-sm text-red-600 dark:text-red-300">删除</button>
         </div>
       </td>
     </tr>
     {% endfor %}
-    {% endif %}
   </tbody>
 </table>
+{% endif %}

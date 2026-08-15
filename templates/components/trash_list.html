@@ -1,6 +1,10 @@
+{% import "partials/icons.html" as icons %}
 {# Trash list fragment #}
 {% if items.is_empty() %}
-<div class="p-8 text-center text-gray-400">回收站为空</div>
+<div class="empty-state">
+  <div class="empty-state-icon">{{ icons::icon("trash", "w-7 h-7") }}</div>
+  <p class="text-sm text-gray-500 dark:text-gray-400">回收站为空</p>
+</div>
 {% else %}
 <table class="w-full text-left border-collapse">
   <thead>

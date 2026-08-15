@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+{% import "partials/icons.html" as icons %}
 <html lang="zh-CN" x-data="{ dark: localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches) }" x-init="if (dark) document.documentElement.classList.add('dark'); $watch('dark', v => { document.documentElement.classList.toggle('dark', v); localStorage.setItem('theme', v ? 'dark' : 'light'); })">
 <head>
   <meta charset="UTF-8">
@@ -17,7 +18,7 @@
 
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
   <link rel="manifest" href="/assets/manifest.json?v=1">
-  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=18">
+  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=19">
 
   <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
   <script src="/assets/htmx.min.js?v=1" data-cfasync="false"></script>
@@ -48,17 +49,20 @@
   <!-- Toast 容器（Alpine x-for 渲染，滑入/滑出动画） -->
   <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col gap-3 pointer-events-none" role="status" aria-live="polite" x-data="toasts()" @show-toast.window="add($event.detail)">
     <template x-for="t in items" :key="t.id">
-      <div class="pointer-events-auto flex items-start gap-2.5 max-w-sm w-full rounded-xl shadow-lg px-4 py-3 text-sm font-medium animate-toast-in"
+      <div class="pointer-events-auto relative overflow-hidden flex items-start gap-2.5 max-w-sm w-full rounded-xl shadow-lg px-4 py-3 text-sm font-medium animate-toast-in"
            :class="t.type === 'success' ? 'bg-emerald-600 text-white' : (t.type === 'error' ? 'bg-red-600 text-white' : 'bg-indigo-600 text-white')"
            x-transition:leave="animate-toast-out">
-        <span class="shrink-0 mt-0.5" x-text="t.type === 'success' ? '✓' : (t.type === 'error' ? '✕' : 'ℹ')"></span>
+        <span class="shrink-0 mt-0.5" x-show="t.type === 'success'">{{ icons::icon("check", "w-4 h-4") }}</span>
+        <span class="shrink-0 mt-0.5" x-show="t.type === 'error'">{{ icons::icon("alert", "w-4 h-4") }}</span>
+        <span class="shrink-0 mt-0.5" x-show="t.type !== 'success' && t.type !== 'error'">{{ icons::icon("info", "w-4 h-4") }}</span>
         <span class="min-w-0" x-text="t.message"></span>
+        <div class="absolute bottom-0 left-0 toast-bar" :class="t.type === 'success' ? 'bg-emerald-300' : (t.type === 'error' ? 'bg-red-300' : 'bg-indigo-300')"></div>
       </div>
     </template>
   </div>
 
   <!-- Modal 容器 -->
-  <div id="modal-container" role="dialog" aria-modal="true" data-modal-backdrop class="fixed inset-0 bg-black/50 backdrop-blur-sm hidden items-center justify-center z-50 p-4"></div>
+  <div id="modal-container" role="dialog" aria-modal="true" data-modal-backdrop class="fixed inset-0 bg-black/50 backdrop-blur-sm hidden items-center justify-center z-50 p-4 animate-backdrop-in"></div>
 
   <!-- 顶部导航栏 -->
   <nav class="bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 sticky top-0 z-40 shadow-sm" aria-label="主导航" x-data="{ open: false }">
@@ -72,7 +76,7 @@
         <div class="hidden sm:flex items-center gap-1">
           {% for item in nav %}
           <a href="{{ item.href }}" hx-boost="true"
-             class="px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}</a>
+             class="relative px-3 py-1.5 rounded-lg text-sm font-medium transition {% if current_page == item.page %}bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300{% else %}text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800{% endif %}">{{ item.label }}{% if current_page == item.page %}<span class="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-indigo-500"></span>{% endif %}</a>
           {% endfor %}
           {% if harness_url != "" && is_admin %}
           <a href="{{ harness_url }}" target="_blank" rel="noopener" data-cfasync="false"
@@ -86,11 +90,11 @@
           <button hx-get="/account/password-form" hx-target="#modal-container" hx-swap="innerHTML"
                   title="账号设置（修改密码）" aria-label="账号设置"
                   class="text-xs px-2 py-1 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition">账号设置</button>
-          <button @click="dark = !dark" class="text-xs p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition" aria-label="切换主题" title="切换主题">🌓</button>
+          <button @click="dark = !dark" class="icon-btn w-9 h-9" aria-label="切换主题" title="切换主题">{{ icons::icon("moon", "w-5 h-5") }}</button>
           <button hx-post="/api/logout" hx-target="body" class="text-xs text-gray-400 hover:text-red-600 dark:hover:text-red-400 font-medium transition px-2 py-1" aria-label="退出登录">退出</button>
           <!-- Mobile menu toggle -->
-          <button @click="open = !open" class="sm:hidden text-sm p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition" aria-label="菜单">
-            <span x-show="!open">菜单</span><span x-show="open">关闭</span>
+          <button @click="open = !open" class="sm:hidden icon-btn w-9 h-9" aria-label="菜单">
+            <span x-show="!open">{{ icons::icon("menu", "w-5 h-5") }}</span><span x-show="open">{{ icons::icon("close", "w-5 h-5") }}</span>
           </button>
         </div>
       </div>
@@ -124,7 +128,7 @@
   <!-- 拖拽上传覆盖层 -->
   <div id="drop-overlay" class="fixed inset-0 z-50 hidden items-center justify-center bg-indigo-500/20 backdrop-blur-sm" style="display:none">
     <div class="bg-white dark:bg-gray-900 rounded-2xl p-10 shadow-2xl border-4 border-dashed border-indigo-400 text-center pointer-events-none">
-      <span class="text-5xl">📁</span>
+      <span class="text-5xl text-indigo-500 dark:text-indigo-400">{{ icons::icon("upload", "w-12 h-12") }}</span>
       <p class="text-lg font-bold text-indigo-600 dark:text-indigo-400 mt-4">释放文件以上传</p>
     </div>
   </div>

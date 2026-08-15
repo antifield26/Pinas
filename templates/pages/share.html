@@ -4,13 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Antifield Cloud — 分享文件</title>
-  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=18">
+  <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=19">
   {% include "partials/theme_head.html" %}
+{% import "partials/icons.html" as icons %}
 </head>
 <body class="bg-gray-50 dark:bg-gray-950 min-h-screen flex items-center justify-center p-4 transition-colors duration-200">
-  <button data-toggle-dark class="fixed top-4 right-4 text-lg p-2 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 transition" aria-label="切换主题" title="切换主题">🌓</button>
+  <button data-toggle-dark class="icon-btn fixed top-4 right-4" aria-label="切换主题" title="切换主题">{{ icons::icon("moon", "w-5 h-5") }}</button>
   <div class="bg-white dark:bg-gray-900 rounded-2xl shadow-2xl max-w-lg w-full p-8 text-center space-y-6">
-    <span class="text-6xl">📁</span>
+    <span class="text-6xl text-indigo-500 dark:text-indigo-400">{{ icons::icon("folder", "w-14 h-14") }}</span>
     <h1 class="text-xl font-bold text-gray-800 dark:text-gray-100">Antifield Cloud</h1>
     <p class="text-gray-500 dark:text-gray-400 text-sm">此分享链接指向: <span class="font-mono text-indigo-600 dark:text-indigo-400">{{ file_path }}</span></p>
 
@@ -19,7 +20,7 @@
       <label for="share-password" class="sr-only">提取码</label>
       <input type="password" id="share-password" name="password" placeholder="请输入提取码"
              class="input-field text-center">
-      <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded-lg transition text-sm">验证提取码</button>
+      <button type="submit" class="btn-primary w-full">验证提取码</button>
     </form>
     {% else if is_dir %}
     <p class="text-gray-500 dark:text-gray-400 text-sm">此分享为目录，包含 {{ file_count }} 个文件</p>
