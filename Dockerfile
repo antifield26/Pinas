@@ -1,7 +1,9 @@
 # ====== Antifield Cloud (Pi-NAS) — ARM64 多阶段构建 ======
 
 # Stage 1: Build
-FROM rust:1.85-slim-bookworm AS builder
+# 注：不得低于依赖树要求的 MSRV（sqlx 0.9 需 rustc ≥1.94、time/zip ≥1.88、icu ≥1.86）——
+# 曾钉 1.85 导致 docker 冒烟构建在依赖解析阶段失败
+FROM rust:1.97-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
