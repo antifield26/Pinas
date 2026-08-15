@@ -43,6 +43,13 @@ jobs:
         run: bash scripts/check-versions.sh
 
       # 目标平台为 aarch64-unknown-linux-gnu (RPi5 cortex-a76)，交叉编译检查防平台性问题
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          # aws-lc-sys（reqwest/rustls 依赖）需要 C 交叉编译器构建，缺 gcc 时 cc-rs 报
+          # ToolNotFound: failed to find tool "aarch64-linux-gnu-gcc"
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
       - name: aarch64 cargo check
         run: |
           rustup target add aarch64-unknown-linux-gnu
