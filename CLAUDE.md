@@ -87,7 +87,7 @@ Browser                      Axum Server
 │   ├── components/          # 可复用 HTMX 片段 (22 个，含 upload_queue.html)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v13
+├── static/sw.js             # PWA Service Worker v15
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -230,6 +230,13 @@ MINECRAFT_PORT=25565
 - JS 全部外置于 `assets/app.js`（CSP script-src 无 'unsafe-inline'；仅两处主题预涂脚本内联，
   经 sha256 哈希放行）；交互统一 data-* 属性 + document 事件委托；
   `window.App = { showToast, closeModal, navigateTo, goParent, handleUploadForm }`
+- **图标系统**：`partials/icons.html` 的 `icon(name, class)` 宏（简约线性 SVG，24×24/stroke1.5/
+  currentColor）；文件类型图标由 Rust 侧 `file_icon_kind` 计算 `icon_kind` 字段；禁止使用 emoji
+- **组件类**：btn-primary/secondary/ghost/danger(/btn-sm)、icon-btn、form-label、input-error、
+  badge 四色、empty-state、card-hover、row-hover、skeleton——新 UI 一律引用组件类，不手写内联重复
+- **动效**：View Transitions API 接管 hx-boost 整页导航（渐进增强，reduced-motion/不支持回退
+  CSS 转场）；流式光标/Toast 倒计时条/批量工具栏淡入在 app.js；交错延迟仍为模板内联
+  animation-delay（未迁移 CSS 变量）
 - 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传；
   `window.UploadQueue` 队列面板（进度/取消/文件夹上传 webkitdirectory + 拖拽 webkitGetAsEntry 递归）
 - 全局搜索：drive 页"全局"checkbox（path 置空）→ 后端 ≥3 字符走 FTS5 trigram、≤2 字符 LIKE 兜底；结果跨目录显示路径
@@ -239,7 +246,7 @@ MINECRAFT_PORT=25565
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v13 预缓存公开壳 `/login` + 全部本地资源（`/api/` 一律不缓存防敏感 JSON 滞留；
+- PWA：SW v15 预缓存公开壳 `/login` + 全部本地资源（`/api/` 一律不缓存防敏感 JSON 滞留；
   预缓存登录壳而非 `/`，避免已登录 dashboard 的用户名被烤进 CacheStorage；
   版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验含嵌套路径与 manifest）；
   离线仅静态壳/登录页兜底，HTMX 片段与页面离线不可用
