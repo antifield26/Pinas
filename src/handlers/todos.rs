@@ -733,6 +733,8 @@ struct CalendarCell {
     day: i32,
     date: String,
     count: usize,
+    /// 是否今天（v1.9.0 日历高亮）
+    is_today: bool,
 }
 
 /// Calendar fragment template
@@ -828,13 +830,20 @@ pub async fn todos_calendar_fragment(
             day: 0,
             date: String::new(),
             count: 0,
+            is_today: false,
         });
     }
     // 填充当月日期
     for day in 1..=days_in_month {
         let date = format!("{}-{:02}-{:02}", year, month, day);
         let count = date_counts.get(&date).copied().unwrap_or(0);
-        cells.push(CalendarCell { day, date, count });
+        let is_today = chrono::Local::now().format("%Y-%m-%d").to_string() == date;
+        cells.push(CalendarCell {
+            day,
+            date,
+            count,
+            is_today,
+        });
     }
 
     AppTemplate(TodoCalendarFragment {

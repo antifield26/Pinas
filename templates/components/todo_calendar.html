@@ -4,11 +4,11 @@
   <div class="flex items-center justify-between mb-4">
     <button hx-get="/todos/calendar?year={{ prev_year }}&month={{ prev_month }}"
             hx-target="#calendar-container" hx-swap="outerHTML"
-            class="text-xs px-3 py-1.5 rounded-lg bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 transition">◀ 上月</button>
+            class="btn-secondary btn-sm">上月</button>
     <span class="text-lg font-bold text-gray-700 dark:text-gray-300">{{ year }} 年 {{ month }} 月</span>
     <button hx-get="/todos/calendar?year={{ next_year }}&month={{ next_month }}"
             hx-target="#calendar-container" hx-swap="outerHTML"
-            class="text-xs px-3 py-1.5 rounded-lg bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 transition">下月 ▶</button>
+            class="btn-secondary btn-sm">下月</button>
   </div>
 
   <!-- Day Headers -->
@@ -25,7 +25,7 @@
   <!-- Calendar Grid -->
   <div class="grid grid-cols-7 gap-1">
     {% for cell in cells %}
-    <div class="min-h-[3rem] p-1 border border-gray-100 dark:border-gray-800 rounded-lg transition {% if cell.count == 0 %}bg-white dark:bg-gray-900{% else %}bg-indigo-50/50 dark:bg-indigo-900/10 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 cursor-pointer{% endif %}"
+    <div class="min-h-[3rem] p-1 border border-gray-100 dark:border-gray-800 rounded-lg transition {% if cell.count == 0 %}bg-white dark:bg-gray-900{% else %}bg-indigo-50/50 dark:bg-indigo-900/10 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 cursor-pointer{% endif %} {% if cell.is_today %}ring-2 ring-indigo-500 dark:ring-indigo-400{% endif %}"
          {% if cell.count > 0 %}
          hx-get="/todos/list?date={{ cell.date }}" hx-target="#todos-container" hx-swap="innerHTML"
          {% endif %}>
