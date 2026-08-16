@@ -27,12 +27,6 @@ pub struct Config {
     pub admin_password: Option<String>,
     #[serde(default)]
     pub guest_password: Option<String>,
-    #[serde(default = "default_deepseek_api_base")]
-    pub deepseek_api_base: String,
-    #[serde(default = "default_deepseek_model")]
-    pub deepseek_model: String,
-    #[serde(default)]
-    pub deepseek_api_key: Option<String>,
     /// 注册开关：serde 默认 false（生产未配置即关闭）；Config::default() 为 true（测试/开发便利）
     #[serde(default = "default_allow_registration")]
     pub allow_registration: bool,
@@ -44,9 +38,6 @@ pub struct Config {
     /// 默认 false——否则用户在 UI 改密后会被环境变量在下次重启时悄悄重置
     #[serde(default)]
     pub sync_passwords: bool,
-    /// AI 每日配额：每用户每日最多 AI 请求次数（防 guest 等账户烧光全局 API 额度）
-    #[serde(default = "default_agent_daily_quota")]
-    pub agent_daily_quota: u32,
     /// dsh 反代端口：Some(port) 时在 127.0.0.1 起第二监听，反代 DeepSeek Harness Web UI
     #[serde(default)]
     pub dsh_port: Option<u16>,
@@ -96,17 +87,8 @@ fn default_upload_limit_mb() -> i64 {
 fn default_quota_mb() -> i64 {
     10240
 }
-fn default_deepseek_api_base() -> String {
-    "https://api.deepseek.com".into()
-}
-fn default_deepseek_model() -> String {
-    "deepseek-v4-flash".into()
-}
 fn default_allow_registration() -> bool {
     false
-}
-fn default_agent_daily_quota() -> u32 {
-    200
 }
 fn default_dsh_upstream_url() -> String {
     "http://127.0.0.1:3080".into()
@@ -127,14 +109,10 @@ impl Default for Config {
             default_quota_mb: default_quota_mb(),
             admin_password: None,
             guest_password: None,
-            deepseek_api_base: default_deepseek_api_base(),
-            deepseek_model: default_deepseek_model(),
-            deepseek_api_key: None,
             // 测试/开发便利：Config::default() 开放注册（生产走 from_env，serde 默认关闭）
             allow_registration: true,
             cookie_secure: None,
             sync_passwords: false,
-            agent_daily_quota: default_agent_daily_quota(),
             dsh_port: None,
             dsh_upstream_url: default_dsh_upstream_url(),
             dsh_public_host: None,

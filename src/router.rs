@@ -72,7 +72,6 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/api/share/access/{code}", get(handlers::access_share))
         .route("/s/{share_id}", get(handlers::share_page))
         .route("/s/{share_id}/{*file_path}", get(handlers::share_subfile))
-        .route("/api/agent/models", get(handlers::get_models))
         .route("/health", get(handlers::health_check));
 
     // --- 受保护路由（需认证）---
@@ -86,7 +85,6 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/", get(handlers::home_page))
         .route("/drive", get(handlers::drive_page))
         .route("/todos", get(handlers::todos_page))
-        .route("/agent", get(handlers::agent_page))
         .route("/links", get(handlers::links_page))
         .route("/trash", get(handlers::trash_page))
         .route("/admin", get(handlers::admin_page))
@@ -183,33 +181,6 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/todos/{id}", delete(handlers::todos_delete_fragment))
         .route("/todos/form", get(handlers::todos_empty_form))
         .route("/todos/form/{id}", get(handlers::todos_edit_form))
-        .route("/api/agent/chat", post(handlers::agent_chat))
-        .route("/api/agent/chat/stream", post(handlers::agent_chat_stream))
-        .route("/api/agent/briefing", post(handlers::generate_briefing))
-        // HTMX Agent fragment routes
-        .route("/agent/chat", post(handlers::agent_chat_fragment))
-        .route("/agent/briefing", post(handlers::agent_briefing_fragment))
-        .route("/agent/settings-form", get(handlers::agent_settings_form))
-        .route(
-            "/agent/conversations",
-            get(handlers::conversation_list_fragment),
-        )
-        .route("/api/agent/settings", get(handlers::get_agent_settings))
-        .route("/api/agent/settings", put(handlers::save_agent_settings))
-        .route("/api/conversations", get(handlers::list_conversations))
-        .route("/api/conversations", post(handlers::create_conversation))
-        .route(
-            "/api/conversations/{id}/messages",
-            get(handlers::get_conversation_messages),
-        )
-        .route(
-            "/api/conversations/{id}",
-            put(handlers::rename_conversation),
-        )
-        .route(
-            "/api/conversations/{id}",
-            delete(handlers::delete_conversation),
-        )
         .layer(middleware::from_fn(crate::core::auth::auth_middleware));
 
     // --- WebDAV 路由（独立 Basic 认证，不走 cookie auth_middleware） ---

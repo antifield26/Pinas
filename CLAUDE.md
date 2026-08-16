@@ -10,7 +10,7 @@
 | 模板 | Askama 0.16 (编译时 Jinja2 语法) |
 | 前端 | HTMX 2.0.4 + Alpine.js 3.14.9 |
 | CSS | Tailwind CSS v4 (预编译 `tailwind.min.css`) |
-| Markdown | marked.js + DOMPurify (AI 聊天渲染) |
+| Markdown | marked.js + DOMPurify (.md 文件预览渲染) |
 | 数据库 | SQLite WAL 模式 (`cloud_disk.db`) |
 | 目标平台 | `aarch64-unknown-linux-gnu`, `cortex-a76` |
 | 部署 | systemd 直跑二进制（Dockerfile 仅作 CI 冒烟构建） |
@@ -28,7 +28,6 @@ Browser                      Axum Server
                               │ JSON API            │
                               │  ├ /api/files/*     │
                               │  ├ /api/todos/*     │
-                              │  ├ /api/agent/*     │
                               │  └ ...              │
                               └─────────────────────┘
 ```
@@ -44,7 +43,7 @@ Browser                      Axum Server
 
 ```
 ├── src/
-│   ├── main.rs              # 入口 (配置/日志/DB/路由/CancellationToken/优雅关闭/主密钥)
+│   ├── main.rs              # 入口 (配置/日志/DB/路由/CancellationToken/优雅关闭)
 │   ├── config.rs            # Config 结构体 (PINAS_* 环境变量 + validate())
 │   ├── constants.rs         # 全局常量
 │   ├── error.rs             # AppError + AppResult<T>
@@ -53,7 +52,7 @@ Browser                      Axum Server
 │   ├── templates.rs         # AppTemplate<T> — Askama → IntoResponse
 │   ├── db/
 │   │   ├── mod.rs           # create_pool(), init_tables()
-│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表, 当前 v11)
+│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表, 当前 v12)
 │   │   └── queries.rs       # 共享查询辅助
 │   ├── middleware/
 │   │   ├── csp.rs           # Content-Security-Policy
@@ -72,9 +71,6 @@ Browser                      Axum Server
 │       ├── system.rs        # 健康检查 + 系统监控
 │       ├── links.rs         # 链接收藏 CRUD
 │       ├── todos.rs         # 待办/日程 CRUD
-│       ├── agent.rs         # AI 对话 (DeepSeek, DNS 钉扎客户端)
-│       ├── conversations.rs # 对话管理 (CRUD + HTMX 片段)
-│       ├── settings.rs      # Agent 用户设置
 │       ├── minecraft.rs     # MC 服务器状态
 │       ├── dav/             # WebDAV（P1-1 拆分：mod 入口 / auth 认证 / ops 方法）
 │       ├── rate_limit.rs    # 异步速率限制器
@@ -82,15 +78,14 @@ Browser                      Axum Server
 ├── core/
 │   ├── mod.rs               # UserSession + 密码学重导出
 │   ├── auth.rs              # auth_middleware（空闲超时滑动刷新）
-│   ├── crypto.rs            # hash_token/password/verify/generate
-│   └── secrets.rs           # 主密钥 + 敏感字段 ChaCha20-Poly1305 加解密
+│   └── crypto.rs            # hash_token/password/verify/generate
 ├── templates/
 │   ├── base.html            # 根布局 (nav/toast/modal/PWA/JS namespace)
-│   ├── pages/               # 10 页面模板 (7 个 page_struct! + 3 独立页)
-│   ├── components/          # 可复用 HTMX 片段 (23 个，含 upload_queue.html)
+│   ├── pages/               # 9 页面模板 (6 个 page_struct! + 3 独立页)
+│   ├── components/          # 可复用 HTMX 片段 (18 个，含 upload_queue.html)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
-├── static/sw.js             # PWA Service Worker v15
+├── static/sw.js             # PWA Service Worker v16
 ├── deny.toml                # cargo-deny 供应链策略（P1-3）
 └── uploads/                 # 运行时文件存储
 ```
@@ -104,7 +99,6 @@ Browser                      Axum Server
 | `GET` | `/` | 仪表盘 |
 | `GET` | `/drive` | 文件浏览器 |
 | `GET` | `/todos` | 待办/日程 |
-| `GET` | `/agent` | AI 助手 |
 | `GET` | `/links` | 链接收藏 |
 | `GET` | `/trash` | 回收站 |
 | `GET` | `/admin` | 用户管理 |
@@ -128,8 +122,6 @@ Browser                      Axum Server
 | `PUT/DELETE` | `/todos/:id` | 更新/删除 |
 | `GET/POST` | `/links/list`, `/links` | 链接列表/创建 |
 | `PUT/DELETE` | `/links/:id` | 更新/删除 |
-| `POST` | `/agent/chat`, `/agent/briefing` | AI 对话/简报 |
-| `GET` | `/agent/settings-form` | 设置表单 |
 | `GET` | `/trash/list` | 回收站列表 |
 | `POST` | `/trash/clear` | 清空回收站 |
 | `GET` | `/home/system-monitor` | 系统监控 |
@@ -151,17 +143,14 @@ Browser                      Axum Server
 | `GET/POST` | `/api/admin/*` | 用户管理 |
 | `GET/POST/PUT/DELETE` | `/api/links`, `/api/links/:id` | 链接 CRUD |
 | `GET/POST/PUT/DELETE` | `/api/todos`, `/api/todos/:id` | 待办 CRUD |
-| `POST` | `/api/agent/chat`, `/api/agent/chat/stream` | AI 对话（非流式 / SSE 流式 + 工具调用） |
-| `POST` | `/api/agent/briefing` | AI 简报 |
 | `*` | `/dav`, `/dav/`, `/dav/{*path}` | WebDAV（Basic 认证：PROPFIND/GET/PUT/MKCOL/MOVE/COPY/DELETE/LOCK） |
-| `GET/PUT` | `/api/agent/settings` | Agent 设置 |
 | `GET` | `/api/system/status` | 系统状态 (admin) |
 | `GET` | `/api/minecraft/status` | MC 状态 |
 | `GET` | `/health` | 健康检查 |
 
 ## 数据库
 
-15 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `user_settings`, `conversations`, `conversation_messages`, `media_tokens`, `fs_journal`（文件操作意图日志，启动重放）, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）
+12 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `media_tokens`, `fs_journal`（文件操作意图日志，启动重放）, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）；v1.11 起内置 AI Chat 相关表（user_settings/conversations/conversation_messages）已随迁移 v12 删除
 
 - **WAL 模式** (`Normal` synchronous)，连接池 16
 - **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
@@ -178,12 +167,9 @@ PINAS_SESSION_DAYS=7               PINAS_SESSION_IDLE_MINUTES=1440   # 空闲超
 PINAS_DATA_DIR=
 PINAS_TEMP_CLEANUP_HOURS=24        PINAS_TRASH_CLEANUP_DAYS=30
 PINAS_ADMIN_PASSWORD=              PINAS_GUEST_PASSWORD=
-PINAS_DEEPSEEK_API_KEY=            PINAS_DEEPSEEK_API_BASE=https://api.deepseek.com
-PINAS_DEEPSEEK_MODEL=deepseek-v4-flash     PINAS_ALLOW_REGISTRATION=false
+PINAS_ALLOW_REGISTRATION=false
 PINAS_COOKIE_SECURE=               PINAS_SYNC_PASSWORDS=false
-PINAS_AGENT_DAILY_QUOTA=200        MINECRAFT_HOST=127.0.0.1
-PINAS_MASTER_KEY=                  # 主密钥（64 位 hex；缺省用 <data_dir>/secret.key，0600）
-MINECRAFT_PORT=25565
+MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 ```
 
 ## 代码约定
@@ -203,14 +189,7 @@ MINECRAFT_PORT=25565
   + 认证限速（10 次/60s/IP）+ 全路径 openat2 沙箱 + DELETE 进回收站；路由级 5GiB body limit
 - 密码学函数从 `src/core` 导入（`hash_password`, `verify_password`, `hash_token`）；
   Argon2id m=19MiB/t=3/p=1（验证参数随哈希串自描述，旧哈希不受影响）
-- **敏感字段落库加密（v1.10 P0-3）**：AI API Key 经 ChaCha20-Poly1305 加密（`core::secrets`），
-  主密钥来自 `PINAS_MASTER_KEY`（hex）或 `<data_dir>/secret.key`（0600，自动生成）；
-  旧明文值读取兼容（无 enc:v1: 前缀原样返回），下次保存即升级；密钥文件损坏拒绝启动（防密文不可解）
-- **AI 端点双重限速**（5 分钟窗口 + 每日配额，本地时区日界，键定期清理）；分享匿名端点限速 + 每分享失败锁定；
-  **api_base 深度校验**（https-only + 拒 IP/私网/重绑定域名后缀，写入与读取双侧）
-- **DNS 钉扎（v1.10 P0-1）**：AI 请求前真实解析 api_base 域名，任一结果落在
-  私网/环回/链路本地/CGNAT/文档网段即拒绝；客户端按 base 缓存 10 分钟并 `resolve()` 钉扎连接 IP
-  （SNI 仍为域名，证书校验不变）；禁止代理（绕过钉扎）
+- 分享匿名端点限速 + 每分享失败锁定
 - **会话双闸（v1.10 P0-2）**：绝对过期（7 天）+ 空闲超时（默认 24h，`PINAS_SESSION_IDLE_MINUTES`）；
   中间件惰性刷新 last_active_at（≥5 分钟才写库），超时会话强制下线并定期清理
 - **X-Request-Id（v1.10 P1-2）**：所有响应携带请求 ID（沿用入站值），tracing span 注入
@@ -250,36 +229,31 @@ MINECRAFT_PORT=25565
 - **组件类**：btn-primary/secondary/ghost/danger(/btn-sm)、icon-btn、form-label、input-error、
   badge 四色、empty-state、card-hover、row-hover、skeleton——新 UI 一律引用组件类，不手写内联重复
 - **动效**：View Transitions API 接管 hx-boost 整页导航（渐进增强，reduced-motion/不支持回退
-  CSS 转场）；流式光标/Toast 倒计时条/批量工具栏淡入在 app.js；交错延迟仍为模板内联
+  CSS 转场）；Toast 倒计时条/批量工具栏淡入在 app.js；交错延迟仍为模板内联
   animation-delay（未迁移 CSS 变量）
 - 上传：10MB 分片 + 3 并发 + 3 次指数退避重试 + `/api/files/check` 断点续传；
   `window.UploadQueue` 队列面板（进度/取消/文件夹上传 webkitdirectory + 拖拽 webkitGetAsEntry 递归）
 - 全局搜索：drive 页"全局"checkbox（path 置空）→ 后端 ≥3 字符走 FTS5 trigram、≤2 字符 LIKE 兜底；结果跨目录显示路径
-- Markdown 渲染：`App.renderMarkdown` = DOMPurify.sanitize(marked.parse())；AI 回复 / .md 预览共用；
+- Markdown 渲染：`App.renderMarkdown` = DOMPurify.sanitize(marked.parse())；.md 预览用；
   preview 的 markdown 原文经 serde_json 编码 + `<` 转义嵌入 script（防 </script> 逃逸）
-- AI 流式：`/api/agent/chat/stream` SSE；工具调用 5 轮循环（search_files/read_file/list_todos/create_todo/get_system_status(admin)）
 - 视频：`<video controls autoplay muted playsinline>` + Range 流式播放
 - 暗色模式：`<head>` 同步脚本预处理 + Alpine `$watch` + localStorage（独立页共用 `partials/theme_head.html`）
 - 云盘路径导航：唯一入口 `App.navigateTo(path)` / `App.goParent()`，路径来源 `#drive-current-path`
-- PWA：SW v15 预缓存公开壳 `/login` + 全部本地资源（`/api/` 一律不缓存防敏感 JSON 滞留；
+- PWA：SW v16 预缓存公开壳 `/login` + 全部本地资源（`/api/` 一律不缓存防敏感 JSON 滞留；
   预缓存登录壳而非 `/`，避免已登录 dashboard 的用户名被烤进 CacheStorage；
   版本串与模板 ?v= 严格一致，`scripts/check-versions.sh` 校验含嵌套路径与 manifest）；
   离线仅静态壳/登录页兜底，HTMX 片段与页面离线不可用
 - 版本对齐：Cargo.toml → `/health` version；`?v=` 与 sw.js 预缓存 URL 严格一致（check-versions.sh 强制）
 
-### 已知边界与接受的残余风险（审计记录，2026-08，v1.10 更新）
+### 已知边界与接受的残余风险（审计记录，2026-08，v1.11 更新）
 - CSP script-src 保留 'unsafe-eval'（Alpine x-data 表达式编译 + htmx hx-on 依赖）；style-src 保留
   'unsafe-inline'（动画延迟/进度条宽度等内联样式依赖）——**接受项**，移除需迁移 Alpine（收益不划算）
-- ~~api_base DNS 重绑定~~ **已根治（v1.10）**：请求时真实解析 + 任一私网地址即拒绝 + 连接 IP 钉扎；
-  残余：DNS 解析走系统解析器（可信），TLS 证书校验不变
-- ~~AI API key 明文存 SQLite~~ **已根治（v1.10）**：ChaCha20-Poly1305 加密落库；
-  残余：主密钥文件/环境变量与备份同权限保护（secret.key 0600，务必纳入备份——丢失即密文不可解）
-- ~~会话无空闲超时~~ **已根治（v1.10）**：绝对过期（7 天）+ 空闲超时（默认 24h）双闸；
-  分享失败锁定仍为内存态（重启清零）
+- 会话双闸（绝对 7 天 + 空闲 24h）已就位；分享失败锁定仍为内存态（重启清零）
 - upload_limit_mb 语义 = 全局 body limit（非单文件上限），单文件实际由配额约束；quota_mb=0 表示禁止上传
-- ~~符号链接 swap 竞态~~ **已根治（v1.10）**：openat2 内核级沙箱（RESOLVE_BENEATH）；
-  残余：绝对路径符号链接在沙箱内被整体拒绝（保守语义，比 std::fs 更严格）
+- openat2 沙箱（RESOLVE_BENEATH）已就位；残余：绝对路径符号链接在沙箱内被整体拒绝（保守语义）
 - 登录响应 JSON 回显会话 token（dsh-plugin-pinas Bearer 流程依赖）；页面 JS 不经手存储
+- v1.11 已移除内置 AI Chat（代码/路由/数据表/保存的 Key 全部清理）；AI 能力收敛到 dsh（DeepSeek Harness 反代 + dsh-plugin-pinas），
+  pinas 保留 dsh 所需的功能 API（files/todos/links/system 等）
 
 ### UI 规范（v1.5 起）
 - **暗色层级**：页面底 `gray-950` → 卡片/导航/模态 `gray-900` → 输入/井面 `gray-800`；hover 恒比基底高一档；边框 `gray-700/800`
@@ -287,17 +261,18 @@ MINECRAFT_PORT=25565
 - **动画**（全部尊重 `prefers-reduced-motion`）：
   - 片段替换：容器 `fade-me`（swap 淡出 0.2s）+ 新内容 `animate-fade-in`（中央映射挂载）
   - 模态框：`animate-modal-in`（scale 0.96→1，0.15s）；Toast：`animate-toast-in/out`
-  - 列表交错：行/卡片 `loop.index0 × 30ms`（封顶 240ms）；聊天消息 `animate-slide-up`
+  - 列表交错：行/卡片 `loop.index0 × 30ms`（封顶 240ms）
   - 页面导航（hx-boost）：`animate-page-leave`（浅淡 0.12s，不白屏）+ `animate-page-enter`（淡入上移 0.2s）；
     JS classList 动态挂载（普通 CSS 类，非 @utility——按需生成会遗漏）；失败/401 即恢复；前进后退同样淡入
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 81 个集成测试 + 25 个单元测试（数量以 CI 为准，本段为覆盖清单；含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
-  子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义、AI 流式 503；
+- 77 个集成测试 + 15 个单元测试（数量以 CI 为准，本段为覆盖清单；含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
+  子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义；
   v1.7 新增同名重传 409、重命名覆盖保护、中文多字节子树、回收站清扫豁免、FK 全连接、媒体令牌作用域、
-  分享爆破锁定、AI 配额、SSE 截断、带时间日程日历、HSTS 门控、大小写搜索等；
-  v1.10 新增符号链接越界（读/写路径 4 项）、DNS 私网 IP 分类、密钥加解密往返、会话空闲超时、X-Request-Id）
+  分享爆破锁定、SSE 截断、带时间日程日历、HSTS 门控、大小写搜索等；
+  v1.10 新增符号链接越界（读/写路径 4 项）、DNS 私网 IP 分类、密钥加解密往返、会话空闲超时、X-Request-Id；
+  v1.11 随内置 AI Chat 移除，AI 相关测试（agent/conversation/settings/api_base）同步删除）
 - 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署

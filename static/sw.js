@@ -1,6 +1,6 @@
-// ====== Antifield Cloud Service Worker v15 ======
+// ====== Antifield Cloud Service Worker v16 ======
 // v14 变更：预缓存新增 /assets/app.js（业务脚本全部外置，CSP 不再依赖 unsafe-inline）
-const CACHE_NAME = 'antifield-v15';
+const CACHE_NAME = 'antifield-v16';
 
 // 资源全部本地化（HTMX/Alpine/marked/DOMPurify 均在 assets/）
 // 注：版本号与 HTML 引用（base.html ?v=）严格对齐，保证预缓存命中
@@ -9,15 +9,15 @@ const PRE_CACHE_URLS = [
   '/assets/css/tailwind.min.css?v=19',
   '/assets/htmx.min.js?v=1',
   '/assets/alpine.min.js?v=1',
-  '/assets/app.js?v=1',
+  '/assets/app.js?v=2',
   '/assets/marked.min.js?v=1',
   '/assets/purify.min.js?v=1',
-  '/assets/manifest.json?v=1',
+  '/assets/manifest.json?v=2',
 ];
 
 // ====== Install ======
 self.addEventListener('install', (event) => {
-  console.log('[SW] v15 安装中...');
+  console.log('[SW] v16 安装中...');
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(PRE_CACHE_URLS).catch((err) => {

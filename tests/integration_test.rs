@@ -1675,19 +1675,18 @@ async fn test_rename_move_chinese_and_wildcard_subtree() {
 async fn test_foreign_keys_enforced() {
     let (pool, app) = test_app().await;
 
-    // 引用不存在的用户 → FK 约束必须拒绝
-    let err =
-        sqlx::query("INSERT INTO conversations (username, title) VALUES ('ghost', '孤儿对话')")
-            .execute(&pool)
-            .await;
-    assert!(err.is_err(), "引用不存在用户的对话应被 FK 拒绝");
+    // 引用不存在的用户 → FK 约束必须拒绝（v1.11 起用 todos 替代已移除的 conversations 表）
+    let err = sqlx::query("INSERT INTO todos (username, title) VALUES ('ghost', '孤儿待办')")
+        .execute(&pool)
+        .await;
+    assert!(err.is_err(), "引用不存在用户的待办应被 FK 拒绝");
 
-    // 级联删除：删除用户后其对话应被 CASCADE 清除
+    // 级联删除：删除用户后其待办应被 CASCADE 清除
     sqlx::query("INSERT INTO users (username, password, role) VALUES ('fkuser', 'x', 'user')")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO conversations (username, title) VALUES ('fkuser', 'c1')")
+    sqlx::query("INSERT INTO todos (username, title) VALUES ('fkuser', 't1')")
         .execute(&pool)
         .await
         .unwrap();
@@ -1695,11 +1694,11 @@ async fn test_foreign_keys_enforced() {
         .execute(&pool)
         .await
         .unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE username = 'fkuser'")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM todos WHERE username = 'fkuser'")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(n, 0, "删除用户应级联删除其对话");
+    assert_eq!(n, 0, "删除用户应级联删除其待办");
 
     // 冒烟：应用路由仍可用
     let resp = app
@@ -1821,89 +1820,7 @@ async fn test_media_proxy_range_semantics() {
     let _ = pool;
 }
 
-// ====== 11. AI 对话消息持久化端点 ======
-
 /// 消息端点:归属校验(他人对话 404)+ 空对话返回空数组
-#[tokio::test]
-async fn test_conversation_messages_endpoint() {
-    let (_pool, app) = test_app().await;
-    let (token_a, _ua) = register_and_login_with_username(&app).await;
-    let (token_b, _ub) = register_and_login_with_username(&app).await;
-
-    // A 创建对话
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/conversations")
-                .header("authorization", format!("Bearer {}", token_a))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-    let conv: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let conv_id = conv["id"].as_i64().unwrap();
-
-    // A 读取 → 空消息数组
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/api/conversations/{}/messages", conv_id))
-                .header("authorization", format!("Bearer {}", token_a))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    if status != StatusCode::OK {
-        let b = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        panic!(
-            "读取消息应 200，实际: {} body={}",
-            status,
-            String::from_utf8_lossy(&b)
-        );
-    }
-    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-    let messages: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(messages.as_array().unwrap().len(), 0, "新对话应无消息");
-
-    // B 访问 A 的对话 → 404（归属校验）
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/api/conversations/{}/messages", conv_id))
-                .header("authorization", format!("Bearer {}", token_b))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "他人对话必须 404");
-
-    // 不存在 id → 404
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/api/conversations/999999/messages")
-                .header("authorization", format!("Bearer {}", token_a))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
 
 // ====== 10. WebDAV 测试 (v1.6.0) ======
 
@@ -2916,27 +2833,6 @@ async fn test_preview_markdown_mode() {
     );
 }
 
-/// AI 流式端点：未配置 key → 503（与 agent_chat 一致）
-#[tokio::test]
-async fn test_agent_stream_unconfigured() {
-    let (_pool, app) = test_app().await;
-    let (token, _) = register_and_login_with_username(&app).await;
-    let resp = app
-        .clone()
-        .oneshot(post_json_with_token(
-            "/api/agent/chat/stream",
-            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "未配置 AI 应 503"
-    );
-}
-
 // ====== 11. P1 批次回归测试 (v1.7.0) ======
 
 /// F9: 分片空洞（缺中间片）合并必须拒绝，而非产出错位损坏文件
@@ -3237,50 +3133,6 @@ async fn test_share_bruteforce_lockout() {
 
     // 清理测试文件
     let _ = tokio::fs::remove_file(format!("uploads/{}/lock.bin", username)).await;
-}
-
-/// F18: AI 每日配额耗尽后 429（限速在 resolve_agent_config/上游调用之前执行）
-#[tokio::test]
-async fn test_agent_rate_limited() {
-    let config = Config {
-        agent_daily_quota: 2,
-        ..Default::default()
-    };
-    let (_pool, app) = test_app_with_config(config).await;
-    let (token, _) = register_and_login_with_username(&app).await;
-
-    // 前 2 次通过限速（无 key → 503），第 3 次配额耗尽 → 429
-    for i in 0..2 {
-        let resp = app
-            .clone()
-            .oneshot(post_json_with_token(
-                "/api/agent/chat",
-                r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-                &token,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "第 {} 次应通过限速到达配置检查 (503)",
-            i + 1
-        );
-    }
-    let resp = app
-        .clone()
-        .oneshot(post_json_with_token(
-            "/api/agent/chat",
-            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::TOO_MANY_REQUESTS,
-        "日配额耗尽应 429"
-    );
 }
 
 /// F21: javascript: 等危险 scheme 链接必须被拒绝（JSON 与 HTMX 片段路径一致）
@@ -4130,34 +3982,6 @@ async fn test_dav_cache_invalidated_on_password_change() {
 }
 
 /// api_base 深度校验回归（写入侧）
-#[tokio::test]
-async fn test_api_base_validation_rejects_dangerous() {
-    let (_pool, app) = test_app().await;
-    let (token, _u) = register_and_login_with_username(&app).await;
-    let cases = [
-        ("http://api.deepseek.com", 400),  // 非 https
-        ("https://127.0.0.1:8080", 400),   // 回环
-        ("https://10.1.2.3", 400),         // 私网
-        ("https://evil.nip.io", 400),      // 重绑定后缀
-        ("https://api.deepseek.com", 200), // 合法
-    ];
-    for (base, want) in cases {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/api/agent/settings")
-                    .header("authorization", format!("Bearer {}", token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(r#"{{"deepseek_api_base":"{}"}}"#, base)))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status().as_u16(), want, "base={} 应 {}", base, want);
-    }
-}
 
 /// CSP 回归：script-src 无 unsafe-inline + 含主题预涂哈希；页面/片段无内联事件处理器
 #[tokio::test]
@@ -4250,7 +4074,7 @@ async fn test_csp_and_templates_no_inline_handlers() {
         );
     }
     assert!(
-        html.contains("/assets/app.js?v=1"),
+        html.contains("/assets/app.js?v=2"),
         "drive 页应加载外部 app.js"
     );
 }

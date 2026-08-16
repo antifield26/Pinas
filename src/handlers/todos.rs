@@ -580,10 +580,6 @@ pub async fn todos_create_fragment(
     .bind(&priority).bind("pending").bind(&category)
     .execute(&pool).await;
 
-    crate::handlers::invalidate_prompt_cache(&session.username).await;
-    crate::handlers::invalidate_prompt_cache(&session.username).await;
-    crate::handlers::invalidate_prompt_cache(&session.username).await;
-    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -672,7 +668,6 @@ pub async fn todos_update_fragment(
     .bind(id).bind(&session.username)
     .execute(&pool).await;
 
-    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -704,7 +699,6 @@ pub async fn todos_delete_fragment(
         .execute(&pool)
         .await;
 
-    crate::handlers::invalidate_prompt_cache(&session.username).await;
     let _ = log_audit(
         &pool,
         &session.username,

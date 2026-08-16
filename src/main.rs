@@ -48,11 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         warn!("切换工作目录到 '{}' 失败: {}", data_dir, e);
     }
-    // 3.5 主密钥初始化（P0-3：敏感字段落库加密；失败即拒绝启动——
-    // 密钥文件损坏时静默重建会让已有密文永久不可解）
-    if let Err(e) = pi_nas::core::secrets::init_master_key() {
-        panic!("主密钥初始化失败: {e}");
-    }
     // 4. 数据库连接池 + 初始化（含回收站旧目录迁移，必须先于 TRASH_DIR 创建与清扫任务）
     let pool = db::create_pool(&config.database_url).await?;
     db::init(&pool, &config).await?;

@@ -244,32 +244,6 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS user_settings (
-            username TEXT PRIMARY KEY,
-            deepseek_api_key TEXT,
-            deepseek_api_base TEXT,
-            deepseek_model TEXT,
-            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    // AI 对话管理（conversation_messages 死表已于 v5 迁移移除，消息持久化列为后续）
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '新对话',
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )",
-    )
-    .execute(pool)
-    .await?;
-
     Ok(())
 }
 

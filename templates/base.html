@@ -8,7 +8,7 @@
   <script>(function(){var d=localStorage.getItem('theme');if(d==='dark'||(!d&&window.matchMedia('(prefers-color-scheme:dark)').matches)){document.documentElement.classList.add('dark');}})();</script>
   <title>{% block title %}Antifield Cloud{% endblock %}</title>
 
-  <meta name="description" content="自托管 NAS 网盘 — 文件管理、待办日程、AI 智能体">
+  <meta name="description" content="自托管 NAS 网盘 — 文件管理、待办日程、链接收藏">
   <meta name="theme-color" content="#4f46e5" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1b4b" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -17,14 +17,14 @@
   <meta name="format-detection" content="telephone=no">
 
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%234f46e5'/><text x='16' y='22' text-anchor='middle' font-family='sans-serif' font-size='18' font-weight='bold' fill='white'>A</text></svg>">
-  <link rel="manifest" href="/assets/manifest.json?v=1">
+  <link rel="manifest" href="/assets/manifest.json?v=2">
   <link rel="stylesheet" href="/assets/css/tailwind.min.css?v=19">
 
   <!-- HTMX + Alpine.js 本地化（第三方 CDN 在国内链路不可控）；data-cfasync 防 Rocket Loader 异步化破坏同步时序 -->
   <script src="/assets/htmx.min.js?v=1" data-cfasync="false"></script>
   <script defer src="/assets/alpine.min.js?v=1" data-cfasync="false"></script>
   <!-- Marked + DOMPurify 改为按需懒加载（App.renderMarkdown 首次调用时动态注入）：
-       两库合计 ~70KB，历史上全站每页加载，而仅 AI 聊天与 .md 预览需要（marked v15 无内置
+       两库合计 ~70KB，历史上全站每页加载，而仅 .md 预览需要（marked v15 无内置
        sanitize，必须配 DOMPurify） -->
 
   {% block head_extra %}{% endblock %}
@@ -123,7 +123,7 @@
   <div id="offline-banner" class="hidden fixed bottom-0 sm:bottom-auto left-0 right-0 bg-red-600 text-white text-center text-sm py-2 z-50 font-medium">网络连接已断开</div>
 
   <!-- 主脚本外置（CSP 收敛）：外部脚本只执行一次，hx-boost 导航不重建（原 H7 守卫语义天然成立） -->
-  <script src="/assets/app.js?v=1" data-cfasync="false"></script>
+  <script src="/assets/app.js?v=2" data-cfasync="false"></script>
 
   <!-- 拖拽上传覆盖层 -->
   <div id="drop-overlay" class="fixed inset-0 z-50 hidden items-center justify-center bg-indigo-500/20 backdrop-blur-sm" style="display:none">

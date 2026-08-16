@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 11;
+const CURRENT_VERSION: i32 = 12;
 
 /// 执行所有待迁移的 schema 变更。
 /// SQLite DDL 事务化：整批迁移一个事务，失败整体回滚，杜绝半迁移状态；
@@ -48,14 +48,6 @@ pub async fn run(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
             .execute(&mut *tx)
             .await?;
         tracing::info!("[DB] Schema 迁移到 v2 完成");
-    }
-
-    if current < 3 {
-        apply_v3_migrations(&mut tx).await?;
-        sqlx::query("INSERT INTO schema_version (version) VALUES (3)")
-            .execute(&mut *tx)
-            .await?;
-        tracing::info!("[DB] Schema 迁移到 v3 完成");
     }
 
     if current < 4 {
@@ -120,6 +112,14 @@ pub async fn run(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
             .execute(&mut *tx)
             .await?;
         tracing::info!("[DB] Schema 迁移到 v11 完成");
+    }
+
+    if current < 12 {
+        apply_v12_migrations(&mut tx).await?;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (12)")
+            .execute(&mut *tx)
+            .await?;
+        tracing::info!("[DB] Schema 迁移到 v12 完成");
     }
 
     tx.commit().await?;
@@ -342,6 +342,23 @@ async fn apply_v4_migrations(
     Ok(())
 }
 
+/// v12: 移除内置 AI Chat（v1.11）——user_settings（含加密的 API Key）、
+/// conversations、conversation_messages 三张表整体删除，保存的 Key 一并清理
+async fn apply_v12_migrations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    for t in ["user_settings", "conversations", "conversation_messages"] {
+        // 表名来自编译期常量白名单，无注入面
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {t}")))
+            .execute(&mut **tx)
+            .await?;
+    }
+    tracing::info!(
+        "[DB] v12 迁移: 移除内置 AI Chat 数据表（user_settings/conversations/conversation_messages）"
+    );
+    Ok(())
+}
+
 /// v11: 会话空闲超时 — sessions.last_active_at（滑动的最后活跃时间）。
 /// 认证层惰性刷新 + 空闲超时强制下线；存量会话回填当前时间（升级即视为活跃）
 async fn apply_v11_migrations(
@@ -493,33 +510,5 @@ async fn apply_v8_migrations(
         .await
         .ok();
     tracing::info!("[DB] v8 迁移: media_tokens 表（短时效路径限定媒体令牌）已建立");
-    Ok(())
-}
-
-/// v3: user_settings 添加 temperature 和 max_tokens 列
-async fn apply_v3_migrations(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<(), sqlx::Error> {
-    let cols: Vec<String> = sqlx::query("PRAGMA table_info(user_settings)")
-        .fetch_all(&mut **tx)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|r| r.get::<String, _>(1))
-        .collect();
-
-    if !cols.iter().any(|c| c == "temperature") {
-        sqlx::query("ALTER TABLE user_settings ADD COLUMN temperature REAL NOT NULL DEFAULT 0.7")
-            .execute(&mut **tx)
-            .await?;
-    }
-    if !cols.iter().any(|c| c == "max_tokens") {
-        sqlx::query(
-            "ALTER TABLE user_settings ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 4096",
-        )
-        .execute(&mut **tx)
-        .await?;
-    }
-    tracing::info!("[DB] v3 迁移: user_settings 添加 temperature 和 max_tokens 列");
     Ok(())
 }

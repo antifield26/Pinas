@@ -32,7 +32,6 @@ pub fn spawn_all(
         config.session_idle_minutes,
         cancel.child_token(),
     );
-    spawn_conversation_cleanup(pool.clone(), cancel.child_token());
     spawn_chunk_rows_cleanup(
         pool.clone(),
         config.temp_cleanup_hours,
@@ -61,41 +60,6 @@ fn spawn_session_cleanup(pool: SqlitePool, idle_minutes: i64, cancel: Cancellati
                     // 过期媒体令牌一并清理（短时效路径限定令牌，防表无限增长）
                     let _ = sqlx::query("DELETE FROM media_tokens WHERE expires_at <= datetime('now')")
                         .execute(&pool).await;
-                    // AI 每日配额键清理（只保留本地时区今天）
-                    crate::handlers::clean_agent_daily().await;
-                }
-            }
-        }
-    });
-}
-
-/// 每对话保留最近 500 条消息，超出的历史删除（防无界增长拖垮 LLM 上下文与响应体积）
-const CONV_MESSAGE_CAP: i64 = 500;
-
-fn spawn_conversation_cleanup(pool: SqlitePool, cancel: CancellationToken) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(3600));
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => { tracing::info!("对话历史清理任务已停止"); break; }
-                _ = interval.tick() => {
-                    // L12 修复：相关子查询 LIMIT 500 是 O(rows×500) 的逐行扫描；
-                    // 窗口函数一次排序即可算出每对话的保留边界
-                    let r = sqlx::query(
-                        "DELETE FROM conversation_messages WHERE id IN (
-                            SELECT id FROM (
-                                SELECT id,
-                                    ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY id DESC) AS rn
-                                FROM conversation_messages
-                            ) WHERE rn > ?
-                        )",
-                    )
-                    .bind(CONV_MESSAGE_CAP)
-                    .execute(&pool)
-                    .await;
-                    if let Err(e) = r {
-                        tracing::error!("清理超限对话历史失败: {}", e);
-                    }
                 }
             }
         }

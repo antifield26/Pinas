@@ -1,7 +1,7 @@
 {
   "name": "Antifield Cloud",
   "short_name": "Antifield",
-  "description": "自托管 NAS 网盘 — 文件管理、待办日程、AI 助手、链接库",
+  "description": "自托管 NAS 网盘 — 文件管理、待办日程、链接库",
   "start_url": "/",
   "display": "standalone",
   "orientation": "any",
@@ -45,13 +45,6 @@
       "description": "管理待办事项和日程安排",
       "url": "/todos",
       "icons": [{ "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA5NiA5NiIgZmlsbD0ibm9uZSI+PHJlY3Qgd2lkdGg9Ijk2IiBoZWlnaHQ9Ijk2IiByeD0iMTIiIGZpbGw9IiNENTc3MEQiLz48dGV4dCB4PSI0OCIgeT0iNjAiIGZvbnQtZmFtaWx5PSJzYW5zLXNlcmlmIiBmb250LXNpemU9IjQwIiBmb250LXdlaWdodD0iYm9sZCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI2ZmZiI+VDwvdGV4dD48L3N2Zz4=", "sizes": "96x96" }]
-    },
-    {
-      "name": "AI 助手",
-      "short_name": "AI",
-      "description": "与 AI 智能助手对话",
-      "url": "/agent",
-      "icons": [{ "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA5NiA5NiIgZmlsbD0ibm9uZSI+PHJlY3Qgd2lkdGg9Ijk2IiBoZWlnaHQ9Ijk2IiByeD0iMTIiIGZpbGw9IiM4QjVDRjYiLz48dGV4dCB4PSI0OCIgeT0iNjAiIGZvbnQtZmFtaWx5PSJzYW5zLXNlcmlmIiBmb250LXNpemU9IjQwIiBmb250LXdlaWdodD0iYm9sZCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI2ZmZiI+QTwvdGV4dD48L3N2Zz4=", "sizes": "96x96" }]
     }
   ]
 }

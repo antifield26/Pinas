@@ -26,7 +26,6 @@ macro_rules! page_struct {
 page_struct!(HomePage, "pages/home.html");
 page_struct!(DrivePage, "pages/drive.html");
 page_struct!(TodosPage, "pages/todos.html");
-page_struct!(AgentPage, "pages/agent.html");
 page_struct!(LinksPage, "pages/links.html");
 page_struct!(TrashPage, "pages/trash.html");
 page_struct!(AdminPage, "pages/admin.html");
@@ -69,7 +68,6 @@ macro_rules! page_handler {
 page_handler!(home_page, HomePage, "home");
 page_handler!(drive_page, DrivePage, "drive");
 page_handler!(todos_page, TodosPage, "todos");
-page_handler!(agent_page, AgentPage, "agent");
 page_handler!(links_page, LinksPage, "links");
 page_handler!(trash_page, TrashPage, "trash");
 

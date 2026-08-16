@@ -4,7 +4,6 @@
 
 pub mod auth;
 pub mod crypto;
-pub mod secrets;
 
 pub use crypto::{generate_random_password, hash_password, hash_token, verify_password};
 

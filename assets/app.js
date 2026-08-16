@@ -89,7 +89,7 @@
 
     // PWA Service Worker
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js?v=15', { scope: '/' }).then(function(r) {
+      navigator.serviceWorker.register('/sw.js?v=16', { scope: '/' }).then(function(r) {
         console.log('[PWA] SW registered');
         r.addEventListener('updatefound', function() {
           var newWorker = r.installing;
@@ -147,10 +147,6 @@
       'links-container': 'animate-fade-in',
       'trash-content': 'animate-fade-in',
       'admin-content': 'animate-fade-in',
-      'conv-list': 'animate-fade-in',
-      'agent-chat-messages': 'animate-slide-up',
-      'home-chat-messages': 'animate-slide-up',
-      'briefing-result': 'animate-slide-up'
     };
 
     // Modal: show when content loaded, hide when emptied
@@ -529,27 +525,6 @@
 
     // ====== CSP 收敛：模板内联脚本与内联事件处理器外置（data-* 属性 + document 事件委托） ======
 
-    // --- 设置表单（settings_form.html）---
-    App.saveSettings = async function(e) {
-      e.preventDefault();
-      const body = {
-        deepseek_api_key: document.getElementById('settings-apikey').value.trim() || null,
-        deepseek_api_base: document.getElementById('settings-apibase').value.trim() || null,
-        deepseek_model: document.getElementById('settings-model').value.trim() || null,
-        temperature: parseFloat(document.getElementById('settings-temperature').value),
-        max_tokens: parseInt(document.getElementById('settings-max-tokens').value)
-      };
-      try {
-        const res = await fetch('/api/agent/settings', {
-          method: 'PUT', headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin', body: JSON.stringify(body)
-        });
-        if (res.ok) { App.closeModal(); App.showToast('设置已保存', 'success'); }
-        else { App.showToast('保存失败', 'error'); }
-      } catch(e) { App.showToast('网络错误', 'error'); }
-      return false;
-    };
-
     // --- 上传表单（upload_form.html）---
     App.handleUploadForm = function(e) {
       e.preventDefault();
@@ -901,366 +876,6 @@
       if (v) App.initVideoResume(v);
     };
 
-    // ====== AI 对话（agent.html）：AppAgent 命名空间 + SSE 流式 ======
-    window.AppAgent = {
-      currentConvId: null,
-      streaming: false,
-
-      // 渲染一条消息（纯 DOM + textContent，防注入；assistant 消息渲染 markdown）
-      appendMessage: function(role, content, useMarkdown) {
-        var box = document.getElementById('agent-chat-messages');
-        if (!box) return;
-        var wrapper = document.createElement('div');
-        wrapper.className = role === 'user'
-          ? 'flex gap-3 justify-end animate-slide-up'
-          : 'flex gap-3 animate-slide-up';
-        if (role === 'user') {
-          var bubble = document.createElement('div');
-          bubble.className = 'bg-indigo-600 text-white rounded-2xl rounded-br-md px-4 py-2.5 max-w-[80%] text-sm';
-          var p = document.createElement('p');
-          p.className = 'whitespace-pre-wrap break-words';
-          p.textContent = content;
-          bubble.appendChild(p);
-          wrapper.appendChild(bubble);
-        } else {
-          var label = document.createElement('div');
-          label.className = 'text-sm shrink-0 text-indigo-500 font-bold';
-          label.textContent = 'AI';
-          var bubble = document.createElement('div');
-          bubble.className = 'bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-bl-md px-4 py-2.5 max-w-[80%] text-sm text-gray-800 dark:text-gray-200';
-          var p = document.createElement('p');
-          p.className = 'whitespace-pre-wrap break-words';
-          if (useMarkdown) {
-            window.App.renderMarkdown(p, content);
-          } else {
-            p.textContent = content;
-          }
-          bubble.appendChild(p);
-          wrapper.appendChild(label);
-          wrapper.appendChild(bubble);
-        }
-        box.appendChild(wrapper);
-        box.scrollTop = box.scrollHeight;
-      },
-
-      // 创建流式 AI 气泡，返回 { append(delta), finish() }
-      startStreamBubble: function() {
-        var box = document.getElementById('agent-chat-messages');
-        var wrapper = document.createElement('div');
-        wrapper.className = 'flex gap-3 animate-slide-up';
-        // AI 头像块（v1.9.0：渐变方块，与历史消息模板一致）
-        var avatar = document.createElement('div');
-        avatar.className = 'w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white text-xs font-bold flex items-center justify-center shrink-0';
-        avatar.textContent = 'AI';
-        var bubble = document.createElement('div');
-        bubble.className = 'bg-gray-100 dark:bg-gray-800 rounded-2xl rounded-bl-md px-4 py-2.5 max-w-[80%] text-sm text-gray-800 dark:text-gray-200';
-        var p = document.createElement('p');
-        p.className = 'whitespace-pre-wrap break-words';
-        var thinking = document.createElement('span');
-        thinking.className = 'text-gray-400';
-        thinking.textContent = '思考中...';
-        p.appendChild(thinking);
-        // 流式光标（v1.9.0）：生成期间闪烁，结束移除
-        var caret = document.createElement('span');
-        caret.className = 'animate-caret';
-        caret.textContent = '▍';
-        bubble.appendChild(p);
-        bubble.appendChild(caret);
-        wrapper.appendChild(avatar);
-        wrapper.appendChild(bubble);
-        box.appendChild(wrapper);
-        box.scrollTop = box.scrollHeight;
-        var full = '';
-        var caretAttached = true;
-        return {
-          append: function(delta) {
-            if (!full) thinking.remove();
-            full += delta;
-            p.textContent = full;
-            box.scrollTop = box.scrollHeight;
-          },
-          finish: function() {
-            thinking.remove();
-            if (caretAttached) { caret.remove(); caretAttached = false; }
-            if (full.trim()) {
-              window.App.renderMarkdown(p, full);
-            }
-            box.scrollTop = box.scrollHeight;
-          }
-        };
-      },
-
-      // 新建对话：创建后清空消息区并记 id（同时刷新桌面/移动端双列表）
-      newConversation: function() {
-        fetch('/api/conversations', { method: 'POST', credentials: 'same-origin' })
-          .then(function(r) { return r.json(); })
-          .then(function(conv) {
-            AppAgent.currentConvId = conv.id;
-            document.getElementById('agent-conversation-id').value = conv.id;
-            var box = document.getElementById('agent-chat-messages');
-            if (box) box.innerHTML = '';
-            AppAgent.refreshConvList();
-            AppAgent.toggleDrawer(false);
-          })
-          .catch(function() { App.showToast('创建对话失败', 'error'); });
-      },
-
-      // 加载指定对话的消息历史（assistant 消息渲染 markdown）
-      loadConversation: function(id) {
-        fetch('/api/conversations/' + id + '/messages', { credentials: 'same-origin' })
-          .then(function(r) { return r.json(); })
-          .then(function(messages) {
-            AppAgent.currentConvId = id;
-            document.getElementById('agent-conversation-id').value = id;
-            var box = document.getElementById('agent-chat-messages');
-            if (box) box.innerHTML = '';
-            messages.forEach(function(m) {
-              AppAgent.appendMessage(m.role, m.content, m.role === 'assistant');
-            });
-            AppAgent.toggleDrawer(false);
-          })
-          .catch(function() { App.showToast('加载对话失败', 'error'); });
-      },
-
-      // 刷新会话列表（桌面 #conv-list + 移动端 #conv-list-m）
-      refreshConvList: function() {
-        var active = AppAgent.currentConvId || '';
-        htmx.ajax('GET', '/agent/conversations', { target: '#conv-list', swap: 'innerHTML', values: { active: active } });
-        htmx.ajax('GET', '/agent/conversations', { target: '#conv-list-m', swap: 'innerHTML', values: { active: active } });
-      },
-
-      // 移动端会话抽屉
-      toggleDrawer: function(open) {
-        var drawer = document.getElementById('conv-drawer');
-        if (!drawer) return;
-        drawer.classList.toggle('hidden', !open);
-        drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
-      },
-
-      // 会话 "..." 菜单（重命名 / 删除）
-      openMenu: function(event, id, btn) {
-        event.stopPropagation();
-        AppAgent.closeMenu();
-        var menu = document.createElement('div');
-        menu.className = 'conv-menu fixed z-50 bg-white dark:bg-gray-800 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 py-1 text-xs min-w-32';
-        var rename = document.createElement('button');
-        rename.className = 'block w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200';
-        rename.textContent = '重命名';
-        rename.onclick = function(e) { e.stopPropagation(); AppAgent.closeMenu(); AppAgent.renameConversation(id); };
-        var del = document.createElement('button');
-        del.className = 'block w-full text-left px-3 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 text-red-500';
-        del.textContent = '删除';
-        del.onclick = function(e) { e.stopPropagation(); AppAgent.closeMenu(); AppAgent.deleteConversation(id); };
-        menu.appendChild(rename);
-        menu.appendChild(del);
-        document.body.appendChild(menu);
-        var rect = btn.getBoundingClientRect();
-        menu.style.top = Math.max(8, rect.bottom + 4) + 'px';
-        menu.style.left = Math.min(rect.left, window.innerWidth - 140) + 'px';
-        AppAgent._menu = menu;
-        setTimeout(function() {
-          document.addEventListener('click', AppAgent.closeMenu, { once: true });
-        }, 0);
-      },
-      closeMenu: function() {
-        if (AppAgent._menu) { AppAgent._menu.remove(); AppAgent._menu = null; }
-      },
-
-      // 重命名（内联编辑，PUT /api/conversations/{id}）
-      renameConversation: function(id) {
-        var item = document.querySelector('#conv-list [data-conv-id="' + id + '"] .conv-title')
-                || document.querySelector('#conv-list-m [data-conv-id="' + id + '"] .conv-title');
-        if (!item) return;
-        var old = item.textContent;
-        var input = document.createElement('input');
-        input.value = old;
-        input.className = 'w-full text-xs px-1 py-0.5 border border-indigo-400 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 focus:outline-none';
-        item.replaceWith(input);
-        input.focus();
-        input.select();
-        var done = function() {
-          var t = input.value.trim();
-          if (t && t !== old) {
-            fetch('/api/conversations/' + id, {
-              method: 'PUT',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ title: t })
-            }).then(function(r) {
-              if (r.ok) { AppAgent.refreshConvList(); }
-              else { App.showToast('重命名失败', 'error'); AppAgent.refreshConvList(); }
-            }).catch(function() { App.showToast('重命名失败', 'error'); AppAgent.refreshConvList(); });
-          } else {
-            AppAgent.refreshConvList();
-          }
-        };
-        input.onblur = done;
-        input.onkeydown = function(e) {
-          if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-          if (e.key === 'Escape') { input.value = old; input.blur(); }
-        };
-      },
-
-      // 删除对话（DELETE /api/conversations/{id}）
-      deleteConversation: function(id) {
-        if (!confirm('删除该对话？')) return;
-        fetch('/api/conversations/' + id, { method: 'DELETE', credentials: 'same-origin' })
-          .then(function(r) {
-            if (r.ok) {
-              if (AppAgent.currentConvId === id) {
-                AppAgent.currentConvId = null;
-                document.getElementById('agent-conversation-id').value = '';
-                var box = document.getElementById('agent-chat-messages');
-                if (box) box.innerHTML = '';
-              }
-              AppAgent.refreshConvList();
-            } else {
-              App.showToast('删除失败', 'error');
-            }
-          })
-          .catch(function() { App.showToast('删除失败', 'error'); });
-      },
-
-      // 提交后：刷新会话列表标题
-      onSent: function() {
-        AppAgent.refreshConvList();
-      },
-
-      // 发送消息：按流式开关走 SSE 流式 或 一次性 JSON
-      send: function() {
-        if (AppAgent.streaming) return;
-        var input = document.getElementById('agent-input');
-        var text = input.value.trim();
-        if (!text) return;
-        var hidden = document.getElementById('agent-conversation-id');
-        var useStream = document.getElementById('agent-stream-toggle').checked;
-
-        var doSend = function() {
-          AppAgent.appendMessage('user', text);
-          input.value = '';
-          input.style.height = 'auto';
-          var btn = document.getElementById('agent-send-btn');
-          var finish = function() {
-            AppAgent.streaming = false;
-            btn.disabled = false;
-            btn.textContent = '发送';
-            AppAgent.onSent();
-            document.getElementById('agent-input').focus();
-          };
-
-          if (useStream) {
-            // ---- SSE 流式 ----
-            var bubble = AppAgent.startStreamBubble();
-            AppAgent.streaming = true;
-            btn.disabled = true;
-            btn.textContent = '生成中...';
-            var finishOnce = function() {
-              if (!AppAgent.streaming) return;
-              AppAgent.streaming = false;
-              bubble.finish();
-              btn.disabled = false;
-              btn.textContent = '发送';
-              AppAgent.onSent();
-              document.getElementById('agent-input').focus();
-            };
-            fetch('/api/agent/chat/stream', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                messages: [{ role: 'user', content: text }],
-                model: document.getElementById('agent-model-hidden').value,
-                conversation_id: AppAgent.currentConvId
-              })
-            }).then(function(r) {
-              if (!r.ok) {
-                return r.json().catch(function() { return {}; }).then(function(e) {
-                  throw new Error(e.error || ('请求失败 (' + r.status + ')'));
-                });
-              }
-              var reader = r.body.getReader();
-              var decoder = new TextDecoder();
-              var buffer = '';
-              var read = function() {
-                reader.read().then(function(res) {
-                  if (res.done) { finishOnce(); return; }
-                  buffer += decoder.decode(res.value, { stream: true });
-                  var idx;
-                  while ((idx = buffer.indexOf('\n\n')) >= 0) {
-                    var frame = buffer.slice(0, idx);
-                    buffer = buffer.slice(idx + 2);
-                    frame.split('\n').forEach(function(line) {
-                      if (line.indexOf('data:') !== 0) return;
-                      var data = line.slice(5).trim();
-                      if (!data) return;
-                      if (data === '[DONE]') { finishOnce(); reader.cancel(); return; }
-                      // 服务端 json_data 编码（多行 delta 安全）；旧格式纯文本兜底
-                      try { var parsed = JSON.parse(data); bubble.append(parsed); }
-                      catch (e) { bubble.append(data); }
-                    });
-                    if (!AppAgent.streaming) return;
-                  }
-                  if (AppAgent.streaming) read();
-                }).catch(function(e) {
-                  finishOnce();
-                  App.showToast('流式中断: ' + e.message, 'error');
-                });
-              };
-              read();
-            }).catch(function(e) {
-              finishOnce();
-              App.showToast(e.message, 'error');
-            });
-          } else {
-            // ---- 非流式（一次性 JSON）----
-            AppAgent.streaming = true;
-            btn.disabled = true;
-            btn.textContent = '生成中...';
-            fetch('/api/agent/chat', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                messages: [{ role: 'user', content: text }],
-                model: document.getElementById('agent-model-hidden').value,
-                conversation_id: AppAgent.currentConvId
-              })
-            }).then(function(r) {
-              return r.json().catch(function() { return {}; }).then(function(data) {
-                if (!r.ok) throw new Error(data.error || ('请求失败 (' + r.status + ')'));
-                return data;
-              });
-            }).then(function(data) {
-              if (data.conversation_id) {
-                AppAgent.currentConvId = data.conversation_id;
-                hidden.value = data.conversation_id;
-              }
-              AppAgent.appendMessage('assistant', data.reply || '（AI 未返回内容）', true);
-            }).catch(function(e) {
-              App.showToast(e.message, 'error');
-            }).then(function() {
-              finish();
-            });
-          }
-        };
-
-        if (AppAgent.currentConvId) {
-          hidden.value = AppAgent.currentConvId;
-          doSend();
-        } else {
-          // 首次发送：先创建对话再发送
-          fetch('/api/conversations', { method: 'POST', credentials: 'same-origin' })
-            .then(function(r) { return r.json(); })
-            .then(function(conv) {
-              AppAgent.currentConvId = conv.id;
-              hidden.value = conv.id;
-              doSend();
-            })
-            .catch(function() { App.showToast('创建对话失败', 'error'); });
-        }
-      }
-    };
-
     // ====== document 级事件委托（CSP 收敛：data-* 属性统一入口，一次绑定避免重复） ======
 
     // 点击委托
@@ -1305,13 +920,6 @@
       // 上传队列取消
       if (target.closest('[data-upload-cancel]')) { window.UploadQueue.cancel(); return; }
 
-      // 会话 "..." 菜单
-      var convMenuBtn = target.closest('[data-conv-menu]');
-      if (convMenuBtn && window.AppAgent) {
-        window.AppAgent.openMenu(e, convMenuBtn.getAttribute('data-conv-menu'), convMenuBtn);
-        return;
-      }
-
       // 批量删除 / 下载
       if (target.closest('[data-batch-delete]')) { batchDelete(); return; }
       if (target.closest('[data-batch-download]')) { batchDownload(); return; }
@@ -1329,39 +937,19 @@
         return;
       }
 
-      // 移动端会话抽屉开合
-      var drawerBtn = target.closest('[data-agent-toggle-drawer]');
-      if (drawerBtn && window.AppAgent) {
-        window.AppAgent.toggleDrawer(drawerBtn.getAttribute('data-agent-toggle-drawer') === 'true');
-        return;
-      }
-
-      // 新建对话
-      if (target.closest('[data-agent-new-conversation]') && window.AppAgent) {
-        window.AppAgent.newConversation();
-        return;
-      }
-
       // 阻止默认（链接列表编辑/删除按钮）
       if (target.closest('[data-prevent]')) e.preventDefault();
 
-      // 会话条目点击：加载消息历史（菜单按钮除外）
-      var convItem = target.closest('[data-conv-id]');
-      if (convItem && !target.closest('.conv-menu-btn') && window.AppAgent) {
-        window.AppAgent.loadConversation(parseInt(convItem.getAttribute('data-conv-id'), 10));
-      }
     });
 
     // 提交委托：按表单 id 分发（各 handler 内部已 preventDefault）
     document.addEventListener('submit', function(e) {
       var form = e.target;
       if (!form || !form.id) return;
-      if (form.id === 'settings-form') App.saveSettings(e);
-      else if (form.id === 'upload-form') App.handleUploadForm(e);
+      if (form.id === 'upload-form') App.handleUploadForm(e);
       else if (form.id === 'pwd-modal-form') handlePwdModal(e);
       else if (form.id === 'login-form') handleLogin(e);
       else if (form.id === 'pwd-form') handleChangePwd(e);
-      else if (form.id === 'agent-chat-form') { e.preventDefault(); window.AppAgent.send(); }
     });
 
     // change 委托
@@ -1371,11 +959,6 @@
       if (el.id === 'select-all') { toggleSelectAll(el); return; }
       if (el.classList && el.classList.contains('file-checkbox')) { updateBatchToolbar(); return; }
       if (el.id === 'upload-folder-input') { App.handleFolderInput(el); return; }
-      if (el.id === 'agent-model-select') {
-        var hidden = document.getElementById('agent-model-hidden');
-        if (hidden) hidden.value = el.value;
-        return;
-      }
       if (el.id === 'global-search') {
         var pathEl = document.getElementById('drive-current-path');
         if (!pathEl) return;
@@ -1395,37 +978,12 @@
       }
     });
 
-    // input 委托：range 标签 / agent 输入框自适应高度
-    document.addEventListener('input', function(e) {
-      var el = e.target;
-      if (!el) return;
-      if (el.hasAttribute && el.hasAttribute('data-range-label')) {
-        el.previousElementSibling.textContent = 'Temperature (' + el.value + ')';
-        return;
-      }
-      if (el.id === 'agent-input') {
-        el.style.height = 'auto';
-        el.style.height = Math.min(el.scrollHeight, 150) + 'px';
-        return;
-      }
-    });
-
-    // keydown 委托：agent 输入框 Enter 发送（Shift+Enter 换行）
-    document.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter' && !e.shiftKey && e.target && e.target.hasAttribute && e.target.hasAttribute('data-agent-enter-submit')) {
-        e.preventDefault();
-        if (e.target.form) e.target.form.requestSubmit();
-      }
-    });
 
     // 媒体加载失败：error 事件不冒泡，捕获阶段在 window 上委托（原 onerror="showMediaError(this)"）
     window.addEventListener('error', function(e) {
       var el = e.target;
       if (el && el.hasAttribute && el.hasAttribute('data-media-el')) App.showMediaError(el);
     }, true);
-
-    // 会话菜单：滚动时关闭
-    document.addEventListener('scroll', function() { window.AppAgent.closeMenu(); }, true);
 
     // 拖拽上传覆盖层（drive.html 原 ondragover/ondragleave/ondrop）
     document.addEventListener('dragover', function(e) {

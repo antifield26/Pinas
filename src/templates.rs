@@ -38,13 +38,12 @@ impl<T: Template> IntoResponse for AppTemplate<T> {
 // 每个 extends "base.html" 的模板 struct 都需要包含这些字段：
 //   pub username: String,
 //   pub is_admin: bool,
-//   pub current_page: String,  // "home"|"drive"|"todos"|"agent"|"links"|"trash"|"admin"
+//   pub current_page: String,  // "home"|"drive"|"todos"|"links"|"trash"|"admin"
 
 /// 导航页标识常量
 pub const PAGE_HOME: &str = "home";
 pub const PAGE_DRIVE: &str = "drive";
 pub const PAGE_TODOS: &str = "todos";
-pub const PAGE_AGENT: &str = "agent";
 pub const PAGE_LINKS: &str = "links";
 pub const PAGE_TRASH: &str = "trash";
 pub const PAGE_ADMIN: &str = "admin";
@@ -83,11 +82,6 @@ pub fn nav_items(is_admin: bool) -> Vec<NavItem> {
             href: "/todos",
             label: "待办",
             page: PAGE_TODOS,
-        },
-        NavItem {
-            href: "/agent",
-            label: "AI",
-            page: PAGE_AGENT,
         },
         NavItem {
             href: "/links",
