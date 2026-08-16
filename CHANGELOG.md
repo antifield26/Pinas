@@ -1,5 +1,69 @@
 # Changelog
 
+## v1.11.0 (2026-08-16)
+
+### Removed（内置 AI Chat 移除，AI 能力收敛到 dsh）
+- **代码**：handlers 删除 agent.rs / conversations.rs / settings.rs（含 validate_api_base）；
+  core::secrets.rs（主密钥 + ChaCha20-Poly1305）一并移除；依赖移除 chacha20poly1305
+- **路由**：`/agent` 页面、`/api/agent/*`（chat/chat/stream/briefing/models/settings）、
+  `/api/conversations*`、`/agent/*` HTMX 片段全部删除；导航栏 AI 入口（templates.rs nav_items）
+  与 PAGE_AGENT 常量移除
+- **模板/前端**：agent.html + 5 个组件（chat_message/conversation_list/settings_form/
+  briefing_result）、todos 页"AI 简报"按钮；app.js 的 AppAgent 命名空间（SSE 流式/会话管理/
+  设置表单/事件委托）整体清理——保留 renderMarkdown（.md 预览共用）与 marked/purify 懒加载
+- **配置**：PINAS_DEEPSEEK_* / PINAS_AGENT_DAILY_QUOTA / PINAS_MASTER_KEY 移除
+- **数据清理（迁移 v12）**：DROP user_settings（含已加密的 API Key）/ conversations /
+  conversation_messages；历史迁移 v3（user_settings 加列）同步移除；
+  生产 secret.key 主密钥文件删除、.env 无 AI 变量残留
+- **PWA**：manifest 移除 AI 快捷入口与描述；SW v16 / app.js?v=2 / manifest?v=2
+  （Cache First 策略下内容变更强制换缓存键）
+
+### Kept（保留项）
+- dsh 反代（127.0.0.1:3100，admin 会话门禁）与首页 DeepSeek Harness 跳转卡片
+- dsh-plugin-pinas 依赖的功能 API（files/todos/links/system/edit 生产实测全通）
+
+### Tests
+- 集成测试 81 → 77（AI 相关 4 项删除，FK 测试改用 todos 表）；15 单元全绿
+
+## v1.10.0 (2026-08-16)
+
+### Security（P0 残余风险根治）
+- **DNS 重绑定钉扎（P0-1）**：AI 请求前真实解析 api_base 域名，任一结果落在
+  私网/环回/链路本地/CGNAT/文档网段即拒绝；客户端按 base 缓存 10 分钟并 `resolve()`
+  钉扎连接 IP（SNI 仍为域名，证书校验不变）；禁止代理绕过钉扎
+- **会话空闲超时（P0-2）**：schema v11 sessions.last_active_at；绝对过期（7 天）+
+  空闲超时（默认 24h，PINAS_SESSION_IDLE_MINUTES）双闸；中间件惰性刷新（≥5 分钟
+  才写库），后台任务定期清理超空闲会话
+- **AI Key 落库加密（P0-3）**：ChaCha20-Poly1305（core::secrets），格式
+  `enc:v1:base64(nonce‖ct‖tag)`；主密钥 = PINAS_MASTER_KEY 或 data_dir/secret.key（0600
+  自动生成）；旧明文读取兼容、下次保存即升级；密钥文件损坏拒绝启动（防密文不可解）
+- **符号链接 TOCTOU（P0-4）**：新增 fsutil::Sandbox = openat2(RESOLVE_BENEATH |
+  NO_MAGICLINKS) + renameat/unlinkat/mkdirat/statat 族，全部物理文件操作迁移
+  （media/file_ops/dav/share/trash/journal/upload/agent）；内核级原子解析，越界
+  （含绝对路径链接）一律拒绝；字符串校验 safe_join_sandbox 保留为纵深防御第一层
+
+### Engineering（P1 工程治理）
+- **模块拆分**：file_ops.rs 1796 行 → file_ops/{mod,core,api,fragments}；
+  dav.rs 1351 行 → dav/{mod,auth,ops}（行为零变化，80 测试回归通过）
+- **X-Request-Id（P1-2）**：全部响应携带请求 ID（沿用入站值），tracing span 注入
+  request_id 字段；dsh 反代读取扩展注入上游请求头（跨进程链路贯穿）
+- **供应链（P1-3）**：deny.toml（advisories + yanked + 15 项宽松许可白名单）；
+  CI 增加 cargo-deny-action；Dependabot（cargo 每周 + actions 每月）；
+  Cargo.toml 补 license 字段；spin 0.9.8 → 0.9.9（yanked）
+- **配置脱敏（P1-4）**：PINAS_DEEPSEEK_API_KEY / PINAS_MASTER_KEY 启动日志掩码
+- **文档（P1-5）**：CLAUDE.md 去漂移（结构图/测试计数/环境变量/已知边界）
+
+### Tests
+- 新增符号链接越界（读/写路径 4 项）、DNS 私网 IP 分类、密钥加解密往返、会话空闲超时、
+  X-Request-Id 等；25 单元 + 81 集成全绿
+
+## v1.9.1 (2026-08-15)
+
+### Fixed（链接库移动端布局）
+- 双列排布在移动端无法完整显示标题 → 单列全宽（grid-cols-1 sm:grid-cols-2 lg:grid-cols-3）
+- 标题两行截断（line-clamp-2 + break-words）
+- 行内操作改图标按钮（icon-btn），修复 `<a>` 嵌套 `<button>` 的非法 HTML 结构
+
 ## v1.9.0 (2026-08-15)
 
 ### UI（视觉与动画优化）
