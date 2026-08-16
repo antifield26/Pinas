@@ -240,16 +240,22 @@ pub async fn access_share(
         Ok(p) => p,
         Err(_) => return (StatusCode::NOT_FOUND, "分享内容不存在").into_response(),
     };
-    if !full_path.is_file() {
-        return (StatusCode::BAD_REQUEST, "仅支持文件分享下载").into_response();
-    }
-    let meta = match tokio::fs::metadata(&full_path).await {
-        Ok(m) => m,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "文件读取失败").into_response(),
+    let rel = full_path
+        .strip_prefix(base)
+        .unwrap_or(&full_path)
+        .to_string_lossy()
+        .into_owned();
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::NOT_FOUND, "分享内容不存在").into_response(),
+    };
+    let meta = match sb.metadata(&rel) {
+        Ok(m) if m.is_file() => m,
+        _ => return (StatusCode::BAD_REQUEST, "仅支持文件分享下载").into_response(),
     };
 
     // 流式返回：一律 attachment；html/svg/xml 强制 octet-stream（同源 XSS 通道封堵）
-    match tokio::fs::File::open(&full_path).await {
+    match sb.open(&rel) {
         Ok(file) => {
             let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
             let mime_str = mime.to_string();
@@ -269,7 +275,7 @@ pub async fn access_share(
             }
             headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             headers.insert(header::CONTENT_LENGTH, HeaderValue::from(meta.len()));
-            let body = Body::from_stream(ReaderStream::new(file));
+            let body = Body::from_stream(ReaderStream::new(tokio::fs::File::from_std(file)));
             (StatusCode::OK, headers, body).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "文件读取失败").into_response(),
@@ -387,18 +393,24 @@ pub async fn share_page(
         Ok(p) => p,
         Err(_) => return (StatusCode::NOT_FOUND, "分享内容不存在").into_response(),
     };
-    let is_dir = full_path.is_dir();
+    let rel = full_path
+        .strip_prefix(base)
+        .unwrap_or(&full_path)
+        .to_string_lossy()
+        .into_owned();
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::NOT_FOUND, "分享内容不存在").into_response(),
+    };
+    let is_dir = sb.metadata(&rel).map(|m| m.is_dir()).unwrap_or(false);
     let file_size;
     let file_count;
 
     if is_dir {
-        file_count = std::fs::read_dir(&full_path)
-            .map(|d| d.count())
-            .unwrap_or(0);
+        file_count = sb.read_dir(&rel).map(|d| d.len()).unwrap_or(0);
         file_size = format!("{} 个项目", file_count);
     } else {
-        let meta = full_path.metadata();
-        let len = meta.map(|m| m.len()).unwrap_or(0);
+        let len = sb.metadata(&rel).map(|m| m.len()).unwrap_or(0);
         file_size = if len < 1024 {
             format!("{} B", len)
         } else if len < 1024 * 1024 {
@@ -495,30 +507,30 @@ pub async fn share_subfile(
         Ok(p) => p,
         Err(_) => return (StatusCode::FORBIDDEN, "访问越界").into_response(),
     };
+    // 相对 uploads 根的 rel（openat2 沙箱原子操作；越界符号链接一律 404）
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::FORBIDDEN, "访问越界").into_response(),
+    };
+    let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
+    let target_rel = match target_path.strip_prefix(base) {
+        Ok(r) => r.to_string_lossy().into_owned(),
+        Err(_) => return (StatusCode::FORBIDDEN, "访问越界").into_response(),
+    };
 
     // 路径前缀检查（组件级，阻止 ../ 穿越；沙箱 Result 已拦截主路径，此检查兜底符号链接场景）
     if !target_path.starts_with(&share_base) {
         return (StatusCode::FORBIDDEN, "访问越界").into_response();
     }
-    if !target_path.exists() {
-        return (StatusCode::NOT_FOUND, "文件或目录不存在").into_response();
-    }
-    // 符号链接兜底：文件存在后，规范化路径再次检查
-    if let (Ok(canon_target), Ok(canon_base)) =
-        (target_path.canonicalize(), share_base.canonicalize())
-        && !canon_target.starts_with(&canon_base)
-    {
-        tracing::error!(
-            "[Share] 符号链接越界: target={:?}, base={:?}",
-            canon_target,
-            canon_base
-        );
-        return (StatusCode::FORBIDDEN, "访问越界").into_response();
-    }
+    // 存在性经 openat2 沙箱（越界符号链接 → 不存在 → 404）
+    let meta = match sb.metadata(&target_rel) {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::NOT_FOUND, "文件或目录不存在").into_response(),
+    };
 
-    // 4. 如果是目录，返回目录内容 JSON
-    if target_path.is_dir() {
-        let items = list_directory_files(&target_path, &user_root).await;
+    // 4. 如果是目录，返回目录内容 JSON（沙箱内遍历，符号链接条目跳过不暴露）
+    if meta.is_dir() {
+        let items = list_directory_files(&sb, &target_rel).await;
         return (StatusCode::OK, Json(items)).into_response();
     }
 
@@ -544,7 +556,7 @@ pub async fn share_subfile(
     });
 
     // 5. 如果是文件，流式返回
-    match tokio::fs::File::open(&target_path).await {
+    match sb.open(&target_rel) {
         Ok(file) => {
             let mime = mime_guess::from_path(&target_path).first_or_octet_stream();
             let mime_str = mime.to_string();
@@ -564,37 +576,35 @@ pub async fn share_subfile(
                 headers.insert(header::CONTENT_DISPOSITION, disposition);
             }
             headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            let body = Body::from_stream(ReaderStream::new(file));
+            let body = Body::from_stream(ReaderStream::new(tokio::fs::File::from_std(file)));
             (StatusCode::OK, headers, body).into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "文件读取失败").into_response(),
     }
 }
 
-// --- 辅助函数：列出目录内容（供分享使用）---
+// --- 辅助函数：列出目录内容（供分享使用；沙箱内遍历，符号链接不跟随/不暴露）---
 async fn list_directory_files(
-    dir_path: &std::path::Path,
-    user_root: &std::path::Path,
+    sb: &crate::fsutil::Sandbox,
+    dir_rel: &str,
 ) -> Vec<serde_json::Value> {
     let mut items = Vec::new();
-    let mut entries = match tokio::fs::read_dir(dir_path).await {
-        Ok(e) => e,
-        Err(_) => return items,
+    let Ok(entries) = sb.read_dir(dir_rel) else {
+        return items;
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let metadata = match entry.metadata().await {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let relative_path = match entry.path().strip_prefix(user_root) {
-            Ok(p) => p.to_string_lossy().into_owned(),
-            Err(_) => continue,
+    for item in entries {
+        if item.is_symlink() {
+            continue; // 分享场景不暴露符号链接（防越界元数据泄漏）
+        }
+        let relative_path = if dir_rel.is_empty() {
+            item.name.to_string_lossy().into_owned()
+        } else {
+            format!("{}/{}", dir_rel, item.name.to_string_lossy())
         };
         items.push(serde_json::json!({
-            "name": name,
-            "is_dir": metadata.is_dir(),
-            "size": metadata.len(),
+            "name": item.name.to_string_lossy(),
+            "is_dir": item.is_dir(),
+            "size": item.size,
             "path": relative_path,
         }));
     }

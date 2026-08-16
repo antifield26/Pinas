@@ -217,6 +217,21 @@ pub async fn is_allowed_mime_streaming(
     Ok(is_allowed_mime(&buffer))
 }
 
+/// P0-4：沙箱版 MIME 检测——经 openat2 打开（越界符号链接 → Err），
+/// 防止被检测文件被替换为沙箱外内容（与 merge/dav PUT 前置校验共用）
+pub fn is_allowed_mime_streaming_sandbox(
+    sb: &crate::fsutil::Sandbox,
+    rel: &str,
+) -> Result<bool, std::io::Error> {
+    const CHECK_SIZE: usize = 1024 * 1024;
+    use std::io::Read as _;
+    let mut file = sb.open(rel)?;
+    let mut buffer = vec![0u8; CHECK_SIZE];
+    let n = file.read(&mut buffer)?;
+    buffer.truncate(n);
+    Ok(is_allowed_mime(&buffer))
+}
+
 pub fn safe_join_sandbox(
     base: &std::path::Path,
     user_raw_path: &str,

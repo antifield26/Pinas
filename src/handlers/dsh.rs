@@ -231,6 +231,13 @@ async fn dsh_proxy(config: Config, req: Request<Body>) -> Response {
             .unwrap_or_else(|| "127.0.0.1".to_string())
     };
     builder = builder.header(header::HOST, host_value);
+    // P1-2：请求 ID 注入上游（dsh 侧生成/沿用的 ID 贯穿到上游日志）
+    if let Some(rid) = parts
+        .extensions
+        .get::<crate::middleware::request_id::RequestId>()
+    {
+        builder = builder.header(crate::middleware::request_id::REQUEST_ID_HEADER, &rid.0);
+    }
     // 透传 body（流式，避免缓冲大文件）
     builder = builder.body(reqwest::Body::wrap_stream(
         body.into_data_stream().map_err(std::io::Error::other),
@@ -546,5 +553,9 @@ pub fn build_dsh_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::X_FRAME_OPTIONS,
             HeaderValue::from_static("DENY"),
+        ))
+        // P1-2：X-Request-Id 最外层（响应带 ID；dsh_proxy 注入上游）
+        .layer(middleware::from_fn(
+            crate::middleware::request_id_middleware,
         ))
 }

@@ -1,0 +1,36 @@
+# ====== cargo-deny 策略（P1-3：供应链治理） ======
+# 本地验证: cargo deny check
+# 准入原则: 仅宽松许可证（MIT/Apache/ISC/BSD/Zlib/Unlicense/CC0 等）；
+# 高危许可证（GPL/AGPL/SSPL 等 copyleft）或未知许可证一律拒绝
+
+[advisories]
+db-path = "~/.cargo/advisory-dbs"
+# 已知被撤销(yanked)的依赖版本禁止引入
+yanked = "deny"
+# 逐个评估后显式豁免的 advisory（当前无）
+
+[licenses]
+# SPDX 允许清单——覆盖当前依赖树全部许可（2026 复核）
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "0BSD",
+    "bzip2-1.0.6",
+    "CDLA-Permissive-2.0",
+    "MIT-0",
+]
+# 未列入 allow 的许可证默认拒绝（cargo-deny 0.20 起 unlicensed 键已移除，deny 为默认行为）
+confidence-threshold = 0.8
+version = 2
+
+[bans]
+# 同一依赖多版本共存提示（rustix 0.38/1.x 等历史共存，人工确认后可在 skip 中豁免）
+multiple-versions = "warn"

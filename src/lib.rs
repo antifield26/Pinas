@@ -6,6 +6,7 @@ pub mod constants;
 pub mod core;
 pub mod db;
 pub mod error;
+pub mod fsutil;
 pub mod handlers;
 mod middleware;
 pub mod router;

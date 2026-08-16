@@ -27,7 +27,11 @@ pub fn spawn_all(
         config.trash_cleanup_interval_hours,
         cancel.child_token(),
     );
-    spawn_session_cleanup(pool.clone(), cancel.child_token());
+    spawn_session_cleanup(
+        pool.clone(),
+        config.session_idle_minutes,
+        cancel.child_token(),
+    );
     spawn_conversation_cleanup(pool.clone(), cancel.child_token());
     spawn_chunk_rows_cleanup(
         pool.clone(),
@@ -39,15 +43,17 @@ pub fn spawn_all(
     spawn_wal_checkpoint(pool.clone(), cancel.child_token());
 }
 
-/// 定期清理过期会话行（sessions 表曾只在本启动时清理，运行期无限增长）
-fn spawn_session_cleanup(pool: SqlitePool, cancel: CancellationToken) {
+/// 定期清理过期/超空闲会话行（sessions 表曾只在本启动时清理，运行期无限增长）
+fn spawn_session_cleanup(pool: SqlitePool, idle_minutes: i64, cancel: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => { tracing::info!("会话清理任务已停止"); break; }
                 _ = interval.tick() => {
-                    if let Err(e) = sqlx::query("DELETE FROM sessions WHERE expires_at <= datetime('now')")
+                    let idle_mod = format!("-{} minutes", idle_minutes.max(1));
+                    if let Err(e) = sqlx::query("DELETE FROM sessions WHERE expires_at <= datetime('now') OR last_active_at IS NULL OR last_active_at < datetime('now', ?)")
+                        .bind(&idle_mod)
                         .execute(&pool).await
                     {
                         tracing::error!("清理过期会话失败: {}", e);

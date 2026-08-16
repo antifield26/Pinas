@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 10;
+const CURRENT_VERSION: i32 = 11;
 
 /// 执行所有待迁移的 schema 变更。
 /// SQLite DDL 事务化：整批迁移一个事务，失败整体回滚，杜绝半迁移状态；
@@ -112,6 +112,14 @@ pub async fn run(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
             .execute(&mut *tx)
             .await?;
         tracing::info!("[DB] Schema 迁移到 v10 完成");
+    }
+
+    if current < 11 {
+        apply_v11_migrations(&mut tx).await?;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (11)")
+            .execute(&mut *tx)
+            .await?;
+        tracing::info!("[DB] Schema 迁移到 v11 完成");
     }
 
     tx.commit().await?;
@@ -331,6 +339,30 @@ async fn apply_v4_migrations(
     .await
     .ok();
     tracing::info!("[DB] v4 迁移: upload_chunks 添加 bytes_received 列与 created_at 索引");
+    Ok(())
+}
+
+/// v11: 会话空闲超时 — sessions.last_active_at（滑动的最后活跃时间）。
+/// 认证层惰性刷新 + 空闲超时强制下线；存量会话回填当前时间（升级即视为活跃）
+async fn apply_v11_migrations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(sessions)")
+        .fetch_all(&mut **tx)
+        .await
+        .map(|rows| rows.iter().filter_map(|r| r.try_get("name").ok()).collect())
+        .unwrap_or_default();
+    if !cols.iter().any(|c| c == "last_active_at") {
+        sqlx::query("ALTER TABLE sessions ADD COLUMN last_active_at DATETIME")
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(
+            "UPDATE sessions SET last_active_at = datetime('now') WHERE last_active_at IS NULL",
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    tracing::info!("[DB] v11 迁移: sessions 添加 last_active_at（空闲超时）");
     Ok(())
 }
 

@@ -54,23 +54,28 @@ pub async fn restore_trash(
     let orig_path: String = row.get("original_path");
     let trash_uuid: String = row.get("trash_uuid");
 
-    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let trash_dir = std::path::Path::new(crate::constants::TRASH_DIR);
-    let src = trash_dir.join(&trash_uuid);
-    let dst = safe_join_sandbox(base_path, &format!("{}/{}", username, orig_path))?;
+    // P0-4：全部物理操作经 openat2 沙箱（root = uploads，.trash 与用户目录同 root）
+    let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
+        .map_err(|e| AppError::internal_log("打开沙箱", e))?;
+    let src_rel = format!(".trash/{}", trash_uuid);
+    let dst_rel = format!("{}/{}", username, orig_path);
+    let _src = sb.join(&src_rel);
+    let _dst = safe_join_sandbox(
+        std::path::Path::new(crate::constants::UPLOADS_DIR),
+        &dst_rel,
+    )?;
 
-    if dst.exists() {
+    if sb.try_exists(&dst_rel).unwrap_or(false) {
         return Err(AppError::conflict("目标路径已存在，请先移动或删除同名文件"));
     }
 
     // 配额预检：恢复大文件同样计入配额，超限拒绝（此前恢复可无限制撑爆配额）
-    let src_size: u64 = dir_size(&src).await;
+    let src_size: u64 = dir_size(&sb, &src_rel).await;
 
-    if let Some(p) = dst.parent() {
-        let _ = tokio::fs::create_dir_all(p).await;
+    if let Some((parent_rel, _)) = dst_rel.rsplit_once('/') {
+        let _ = sb.create_dir_all(parent_rel);
     }
-    tokio::fs::rename(&src, &dst)
-        .await
+    sb.rename(&src_rel, &dst_rel)
         .map_err(|e| AppError::internal_log("回收站还原", e))?;
 
     // M3/M4 修复：配额预检 + DB 登记 + trash 行删除进同一写事务（写锁串行化并发，
@@ -87,7 +92,7 @@ pub async fn restore_trash(
     .await
     {
         drop(tx);
-        let _ = std::fs::rename(&dst, &src); // 回滚物理还原
+        let _ = sb.rename(&dst_rel, &src_rel); // 回滚物理还原
         return Err(e);
     }
 
@@ -108,10 +113,10 @@ pub async fn restore_trash(
         parent
     };
 
-    let db_result = if dst.is_dir() {
-        restore_dir_recursive_tx(&mut tx, username, &dst, &parent_cleaned).await
+    let db_result = if sb.metadata(&dst_rel).map(|m| m.is_dir()).unwrap_or(false) {
+        restore_dir_recursive_tx(&mut tx, username, &sb, &dst_rel, &parent_cleaned).await
     } else {
-        let meta = dst.metadata().map(|m| m.len()).unwrap_or(0);
+        let meta = sb.metadata(&dst_rel).map(|m| m.len()).unwrap_or(0);
         let size_mb = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
         sqlx::query(
             "INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)",
@@ -127,7 +132,7 @@ pub async fn restore_trash(
     };
     if let Err(e) = db_result {
         drop(tx);
-        let _ = std::fs::rename(&dst, &src);
+        let _ = sb.rename(&dst_rel, &src_rel);
         tracing::error!("[Trash] 还原登记失败: {}", e);
         return Err(AppError::internal("还原失败，请稍后重试"));
     }
@@ -138,12 +143,12 @@ pub async fn restore_trash(
         .await
     {
         drop(tx);
-        let _ = std::fs::rename(&dst, &src);
+        let _ = sb.rename(&dst_rel, &src_rel);
         tracing::error!("[Trash] 回收行删除失败: {}", e);
         return Err(AppError::internal("还原失败，请稍后重试"));
     }
     if let Err(e) = tx.commit().await {
-        let _ = std::fs::rename(&dst, &src);
+        let _ = sb.rename(&dst_rel, &src_rel);
         tracing::error!("[Trash] 还原事务提交失败: {}", e);
         return Err(AppError::internal("还原失败，请稍后重试"));
     }
@@ -161,12 +166,12 @@ pub async fn restore_trash(
     Ok((StatusCode::OK, "目标已恢复原位"))
 }
 
-/// 计算路径总字节数（文件直接用大小；目录迭代式累加——async fn 递归需装箱，迭代更直白）
-async fn dir_size(path: &std::path::Path) -> u64 {
+/// 计算路径总字节数（沙箱内迭代式遍历；文件直接用大小，目录累加）
+async fn dir_size(sb: &crate::fsutil::Sandbox, rel: &str) -> u64 {
     let mut total: u64 = 0;
-    let mut stack: Vec<std::path::PathBuf> = vec![path.to_path_buf()];
+    let mut stack: Vec<String> = vec![rel.to_string()];
     while let Some(cur) = stack.pop() {
-        let meta = match tokio::fs::metadata(&cur).await {
+        let meta = match sb.metadata(&cur) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -174,9 +179,10 @@ async fn dir_size(path: &std::path::Path) -> u64 {
             total += meta.len();
             continue;
         }
-        if let Ok(mut entries) = tokio::fs::read_dir(&cur).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                stack.push(entry.path());
+        if let Ok(entries) = sb.read_dir(&cur) {
+            for item in entries {
+                let child = format!("{}/{}", cur, item.name.to_string_lossy());
+                stack.push(child);
             }
         }
     }
@@ -187,14 +193,11 @@ async fn dir_size(path: &std::path::Path) -> u64 {
 async fn restore_dir_recursive_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     username: &str,
-    dir_path: &std::path::Path,
+    sb: &crate::fsutil::Sandbox,
+    dir_rel: &str,
     parent_path: &str,
 ) -> Result<(), String> {
-    let dir_name = dir_path
-        .file_name()
-        .ok_or_else(|| format!("无法获取目录名: {:?}", dir_path))?
-        .to_string_lossy()
-        .into_owned();
+    let dir_name = dir_rel.rsplit('/').next().unwrap_or("").to_string();
     let _ =
         sqlx::query("INSERT INTO files (username, name, parent_path, is_dir) VALUES (?, ?, ?, 1)")
             .bind(username)
@@ -208,23 +211,29 @@ async fn restore_dir_recursive_tx(
     } else {
         format!("{}/{}", parent_path, dir_name)
     };
-    if let Ok(mut entries) = tokio::fs::read_dir(dir_path).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let p = entry.path();
-            let n = entry.file_name().to_string_lossy().into_owned();
-            if p.is_dir() {
-                Box::pin(restore_dir_recursive_tx(tx, username, &p, &new_parent)).await?;
-            } else {
-                let m = p.metadata().map(|m| m.len()).unwrap_or(0);
-                let size_mb = m as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
+    if let Ok(entries) = sb.read_dir(dir_rel) {
+        for item in entries {
+            let child_rel = format!("{}/{}", dir_rel, item.name.to_string_lossy());
+            if item.is_dir() {
+                Box::pin(restore_dir_recursive_tx(
+                    tx,
+                    username,
+                    sb,
+                    &child_rel,
+                    &new_parent,
+                ))
+                .await?;
+            } else if item.is_file() {
+                let size_mb = item.size as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
                 let _ = sqlx::query("INSERT INTO files (username, name, parent_path, is_dir, size_mb) VALUES (?, ?, ?, 0, ?)")
                     .bind(username)
-                    .bind(&n)
+                    .bind(item.name.to_string_lossy().into_owned())
                     .bind(&new_parent)
                     .bind(size_mb)
                     .execute(&mut **tx)
                     .await;
             }
+            // 符号链接条目跳过（不恢复，防越界）
         }
     }
     Ok(())
@@ -247,11 +256,15 @@ pub async fn delete_trash_permanent(
 
     let uuid: String = row.get("trash_uuid");
     let original_path: String = row.get("original_path");
-    let p = std::path::Path::new(crate::constants::TRASH_DIR).join(&uuid);
-    if p.is_dir() {
-        let _ = tokio::fs::remove_dir_all(&p).await;
+    // openat2 沙箱删除（root = .trash，uuid 由 DB 生成，无用户输入）
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::TRASH_DIR) {
+        Ok(s) => s,
+        Err(_) => return Err(AppError::internal("回收站不可用")),
+    };
+    if sb.metadata(&uuid).map(|m| m.is_dir()).unwrap_or(false) {
+        let _ = sb.remove_dir_all(&uuid);
     } else {
-        let _ = tokio::fs::remove_file(&p).await;
+        let _ = sb.remove_file(&uuid);
     }
 
     let _ = sqlx::query("DELETE FROM trash WHERE id = ?")
@@ -280,16 +293,23 @@ async fn clear_trash_physical(pool: &sqlx::SqlitePool, username: &str) -> usize 
         .fetch_all(pool)
         .await
         .unwrap_or_default();
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::TRASH_DIR) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
 
     let count = rows.len();
     for row in rows {
         let id: i64 = row.get("id");
         let trash_uuid: String = row.get("trash_uuid");
-        let p = std::path::Path::new(crate::constants::TRASH_DIR).join(&trash_uuid);
-        if p.is_dir() {
-            let _ = tokio::fs::remove_dir_all(&p).await;
+        if sb
+            .metadata(&trash_uuid)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            let _ = sb.remove_dir_all(&trash_uuid);
         } else {
-            let _ = tokio::fs::remove_file(&p).await;
+            let _ = sb.remove_file(&trash_uuid);
         }
         let _ = sqlx::query("DELETE FROM trash WHERE id = ?")
             .bind(id)
@@ -331,16 +351,23 @@ pub async fn clean_expired_trash(pool: &sqlx::SqlitePool, days: u32) -> Result<(
         .bind(&cutoff_str)
         .fetch_all(pool)
         .await?;
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::TRASH_DIR) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
 
     for row in rows {
         let id: i64 = row.get("id");
         let trash_uuid: String = row.get("trash_uuid");
-        let physical_path = std::path::Path::new(crate::constants::TRASH_DIR).join(&trash_uuid);
 
-        if physical_path.is_dir() {
-            let _ = tokio::fs::remove_dir_all(&physical_path).await;
+        if sb
+            .metadata(&trash_uuid)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            let _ = sb.remove_dir_all(&trash_uuid);
         } else {
-            let _ = tokio::fs::remove_file(&physical_path).await;
+            let _ = sb.remove_file(&trash_uuid);
         }
 
         let _ = sqlx::query("DELETE FROM trash WHERE id = ?")

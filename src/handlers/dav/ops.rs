@@ -1,336 +1,31 @@
-// ====== WebDAV 端点 ======
-// 解锁全平台同步客户端（Rclone / RaiDrive / 手机文件管理器 / Windows 资源管理器映射）。
-// 认证：HTTP Basic（独立于 cookie 会话，60s 成功缓存防每请求 argon2）。
-// 路径：/dav/{*path} 映射到当前认证用户的云盘根目录。
-// 安全：全部路径过 safe_join_sandbox + validate_name；PUT 流式落盘 temp + 原子 rename；
-// DELETE 进回收站（可还原）；配额沿用 upload.rs 预检模式；大请求路由级 5GiB 上限（router.rs）。
-
+// ====== WebDAV：方法实现（P1-1 拆分） ======
 use axum::{
-    Extension,
     extract::Request,
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use base64::Engine as _;
 use futures_util::StreamExt;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
 
 use crate::constants::{TMP_DIR, UPLOADS_DIR};
-use crate::handlers::utils::{safe_join_sandbox, update_user_used_mb, validate_name};
+use crate::handlers::dav::DAV_MAX_BODY_BYTES;
+use crate::handlers::utils::{update_user_used_mb, validate_name};
 
-/// WebDAV PUT 防御上限（路由级 body limit 已在 router.rs 设置）
-const DAV_MAX_BODY_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-
-// ====== Basic 认证 ======
-
-/// 已认证的 WebDAV 用户（提取器）
-pub struct DavUser {
-    pub username: String,
-    pub is_admin: bool,
-}
-
-/// 认证成功缓存：username → (凭证指纹, 验证时间)。仅缓存通过态，失败即时校验。
-/// 指纹 = sha256(username\0password)——命中必须指纹一致，绝不允许仅凭用户名放行
-/// （历史缺陷：60s 窗口内任意密码可通过认证，C1 修复）。
-static AUTH_CACHE: LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"pi_nas\"")],
-        "Unauthorized",
-    )
-        .into_response()
-}
-
-/// 密码变更后失效认证缓存（L8：历史实现改密/重置后旧凭证仍有 60s 的 Basic 访问窗口）
-pub fn invalidate_dav_auth_cache(username: &str) {
-    AUTH_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(username);
-}
-
-/// 手动 Basic 认证（WebDAV 单 handler 内调用）：成功 → DavUser；失败 → 401 响应。
-/// 60s 成功缓存防每请求 argon2（键值含凭证指纹，见 AUTH_CACHE）；角色实时查（权限变更即时生效）。
-/// 未命中缓存时先过限速：Argon2 ~100ms 是公网可用的 CPU DoS 面，必须按对端 IP 限频。
-async fn dav_auth(
-    headers: HeaderMap,
-    peer_ip: Option<std::net::IpAddr>,
-    pool: &SqlitePool,
-) -> Result<DavUser, Response> {
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(unauthorized)?;
-    let (scheme, b64) = auth.split_once(' ').ok_or_else(unauthorized)?;
-    if !scheme.eq_ignore_ascii_case("basic") {
-        return Err(unauthorized());
-    }
-    let creds = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .ok_or_else(unauthorized)?;
-    let (user, pass) = creds.split_once(':').ok_or_else(unauthorized)?;
-
-    // 命中缓存（60s）时跳过 argon2 验证；指纹必须与本次提交的凭证完全一致。角色实时查。
-    // 锁不得跨越 await（MutexGuard 非 Send）
-    // 中毒恢复：panic=abort 下 Mutex 中毒的 unwrap 会把整站打死，必须 into_inner 恢复
-    let cred_fp = crate::core::hash_token(&format!("{user}\u{0}{pass}"));
-    let cached_ok = {
-        let cache = AUTH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .get(user)
-            .map(|(fp, t)| *fp == cred_fp && t.elapsed() < std::time::Duration::from_secs(60))
-            .unwrap_or(false)
-    };
-    if cached_ok {
-        let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE username = ?")
-            .bind(user)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-        return Ok(DavUser {
-            username: user.to_string(),
-            is_admin: role.as_deref() == Some(crate::constants::ROLE_ADMIN),
-        });
-    }
-
-    // 限速：仅未命中缓存（即必须跑 argon2）的尝试计数——成功路径 60s 内走缓存不再消耗额度。
-    // 键与登录限速同源（回环信任 CF-Connecting-IP，直连用真实对端 IP）
-    let rate_key = crate::handlers::auth::extract_ip(peer_ip, &headers)
-        .unwrap_or_else(|| format!("dav:user:{user}"));
-    if !crate::handlers::rate_limit::check_rate_limit(
-        &rate_key,
-        crate::constants::LOGIN_RATE_LIMIT_ATTEMPTS,
-        std::time::Duration::from_secs(crate::constants::LOGIN_RATE_LIMIT_WINDOW_SECS),
-    )
-    .await
-    {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"pi_nas\"")],
-            "请求过于频繁，请稍后再试",
-        )
-            .into_response());
-    }
-
-    // 用户不存在时用哑哈希等时校验（抹平用户枚举时序侧信道）
-    let auth_row = match crate::db::queries::get_user_auth(pool, user).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            let dummy_pass = pass.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::core::verify_password(
-                    crate::handlers::auth::dummy_hash_for_timing(),
-                    &dummy_pass,
-                )
-            })
-            .await
-            .unwrap_or(false);
-            return Err(unauthorized());
-        }
-        Err(_) => return Err(unauthorized()),
-    };
-    // Argon2 为阻塞 CPU 操作，必须移出 async 运行时（同 auth.rs 登录路径）
-    let pass2 = pass.to_string();
-    let hash2 = auth_row.0.clone();
-    let ok = tokio::task::spawn_blocking(move || crate::core::verify_password(&hash2, &pass2))
-        .await
-        .unwrap_or(false);
-    if !ok {
-        return Err(unauthorized());
-    }
-    if auth_row.2 {
-        return Err((
-            StatusCode::FORBIDDEN,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"pi_nas\"")],
-            "请先通过网页登录修改初始密码",
-        )
-            .into_response());
-    }
-    AUTH_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(user.to_string(), (cred_fp, Instant::now()));
-    Ok(DavUser {
-        username: user.to_string(),
-        is_admin: auth_row.1 == crate::constants::ROLE_ADMIN,
-    })
-}
-
-// ====== 主 handler ======
-
-/// 根路径处理器：/dav 与 /dav/（精确路由无通配符参数，Path 提取会失败，这里直接传空路径）
-pub async fn dav_root_handler(Extension(pool): Extension<SqlitePool>, req: Request) -> Response {
-    dav_handler(Extension(pool), axum::extract::Path(String::new()), req).await
-}
-
-/// GET/HEAD/PUT/DELETE/PROPFIND/MKCOL/COPY/MOVE/LOCK/UNLOCK 单入口分发
-pub async fn dav_handler(
-    Extension(pool): Extension<SqlitePool>,
-    axum::extract::Path(path): axum::extract::Path<String>,
-    req: Request,
-) -> Response {
-    // OPTIONS 免认证（客户端常先无凭据探测能力）
-    if req.method() == Method::OPTIONS {
-        return options_response();
-    }
-    // ConnectInfo 在 &req 持有期外提前取出（&Request 非 Send，跨 await 持引用会使 handler future 非 Send）
-    let peer_ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip());
-    let user = match dav_auth(req.headers().clone(), peer_ip, &pool).await {
-        Ok(u) => u,
-        Err(resp) => return resp,
-    };
-    // 注意：&Request<Body> 非 Send（Body 非 Sync），跨 await 持引用会使 handler future 非 Send。
-    // 故先克隆 method 与 headers（HeaderMap: Sync），子函数只接收克隆后的头
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    // http::Method 无 PROPFIND/MKCOL 等非标准方法常量，按字符串分发
-    match method.as_str() {
-        "OPTIONS" => options_response(),
-        "PROPFIND" => propfind(&pool, &user, &path, &headers).await,
-        "GET" | "HEAD" => get_file(&user, &path, &headers, &method).await,
-        "PUT" => put_file(&pool, &user, &path, req).await,
-        "MKCOL" => mkcol(&pool, &user, &path).await,
-        "MOVE" => move_or_copy(&pool, &user, &path, true, &headers).await,
-        "COPY" => move_or_copy(&pool, &user, &path, false, &headers).await,
-        "DELETE" => delete_item(&pool, &user, &path).await,
-        "LOCK" => lock_response(),
-        "UNLOCK" => StatusCode::NO_CONTENT.into_response(),
-        _ => StatusCode::NOT_IMPLEMENTED.into_response(),
-    }
-}
-
-// ====== 工具函数 ======
-
-/// 绝对路径解析：tokio::fs 在阻塞池线程执行，相对路径依赖池线程 CWD
-/// （历史 ENOENT 竞态根源）。统一在 async 上下文解析绝对路径后再交给 tokio::fs
-fn absolute_uploads_path(rel: &std::path::Path) -> std::path::PathBuf {
-    std::path::absolute(rel).unwrap_or_else(|_| rel.to_path_buf())
-}
-
-/// 拆分相对路径为 (父目录, 名称)；根为空串
-fn split_last(rel: &str) -> (String, String) {
-    match rel.rfind('/') {
-        Some(i) => (rel[..i].to_string(), rel[i + 1..].to_string()),
-        None => (String::new(), rel.to_string()),
-    }
-}
-
-/// 逻辑路径拼接（父为空返回 name）
-fn logical_path(parent: &str, name: &str) -> String {
-    if parent.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent}/{name}")
-    }
-}
-
-/// URL 路径段编码（按字节 %XX，保留 ASCII 字母数字与 -_.~/）
-fn encode_path(seg: &str) -> String {
-    let mut out = String::with_capacity(seg.len());
-    for &b in seg.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// XML 转义（含控制字符 → U+FFFD，XML 1.0 非法字符）
-fn escape_xml(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c if (c as u32) < 0x20 => out.push('\u{FFFD}'),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// HTTP-date 格式化（Last-Modified）
-fn http_date(secs: i64) -> String {
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|t| t.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
-        .unwrap_or_else(|| "Thu, 01 Jan 1970 00:00:00 GMT".to_string())
-}
-
-/// DB created_at（"YYYY-MM-DD HH:MM:SS"）→ ISO8601
-fn creation_date(created_at: &str) -> String {
-    chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
-        .map(|t| format!("{}Z", t.format("%Y-%m-%dT%H:%M:%S")))
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
-/// 解析 Destination 头 → 相对路径（剥 /dav 前缀）；仅接受同源 /dav/ 形式
-fn parse_destination(dest: &str) -> Result<String, StatusCode> {
-    let uri: axum::http::Uri = dest.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let p = uri.path().trim_start_matches('/');
-    let rel = p
-        .strip_prefix("dav/")
-        .or_else(|| p.strip_prefix("dav"))
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    Ok(rel.trim_matches('/').to_string())
-}
-
-/// 查询配额 (used_mb, quota_mb)
-async fn quota_info(pool: &SqlitePool, username: &str) -> (i64, i64) {
-    sqlx::query_as::<_, (i64, i64)>("SELECT used_mb, quota_mb FROM users WHERE username = ?")
-        .bind(username)
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None)
-        .unwrap_or((0, 0))
-}
-
-/// 物理路径：uploads/{username}/{rel}
-fn physical_path(username: &str, rel: &str) -> Result<std::path::PathBuf, StatusCode> {
-    safe_join_sandbox(
-        std::path::Path::new(UPLOADS_DIR),
-        &format!("{username}/{rel}"),
-    )
-    .map_err(|_| StatusCode::NOT_FOUND)
-}
-
-// ====== OPTIONS ======
-
-fn options_response() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (
-                "Allow",
-                "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK",
-            ),
-            ("DAV", "1, 2"),
-            ("Content-Length", "0"),
-        ],
-        "",
-    )
-        .into_response()
-}
+use super::auth::DavUser;
+use crate::handlers::dav::{
+    absolute_uploads_path, creation_date, encode_path, escape_xml, http_date, logical_path,
+    parse_destination, physical_path, quota_info, split_last, user_sandbox,
+};
 
 // ====== PROPFIND ======
 
 /// PROPFIND：Depth 0/1（infinity → 403）；手写 XML multistatus，全量返回（忽略 propfind body）
-async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &HeaderMap) -> Response {
+pub(crate) async fn propfind(
+    pool: &SqlitePool,
+    user: &DavUser,
+    path: &str,
+    headers: &HeaderMap,
+) -> Response {
     let depth = headers
         .get("Depth")
         .and_then(|v| v.to_str().ok())
@@ -340,18 +35,16 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
     }
     let deep = !depth.starts_with('0');
     let rel = path.trim_start_matches('/');
+    let sb = match user_sandbox() {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
-    // 目标是否存在（磁盘为准）
+    // 目标是否存在（磁盘为准；openat2 沙箱判定，越界符号链接视为不存在）
     let is_root = rel.is_empty();
     if !is_root {
-        let full = match physical_path(&user.username, rel) {
-            Ok(p) => p,
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        };
-        if !tokio::fs::try_exists(&absolute_uploads_path(&full))
-            .await
-            .unwrap_or(false)
-        {
+        let full_rel = format!("{}/{}", user.username, rel);
+        if !sb.try_exists(&full_rel).unwrap_or(false) {
             return StatusCode::NOT_FOUND.into_response();
         }
     }
@@ -377,19 +70,11 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             .await
             .unwrap_or_default();
             for (name, parent_path, is_dir, _size_mb, created_at) in rows {
-                let full = match physical_path(&user.username, &logical_path(&parent_path, &name)) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if !tokio::fs::try_exists(&absolute_uploads_path(&full))
-                    .await
-                    .unwrap_or(false)
-                {
+                let full_rel = format!("{}/{}", user.username, logical_path(&parent_path, &name));
+                if !sb.try_exists(&full_rel).unwrap_or(false) {
                     continue;
                 }
-                let meta = tokio::fs::metadata(&absolute_uploads_path(&full))
-                    .await
-                    .ok();
+                let meta = sb.metadata(&full_rel).ok();
                 let mtime = meta
                     .as_ref()
                     .and_then(|m| m.modified().ok())
@@ -414,8 +99,8 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
         }
     } else {
         let (parent, name) = split_last(rel);
-        let full = physical_path(&user.username, rel).unwrap();
-        let meta = match tokio::fs::metadata(&absolute_uploads_path(&full)).await {
+        let full_rel = format!("{}/{}", user.username, rel);
+        let meta = match sb.metadata(&full_rel) {
             Ok(m) => m,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
@@ -453,19 +138,11 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
             .await
             .unwrap_or_default();
             for (name, parent_path, is_dir, _size_mb, created_at) in rows {
-                let full = match physical_path(&user.username, &logical_path(&parent_path, &name)) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if !tokio::fs::try_exists(&absolute_uploads_path(&full))
-                    .await
-                    .unwrap_or(false)
-                {
+                let full_rel = format!("{}/{}", user.username, logical_path(&parent_path, &name));
+                if !sb.try_exists(&full_rel).unwrap_or(false) {
                     continue;
                 }
-                let meta = tokio::fs::metadata(&absolute_uploads_path(&full))
-                    .await
-                    .ok();
+                let meta = sb.metadata(&full_rel).ok();
                 let mtime = meta
                     .as_ref()
                     .and_then(|m| m.modified().ok())
@@ -566,17 +243,26 @@ async fn propfind(pool: &SqlitePool, user: &DavUser, path: &str, headers: &Heade
 // ====== GET / HEAD ======
 
 /// GET/HEAD：全量返回（无 Range 限制，区别于 media_proxy 的 2MB 截断）+ Range 支持
-async fn get_file(user: &DavUser, path: &str, headers: &HeaderMap, method: &Method) -> Response {
+pub(crate) async fn get_file(
+    user: &DavUser,
+    path: &str,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Response {
     let rel = path.trim_start_matches('/');
+    let full_rel = format!("{}/{}", user.username, rel);
     let full = match physical_path(&user.username, rel) {
         Ok(p) => p,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    // 注：测试/生产环境相对路径下 tokio::fs 存在 ENOENT 竞态（blocking 池解析），统一用 std::fs 同步操作
-    let meta = match std::fs::metadata(&full) {
-        Ok(m) if m.is_file() => m,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+    let sb = match user_sandbox() {
+        Ok(s) => s,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    // openat2 沙箱元数据 + 打开（越界符号链接 → 404）
+    let meta = match sb.metadata(&full_rel) {
+        Ok(m) if m.is_file() => m,
+        _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let file_size = meta.len();
     let mime = mime_guess::from_path(&full).first_or_octet_stream();
@@ -621,8 +307,11 @@ async fn get_file(user: &DavUser, path: &str, headers: &HeaderMap, method: &Meth
     };
     let length = end - start + 1;
 
-    let mut file = match std::fs::File::open(&full) {
+    let mut file = match sb.open(&full_rel) {
         Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).is_err() {
@@ -665,22 +354,25 @@ async fn get_file(user: &DavUser, path: &str, headers: &HeaderMap, method: &Meth
 // ====== PUT ======
 
 /// PUT：流式落盘 uploads/tmp/dav_{uuid} → 配额预检+复核 → 原子 rename 覆盖 → 登记 files 表
-async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -> Response {
+pub(crate) async fn put_file(
+    pool: &SqlitePool,
+    user: &DavUser,
+    path: &str,
+    req: Request,
+) -> Response {
     let rel = path.trim_start_matches('/');
     let (parent, name) = split_last(rel);
     if validate_name(&name).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // 父目录物理创建 + DB 目录行补插
-    let parent_full = match safe_join_sandbox(
-        std::path::Path::new(UPLOADS_DIR),
-        &format!("{}/{}", user.username, parent),
-    ) {
-        Ok(p) => p,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    // 父目录物理创建（openat2 沙箱内逐级 mkdir）+ DB 目录行补插
+    let parent_rel = format!("{}/{}", user.username, parent);
+    let sb = match user_sandbox() {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if std::fs::create_dir_all(&parent_full).is_err() {
+    if sb.create_dir_all(&parent_rel).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &parent)
@@ -705,10 +397,10 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
     // 全程 tokio::fs + 绝对路径：std::fs 阻塞写会在 async worker 上卡住整条上传
     // （1GB 慢速上行可占死一个 worker，3-4 并发冻结全站）
     let _ = std::fs::create_dir_all(TMP_DIR);
-    let tmp = absolute_uploads_path(std::path::Path::new(&format!(
-        "{TMP_DIR}/dav_{}",
-        uuid::Uuid::new_v4()
-    )));
+    let tmp_uuid = format!("{TMP_DIR}/dav_{}", uuid::Uuid::new_v4());
+    // 相对 uploads 根的 rel（沙箱 root = uploads）：uploads/tmp → tmp
+    let tmp_rel = tmp_uuid.trim_start_matches("uploads/").to_string();
+    let tmp = absolute_uploads_path(std::path::Path::new(&tmp_uuid));
     let mut file = match tokio::fs::File::create(&tmp).await {
         Ok(f) => f,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -758,8 +450,12 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
 
     // 覆盖语义：rename(2) 对同文件系统原子替换，绝不先删旧文件再改名
     // （先删后改存在崩溃/失败窗口：旧文件已删、新文件未就位 = 永久数据丢失）
-    let target = absolute_uploads_path(&parent_full.join(&name));
-    let existed = tokio::fs::try_exists(&target).await.unwrap_or(false);
+    let target_rel = if parent.is_empty() {
+        format!("{}/{}", user.username, name)
+    } else {
+        format!("{}/{}/{}", user.username, parent, name)
+    };
+    let existed = sb.try_exists(&target_rel).unwrap_or(false);
 
     // 配额预留必须先于 rename（M3/M4 修复 + 覆盖保护）：
     // 事务内预检+增量（写锁串行化消除 TOCTOU）。delta = 新占用 - 旧占用（覆盖时旧大小释放）。
@@ -807,7 +503,7 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    if tokio::fs::rename(&tmp, &target).await.is_err() {
+    if sb.rename(&tmp_rel, &target_rel).is_err() {
         let _ = tokio::fs::remove_file(&tmp).await;
         // 预留已提交但落盘失败：全量重算自愈（事务化版本）
         let _ = update_user_used_mb(pool, &user.username).await;
@@ -864,31 +560,26 @@ async fn put_file(pool: &SqlitePool, user: &DavUser, path: &str, req: Request) -
 
 // ====== MKCOL ======
 
-async fn mkcol(pool: &SqlitePool, user: &DavUser, path: &str) -> Response {
+pub(crate) async fn mkcol(pool: &SqlitePool, user: &DavUser, path: &str) -> Response {
     let rel = path.trim_start_matches('/');
     let (parent, name) = split_last(rel);
     if validate_name(&name).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let full = match physical_path(&user.username, rel) {
-        Ok(p) => p,
+    let full_rel = format!("{}/{}", user.username, rel);
+    let parent_rel = format!("{}/{}", user.username, parent);
+    let sb = match user_sandbox() {
+        Ok(s) => s,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if full.exists() {
+    if sb.try_exists(&full_rel).unwrap_or(false) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    // 父目录必须已存在（RFC 4918：否则 409）
-    let parent_full = match safe_join_sandbox(
-        std::path::Path::new(UPLOADS_DIR),
-        &format!("{}/{}", user.username, parent),
-    ) {
-        Ok(p) => p,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
-    if !parent_full.exists() {
+    // 父目录必须已存在（RFC 4918：否则 409；沙箱内判定，越界视为不存在）
+    if !sb.try_exists(&parent_rel).unwrap_or(false) {
         return StatusCode::CONFLICT.into_response();
     }
-    if std::fs::create_dir(&full).is_err() {
+    if sb.create_dir(&full_rel).is_err() {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let _ =
@@ -913,7 +604,7 @@ async fn mkcol(pool: &SqlitePool, user: &DavUser, path: &str) -> Response {
 
 // ====== MOVE / COPY ======
 
-async fn move_or_copy(
+pub(crate) async fn move_or_copy(
     pool: &SqlitePool,
     user: &DavUser,
     path: &str,
@@ -943,11 +634,16 @@ async fn move_or_copy(
         .get("Overwrite")
         .map(|v| v.as_bytes() == b"F")
         .unwrap_or(false);
-    let dst_full = match physical_path(&user.username, &dest_rel) {
+    let _dst_full = match physical_path(&user.username, &dest_rel) {
         Ok(p) => p,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if dst_full.exists() && !overwrite {
+    let dst_rel_full = format!("{}/{}", user.username, dest_rel);
+    let sb = match user_sandbox() {
+        Ok(s) => s,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if sb.try_exists(&dst_rel_full).unwrap_or(false) && !overwrite {
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
     // 覆盖目标：先移走旧目标（物理 + DB 行暂存），移动成功后再清理。
@@ -961,24 +657,25 @@ async fn move_or_copy(
         size_mb: f64,
         identifier: Option<String>,
     }
-    // (位移文件, 元数据文件, name, parent, logical, 暂存的 DB 行)
+    // (位移文件 rel, 元数据文件, name, parent, logical, 暂存的 DB 行)
     let mut displaced: Option<(
-        std::path::PathBuf,
+        String,
         std::path::PathBuf,
         String,
         String,
         String,
         Vec<DisplacedFileRow>,
     )> = None;
-    if dst_full.exists() {
+    if sb.try_exists(&dst_rel_full).unwrap_or(false) {
         // M9：位移目标放在 uploads/.dav_disp（不在 TMP_DIR 内——24h 临时清扫不得触碰），
         // 并落一份 JSON 元数据（目标路径 + 暂存 DB 行），崩溃后由启动任务 recover_dav_disp 还原
         let disp_uuid = uuid::Uuid::new_v4().to_string();
         let disp_dir = std::path::Path::new(crate::constants::DAV_DISP_DIR);
         let _ = std::fs::create_dir_all(disp_dir);
-        let disp_path = disp_dir.join(format!("{disp_uuid}.d"));
+        let disp_rel = format!("{}/{}.d", crate::constants::DAV_DISP_DIR, disp_uuid);
+        let _disp_path = disp_dir.join(format!("{disp_uuid}.d"));
         let meta_path = disp_dir.join(format!("{disp_uuid}.json"));
-        if std::fs::rename(&dst_full, &disp_path).is_err() {
+        if sb.rename(&dst_rel_full, &disp_rel).is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         let child_prefix = if d_parent.is_empty() {
@@ -1029,7 +726,7 @@ async fn move_or_copy(
         let _ = std::fs::write(&meta_path, meta.to_string());
         let displaced_logical = logical_path(&d_parent, &d_name);
         displaced = Some((
-            disp_path,
+            disp_rel,
             meta_path,
             d_name.clone(),
             d_parent.clone(),
@@ -1040,14 +737,9 @@ async fn move_or_copy(
 
     let (s_parent, s_name) = split_last(src_rel);
     let result = if is_move {
-        // 目标父目录需存在（物理 + 目录行）
-        let _ = std::fs::create_dir_all(
-            safe_join_sandbox(
-                std::path::Path::new(UPLOADS_DIR),
-                &format!("{}/{}", user.username, d_parent),
-            )
-            .unwrap_or_default(),
-        );
+        // 目标父目录需存在（物理经沙箱逐级创建 + 目录行）
+        let dst_parent_rel = format!("{}/{}", user.username, d_parent);
+        let _ = sb.create_dir_all(&dst_parent_rel);
         let _ = crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &d_parent).await;
         // move_core 为同名移动；Destination 含新文件名时先移动再改名（rename_core 处理子树）
         if s_parent == d_parent {
@@ -1090,9 +782,9 @@ async fn move_or_copy(
 
     match result {
         Ok(()) => {
-            if let Some((tmp, meta_path, name, parent, logical, _rows)) = displaced {
-                // 成功：DB 行已删，物理位移文件 + 元数据清掉
-                let _ = std::fs::remove_dir_all(&tmp);
+            if let Some((tmp_rel, meta_path, name, parent, logical, _rows)) = displaced {
+                // 成功：DB 行已删，物理位移文件 + 元数据清掉（沙箱内递归删除）
+                let _ = sb.remove_dir_all(&tmp_rel);
                 let _ = std::fs::remove_file(&meta_path);
                 let _ = crate::handlers::utils::log_audit(
                     pool,
@@ -1125,8 +817,8 @@ async fn move_or_copy(
         }
         Err(_) => {
             // 失败：完整还原被移走的旧目标（物理文件 + DB 行）+ 清理元数据
-            if let Some((tmp, meta_path, _, _, _, rows)) = displaced {
-                let _ = std::fs::rename(&tmp, &dst_full);
+            if let Some((tmp_rel, meta_path, _, _, _, rows)) = displaced {
+                let _ = sb.rename(&tmp_rel, &dst_rel_full);
                 for r in rows {
                     let _ = sqlx::query(
                         "INSERT OR IGNORE INTO files (username, name, parent_path, is_dir, size_mb, identifier) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1148,7 +840,7 @@ async fn move_or_copy(
 }
 
 /// COPY 递归：磁盘复制 + DB 登记 + 配额累加预检
-async fn copy_recursive(
+pub(crate) async fn copy_recursive(
     pool: &SqlitePool,
     username: &str,
     s_parent: &str,
@@ -1182,18 +874,13 @@ async fn copy_recursive(
         .map(|r| r.3.ceil())
         .sum::<f64>();
 
-    // 阶段一：磁盘复制（无任何 DB 写入）。std::fs::copy 是阻塞 IO，必须移出 async worker
+    // 阶段一：磁盘复制（无任何 DB 写入）。沙箱内复制是阻塞 IO，必须移出 async worker
     // 且移出写事务——历史实现把整个拷贝过程包在 SQLite 写事务里：大目录 COPY 会
     // 占死一个 tokio worker + 持写锁数分钟，全站写操作 busy_timeout 后 500。
-    let base = std::path::Path::new(UPLOADS_DIR);
-    let mut disk_plan: Vec<(
-        std::path::PathBuf,
-        std::path::PathBuf,
-        bool,
-        String,
-        String,
-        f64,
-    )> = Vec::with_capacity(rows.len());
+    let sb = crate::fsutil::Sandbox::new(UPLOADS_DIR)
+        .map_err(|e| format!("COPY 沙箱初始化失败: {e}"))?;
+    let mut disk_plan: Vec<(String, String, bool, String, String, f64)> =
+        Vec::with_capacity(rows.len());
     for (name, parent_path, is_dir, size_mb) in &rows {
         // 根对象（源自身行）：落在目标父目录 d_parent 下、名取 d_name（Destination 可改名）；
         // 子树对象：完整路径替换源前缀
@@ -1204,27 +891,29 @@ async fn copy_recursive(
             parent_path.replacen(&format!("{s_prefix}/"), &format!("{d_prefix}/"), 1)
         };
         let target_name = if is_root { d_name } else { name };
-        let src = safe_join_sandbox(base, &format!("{username}/{parent_path}/{name}"))
-            .map_err(|_| "COPY 源路径非法".to_string())?;
-        let dst_parent = safe_join_sandbox(base, &format!("{username}/{new_parent}"))
-            .map_err(|_| "COPY 目标路径非法".to_string())?;
-        std::fs::create_dir_all(&dst_parent).map_err(|e| format!("COPY 创建目录失败: {e}"))?;
+        let src_rel = format!("{username}/{parent_path}/{name}");
+        let dst_rel = format!("{username}/{new_parent}/{target_name}");
+        let dst_parent_rel = format!("{username}/{new_parent}");
+        sb.create_dir_all(&dst_parent_rel)
+            .map_err(|e| format!("COPY 创建目录失败: {e}"))?;
         disk_plan.push((
-            src,
-            dst_parent.join(target_name),
+            src_rel,
+            dst_rel,
             *is_dir != 0,
             new_parent,
             target_name.to_string(),
             *size_mb,
         ));
     }
-    for (src, dst, is_dir, _new_parent, _target_name, _size_mb) in &disk_plan {
+    for (src_rel, dst_rel, is_dir, _new_parent, _target_name, _size_mb) in &disk_plan {
         if *is_dir {
-            std::fs::create_dir_all(dst).map_err(|e| format!("COPY 创建目录失败: {e}"))?;
+            sb.create_dir_all(dst_rel)
+                .map_err(|e| format!("COPY 创建目录失败: {e}"))?;
         } else {
-            let src = src.clone();
-            let dst = dst.clone();
-            tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
+            let src_rel = src_rel.clone();
+            let dst_rel = dst_rel.clone();
+            let sb2 = sb.clone();
+            tokio::task::spawn_blocking(move || sb2.copy(&src_rel, &dst_rel))
                 .await
                 .map_err(|_e| "COPY 复制任务失败".to_string())?
                 .map_err(|e| format!("COPY 复制文件失败: {e}"))?;
@@ -1250,10 +939,9 @@ async fn copy_recursive(
     };
     if used_mb + total_mb as i64 > quota_mb {
         drop(tx);
-        // 仅当目标根路径能安全解析时才清理（沙箱失败绝不触碰任何目录）
-        if let Ok(root) = safe_join_sandbox(base, &format!("{username}/{d_parent}/{d_name}")) {
-            let _ = std::fs::remove_dir_all(&root);
-        }
+        // 仅当目标根路径能安全解析时才清理（openat2 沙箱失败绝不触碰任何目录）
+        let root_rel = format!("{username}/{d_parent}/{d_name}");
+        let _ = sb.remove_dir_all(&root_rel);
         return Err("存储空间不足".to_string());
     }
 
@@ -1292,16 +980,21 @@ async fn copy_recursive(
 
 // ====== DELETE ======
 
-async fn delete_item(pool: &SqlitePool, user: &DavUser, path: &str) -> Response {
+pub(crate) async fn delete_item(pool: &SqlitePool, user: &DavUser, path: &str) -> Response {
     let rel = path.trim_start_matches('/');
     if rel.is_empty() {
         return StatusCode::FORBIDDEN.into_response(); // 不允许删除根
     }
-    let full = match physical_path(&user.username, rel) {
+    let full_rel = format!("{}/{}", user.username, rel);
+    let _full = match physical_path(&user.username, rel) {
         Ok(p) => p,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    if !full.exists() {
+    let sb = match user_sandbox() {
+        Ok(s) => s,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if !sb.try_exists(&full_rel).unwrap_or(false) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (parent, name) = split_last(rel);
@@ -1329,7 +1022,7 @@ async fn delete_item(pool: &SqlitePool, user: &DavUser, path: &str) -> Response 
 // ====== LOCK / UNLOCK（伪实现） ======
 // 单写者场景（家庭云盘）：返回空写锁不持有状态，客户端（Windows 资源管理器）依赖 LOCK 成功
 
-fn lock_response() -> Response {
+pub(crate) fn lock_response() -> Response {
     let token = uuid::Uuid::new_v4();
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\

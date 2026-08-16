@@ -1,7 +1,8 @@
 [package]
 name = "pi_nas"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart", "ws"] }
@@ -33,6 +34,10 @@ futures-util = "0.3"
 http-body = "1"
 base64 = "0.22"
 askama = { version = "0.16", features = ["serde_json"] }
+# 内核级路径沙箱（openat2 RESOLVE_BENEATH + *at 系统调用族）——P0-4 符号链接 TOCTOU 根治
+rustix = { version = "1", features = ["fs"] }
+# AI key 落库加密（ChaCha20-Poly1305 AEAD）——P0-3 明文密钥残余风险根治
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.8"

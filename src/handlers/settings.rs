@@ -45,14 +45,23 @@ pub async fn get_agent_settings(
     .await?;
 
     match row {
-        Some((api_key, api_base, model, temp, tokens)) => Ok(Json(serde_json::json!({
-            "deepseek_api_key": api_key.as_ref().map(|k| mask_api_key(k)),
-            "deepseek_api_key_configured": api_key.as_ref().is_some_and(|k| !k.is_empty()),
-            "deepseek_api_base": api_base,
-            "deepseek_model": model,
-            "temperature": temp.unwrap_or(0.7),
-            "max_tokens": tokens.unwrap_or(4096),
-        }))),
+        Some((api_key, api_base, model, temp, tokens)) => {
+            // 落库密文 → 解密后掩码回显（解密失败按未配置处理并告警，绝不明文外泄损坏数据）
+            let decrypted = api_key.as_deref().map(|k| {
+                crate::core::secrets::decrypt_secret(k).unwrap_or_else(|e| {
+                    tracing::error!("[Settings] API Key 解密失败: {}", e);
+                    String::new()
+                })
+            });
+            Ok(Json(serde_json::json!({
+                "deepseek_api_key": decrypted.as_ref().map(|k| mask_api_key(k)),
+                "deepseek_api_key_configured": decrypted.as_ref().is_some_and(|k| !k.is_empty()),
+                "deepseek_api_base": api_base,
+                "deepseek_model": model,
+                "temperature": temp.unwrap_or(0.7),
+                "max_tokens": tokens.unwrap_or(4096),
+            })))
+        }
         None => Ok(Json(serde_json::json!({
             "deepseek_api_key": null,
             "deepseek_api_key_configured": false,
@@ -134,6 +143,14 @@ pub async fn save_agent_settings(
 
     // 首次保存（无现有行）时 temperature/max_tokens 为 NULL 会撞 NOT NULL 约束 → 500：
     // INSERT 侧同样 COALESCE 兜底（与 ON CONFLICT 侧口径一致，部分字段保存可用）
+    // P0-3：API Key 落库前 ChaCha20-Poly1305 加密；空串 = 清除密钥（明文空串不受影响）
+    let api_key_encrypted = payload.deepseek_api_key.as_deref().map(|k| {
+        if k.is_empty() {
+            String::new()
+        } else {
+            crate::core::secrets::encrypt_secret(k)
+        }
+    });
     sqlx::query(
         "INSERT INTO user_settings (username, deepseek_api_key, deepseek_api_base, deepseek_model, temperature, max_tokens)
          VALUES (?, ?, ?, ?, COALESCE(?, 0.7), COALESCE(?, 4096))
@@ -145,7 +162,7 @@ pub async fn save_agent_settings(
              max_tokens       = COALESCE(excluded.max_tokens, user_settings.max_tokens, 4096)"
     )
     .bind(&session.username)
-    .bind(&payload.deepseek_api_key)
+    .bind(&api_key_encrypted)
     .bind(&payload.deepseek_api_base)
     .bind(&payload.deepseek_model)
     .bind(payload.temperature)

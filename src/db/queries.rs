@@ -82,7 +82,7 @@ pub async fn get_user_quota(
         .await
 }
 
-/// 创建用户会话
+/// 创建用户会话（last_active_at = 创建时刻，空闲超时从此刻起算）
 pub async fn create_session(
     pool: &SqlitePool,
     token_hash: &str,
@@ -90,14 +90,16 @@ pub async fn create_session(
     role: &str,
     expires_at: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO sessions (token, username, role, expires_at) VALUES (?, ?, ?, ?)")
-        .bind(token_hash)
-        .bind(username)
-        .bind(role)
-        .bind(expires_at)
-        .execute(pool)
-        .await
-        .map(|_| ())
+    sqlx::query(
+        "INSERT INTO sessions (token, username, role, expires_at, last_active_at) VALUES (?, ?, ?, ?, datetime('now'))",
+    )
+    .bind(token_hash)
+    .bind(username)
+    .bind(role)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// 删除会话
@@ -109,12 +111,21 @@ pub async fn delete_session(pool: &SqlitePool, token_hash: &str) -> Result<(), s
         .map(|_| ())
 }
 
-/// 清理过期会话
-pub async fn clean_expired_sessions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM sessions WHERE expires_at <= datetime('now')")
-        .execute(pool)
-        .await
-        .map(|_| ())
+/// 清理过期/超空闲会话（绝对过期 + 空闲超时双闸）
+pub async fn clean_expired_sessions(
+    pool: &SqlitePool,
+    idle_minutes: i64,
+) -> Result<(), sqlx::Error> {
+    let idle_mod = format!("-{} minutes", idle_minutes.max(1));
+    sqlx::query(
+        "DELETE FROM sessions WHERE expires_at <= datetime('now') \
+         OR last_active_at IS NULL \
+         OR last_active_at < datetime('now', ?)",
+    )
+    .bind(&idle_mod)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 pub async fn count_user_files(

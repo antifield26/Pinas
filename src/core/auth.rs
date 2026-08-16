@@ -25,6 +25,7 @@ fn reject_no_token(uri_path: &str) -> Result<Response, StatusCode> {
 
 pub async fn auth_middleware(
     Extension(pool): Extension<sqlx::SqlitePool>,
+    Extension(config): Extension<crate::config::Config>,
     mut req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -126,13 +127,18 @@ pub async fn auth_middleware(
     };
 
     let token_hash = hash_token(&target_token);
+    // 空闲超时（P0-2）：会话必须同时满足 未超过绝对过期 且 空闲未超时
+    // （last_active_at 为 NULL = 升级前的旧会话，宽限为活跃，首次请求即刷新）
+    let idle_mod = format!("-{} minutes", config.session_idle_minutes.max(1));
     // role 实时取 users 表（不信任 sessions 快照）：admin 降权后未过期会话立即生效
     let session_row = sqlx::query(
-        "SELECT s.username, COALESCE(u.role, s.role) as role, COALESCE(u.must_change_pwd, 0) as must_change_pwd \
+        "SELECT s.username, COALESCE(u.role, s.role) as role, COALESCE(u.must_change_pwd, 0) as must_change_pwd, s.last_active_at \
          FROM sessions s LEFT JOIN users u ON s.username = u.username \
-         WHERE s.token = ? AND s.expires_at > datetime('now')",
+         WHERE s.token = ? AND s.expires_at > datetime('now') \
+           AND (s.last_active_at IS NULL OR s.last_active_at >= datetime('now', ?))",
     )
     .bind(&token_hash)
+    .bind(&idle_mod)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
@@ -144,11 +150,12 @@ pub async fn auth_middleware(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (username, role, must_change_pwd) = match session_row {
+    let (username, role, must_change_pwd, last_active_at) = match session_row {
         Some(row) => (
             row.get::<String, _>("username"),
             row.get::<String, _>("role"),
             row.get::<i64, _>("must_change_pwd") != 0,
+            row.get::<Option<String>, _>("last_active_at"),
         ),
         None => {
             warn!(
@@ -158,6 +165,21 @@ pub async fn auth_middleware(
             return reject_no_token(uri_path);
         }
     };
+
+    // 滑动活跃时间（惰性刷新）：仅当超过 5 分钟未刷新时才写库，避免每请求一次写放大
+    if last_active_at.as_deref().is_none_or(|v| v.is_empty()) {
+        let _ = sqlx::query("UPDATE sessions SET last_active_at = datetime('now') WHERE token = ?")
+            .bind(&token_hash)
+            .execute(&pool)
+            .await;
+    } else {
+        let _ = sqlx::query(
+            "UPDATE sessions SET last_active_at = datetime('now') WHERE token = ? AND last_active_at < datetime('now', '-5 minutes')",
+        )
+        .bind(&token_hash)
+        .execute(&pool)
+        .await;
+    }
 
     // 强制密码修改：must_change_pwd 时仅允许密码修改相关路由
     if must_change_pwd {

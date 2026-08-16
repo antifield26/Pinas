@@ -9,8 +9,8 @@ use tokio::io::AsyncWriteExt;
 use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{
-    bytes_to_mb_ceil, is_allowed_mime, is_allowed_mime_streaming, is_blocked_extension, log_audit,
-    safe_join_sandbox, user_dir_path,
+    bytes_to_mb_ceil, is_allowed_mime, is_allowed_mime_streaming_sandbox, is_blocked_extension,
+    log_audit, user_dir_path,
 };
 
 // --- DTOs ---
@@ -46,17 +46,18 @@ pub struct MergeRequest {
     pub parent_path: String,
 }
 
-/// 合并过程失败时自动清理临时文件和目录的 RAII guard
+/// 合并过程失败时自动清理临时文件和目录的 RAII guard。
+/// P0-4：目标文件（用户路径）经 openat2 沙箱删除，绝不按字符串路径直接 unlink
 struct MergeCleanup {
-    target_file: std::path::PathBuf,
+    target_rel: String,
     tmp_dir: String,
     armed: bool,
 }
 
 impl MergeCleanup {
-    fn new(target_file: std::path::PathBuf, tmp_dir: String) -> Self {
+    fn new(target_rel: String, tmp_dir: String) -> Self {
         Self {
-            target_file,
+            target_rel,
             tmp_dir,
             armed: true,
         }
@@ -70,7 +71,9 @@ impl MergeCleanup {
 impl Drop for MergeCleanup {
     fn drop(&mut self) {
         if self.armed {
-            let _ = std::fs::remove_file(&self.target_file);
+            if let Ok(sb) = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+                let _ = sb.remove_file(&self.target_rel);
+            }
             let _ = std::fs::remove_dir_all(&self.tmp_dir);
         }
     }
@@ -487,12 +490,24 @@ pub async fn merge_chunks(
     let parent_path = user_dir_path(Some(payload.parent_path));
     // 目标目录可能尚未登记(文件夹上传到新子目录)：物理目录随后 create_dir_all,这里先补插目录行
     crate::handlers::file_ops::ensure_dir_rows(&pool, username, &parent_path).await?;
-    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let user_dir = safe_join_sandbox(base_path, &format!("{}/{}", username, parent_path))?;
-    let _ = tokio::fs::create_dir_all(&user_dir).await;
-    let target_file_path = user_dir.join(&payload.file_name);
+    let _base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
+    let target_rel = if parent_path.is_empty() {
+        format!("{}/{}", username, payload.file_name)
+    } else {
+        format!("{}/{}/{}", username, parent_path, payload.file_name)
+    };
+    let user_dir_rel = if parent_path.is_empty() {
+        username.clone()
+    } else {
+        format!("{}/{}", username, parent_path)
+    };
+    // openat2 沙箱：逐级创建父目录（用户可控路径，内核级越界防护）
+    let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
+        .map_err(|e| AppError::internal_log("打开沙箱", e))?;
+    sb.create_dir_all(&user_dir_rel)
+        .map_err(|e| AppError::internal_log("创建目录", e))?;
     // 兜底复检：合并目标必须位于用户沙箱目录之下（防御未来校验绕过）
-    if !target_file_path.starts_with(&user_dir) {
+    if !target_rel.starts_with(&user_dir_rel) {
         return Err(AppError::bad_request("非法文件名"));
     }
 
@@ -507,11 +522,7 @@ pub async fn merge_chunks(
     .fetch_one(&pool)
     .await
     .unwrap_or(true); // DB 异常时保守拒绝，绝不冒险覆盖
-    if same_name_exists
-        || tokio::fs::try_exists(&target_file_path)
-            .await
-            .unwrap_or(true)
-    {
+    if same_name_exists || sb.try_exists(&target_rel).unwrap_or(true) {
         return Err(AppError::conflict("同名文件已存在，请先删除或重命名"));
     }
 
@@ -536,12 +547,14 @@ pub async fn merge_chunks(
         )));
     }
 
-    let mut out_file = tokio::fs::File::create(&target_file_path)
-        .await
+    // O_EXCL 语义：同名预检后的原子创建（沙箱内，越界符号链接拒绝）
+    let mut out_file = sb
+        .open_write(&target_rel, false, true)
+        .map(tokio::fs::File::from_std)
         .map_err(|e| AppError::internal_log("创建目标文件", e))?;
 
     // RAII cleanup guard — 错误发生时自动清理 target_file + tmp_dir
-    let mut cleanup = MergeCleanup::new(target_file_path.clone(), tmp_dir.clone());
+    let mut cleanup = MergeCleanup::new(target_rel.clone(), tmp_dir.clone());
 
     // 按顺序合并所有分片
     for idx in chunks {
@@ -555,8 +568,8 @@ pub async fn merge_chunks(
     }
     let _ = out_file.flush().await;
 
-    // 获取文件元数据
-    let meta = target_file_path.metadata().map(|m| m.len()).unwrap_or(0);
+    // 获取文件元数据（沙箱内，无二次路径解析）
+    let meta = sb.metadata(&target_rel).map(|m| m.len()).unwrap_or(0);
     let file_size_mb_exact = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
     let file_size_mb_ceil = bytes_to_mb_ceil(meta);
 
@@ -581,20 +594,19 @@ pub async fn merge_chunks(
 
     if current_used + file_size_mb_ceil > quota {
         drop(tx);
-        let _ = tokio::fs::remove_file(&target_file_path).await;
+        let _ = sb.remove_file(&target_rel);
         return Err(AppError::forbidden(format!(
             "存储空间不足，配额 {} MB，已使用 {} MB（分片已保留，清理空间后可重试合并）",
             quota, current_used
         )));
     }
 
-    // 完整文件 MIME 检测（安全增强）
-    if !is_allowed_mime_streaming(&target_file_path)
-        .await
+    // 完整文件 MIME 检测（经沙箱打开，防符号链接指向外部文件）
+    if !is_allowed_mime_streaming_sandbox(&sb, &target_rel)
         .map_err(|e| AppError::internal_log("文件完整性检测", e))?
     {
         drop(tx);
-        let _ = tokio::fs::remove_file(&target_file_path).await;
+        let _ = sb.remove_file(&target_rel);
         return Err(AppError::forbidden("完整文件安全检测未通过：非法内容"));
     }
 

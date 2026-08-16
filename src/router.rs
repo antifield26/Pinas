@@ -254,4 +254,8 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .layer(Extension(pool))
         .layer(Extension(config))
         .layer(middleware::from_fn(security_headers))
+        // P1-2：X-Request-Id 最外层——所有响应（含 404 fallback）都带请求 ID
+        .layer(middleware::from_fn(
+            crate::middleware::request_id_middleware,
+        ))
 }

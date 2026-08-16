@@ -34,14 +34,19 @@ pub async fn get_file_content_handler(
     Query(query): Query<EditGetQuery>,
 ) -> impl IntoResponse {
     let username = &session.username;
-    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_p = match safe_join_sandbox(base_path, &format!("{}/{}", username, query.path)) {
+    let rel = format!("{}/{}", username, query.path);
+    let _full_p = match safe_join_sandbox(std::path::Path::new(crate::constants::UPLOADS_DIR), &rel)
+    {
         Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "文件不存在").into_response(),
+    };
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(s) => s,
         Err(_) => return (StatusCode::NOT_FOUND, "文件不存在").into_response(),
     };
 
     // 检查文件大小，防止读取超大文件耗尽内存
-    if let Ok(meta) = tokio::fs::metadata(&full_p).await
+    if let Ok(meta) = sb.metadata(&rel)
         && meta.len() > MAX_EDITOR_READ_SIZE
     {
         return (
@@ -55,7 +60,7 @@ pub async fn get_file_content_handler(
             .into_response();
     }
 
-    match tokio::fs::read_to_string(&full_p).await {
+    match sb.read_to_string(&rel) {
         Ok(text) => (StatusCode::OK, text).into_response(),
         Err(e) => {
             tracing::error!("[Media] 读取文件失败: {}", e);
@@ -85,19 +90,21 @@ pub async fn save_file_content_handler(
     }
 
     let username = &session.username;
-    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_p = match safe_join_sandbox(base_path, &format!("{}/{}", username, payload.path)) {
+    let rel = format!("{}/{}", username, payload.path);
+    let _full_p = match safe_join_sandbox(std::path::Path::new(crate::constants::UPLOADS_DIR), &rel)
+    {
         Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
+    };
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(s) => s,
         Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
     };
 
     // 配额检查（M3/M4 修复）：按新旧 CEIL 差值在写事务内原子预检 + 预留——
     // 历史实现「读 used → 判断 → 写盘 → 增量调整」存在 TOCTOU 与全量重算互相覆盖。
     // 预留成功后写盘失败会由 update_user_used_mb 全量重算自愈
-    let old_len = tokio::fs::metadata(&full_p)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let old_len = sb.metadata(&rel).map(|m| m.len()).unwrap_or(0);
     let new_len = payload.content.len() as u64;
     let delta_mb = crate::handlers::utils::bytes_to_mb_ceil(new_len)
         - crate::handlers::utils::bytes_to_mb_ceil(old_len);
@@ -139,7 +146,7 @@ pub async fn save_file_content_handler(
             .into_response();
     }
 
-    if let Err(e) = tokio::fs::write(&full_p, payload.content.as_bytes()).await {
+    if let Err(e) = sb.write(&rel, payload.content.as_bytes()) {
         tracing::error!("[Media] 写入文件失败: {}", e);
         // 预留已提交但写盘失败：全量重算自愈（事务化版本，不会被增量覆盖）
         let _ = crate::handlers::utils::update_user_used_mb(&pool, username).await;
@@ -163,7 +170,7 @@ pub async fn save_file_content_handler(
         parent
     };
 
-    let meta = full_p.metadata().map(|m| m.len()).unwrap_or(0);
+    let meta = sb.metadata(&rel).map(|m| m.len()).unwrap_or(0);
     let size_mb_exact = meta as f64 / crate::handlers::utils::BYTES_PER_MB_F64;
 
     let _ = sqlx::query(
@@ -202,24 +209,29 @@ pub async fn media_proxy(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let username = &session.username;
-    let base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);
-    let full_path = match safe_join_sandbox(base_path, &format!("{}/{}", username, raw_path)) {
-        Ok(p) => p,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    let rel = format!("{}/{}", username, raw_path);
+    let _full_path =
+        match safe_join_sandbox(std::path::Path::new(crate::constants::UPLOADS_DIR), &rel) {
+            Ok(p) => p,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-
-    if !full_path.exists() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let metadata = match tokio::fs::metadata(&full_path).await {
-        Ok(meta) => meta,
+    // openat2 沙箱元数据：越界符号链接/不存在 → 404
+    let metadata = match sb.metadata(&rel) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let file_size = metadata.len();
     let mime = normalize_media_mime(
-        &full_path,
-        mime_guess::from_path(&full_path).first_or_octet_stream(),
+        std::path::Path::new(&raw_path),
+        mime_guess::from_path(std::path::Path::new(&raw_path)).first_or_octet_stream(),
     );
     let mime_str = mime.to_string();
     // html/svg/xml 等内联渲染可执行脚本 → 强制 octet-stream（存储型 XSS 通道封堵）
@@ -275,8 +287,11 @@ pub async fn media_proxy(
 
     let length = end - start + 1;
 
-    let mut file = match tokio::fs::File::open(&full_path).await {
-        Ok(f) => f,
+    let mut file = match sb.open(&rel) {
+        Ok(f) => tokio::fs::File::from_std(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
@@ -398,7 +413,13 @@ pub async fn download_zip(
             continue;
         };
         if target_path.starts_with(&user_root) && target_path.exists() {
-            items.push((name.clone(), target_path));
+            // 相对 uploads 根的 rel（供沙箱原子操作）
+            let rel = target_path
+                .strip_prefix(base_path)
+                .unwrap_or(&target_path)
+                .to_string_lossy()
+                .into_owned();
+            items.push((name.clone(), rel));
         }
     }
 
@@ -443,20 +464,23 @@ pub async fn download_zip(
         // M2：打包预算——总字节 + 条目数双重上限，防反向 zip bomb（超大目录/符号链接环
         // 打爆 tmpfs 或 SD 卡）；符号链接一律跳过（不跟随，杜绝递归环与越界打包）
         let mut budget = ZipBudget::new();
+        // P0-4：沙箱内打开/遍历（越界符号链接一律拒绝，zip 打包不可能带出沙箱外内容）
+        let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
+            .map_err(|e| e.to_string())?;
 
-        for (name, full_path) in items {
+        for (name, rel) in items {
             // 条目名净化：跳过 "."/".."（防 zip-slip 解压穿越）
             if name == "." || name == ".." {
                 continue;
             }
-            let meta = std::fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
+            let meta = sb.symlink_metadata(&rel).map_err(|e| e.to_string())?;
             if meta.file_type().is_symlink() {
-                tracing::warn!("[Media] zip 跳过符号链接: {:?}", full_path);
+                tracing::warn!("[Media] zip 跳过符号链接: {}", rel);
                 continue;
             }
             if meta.is_file() {
                 budget.charge(meta.len())?;
-                let mut file = std::fs::File::open(&full_path).map_err(|e| e.to_string())?;
+                let mut file = sb.open(&rel).map_err(|e| e.to_string())?;
                 zip_writer
                     .start_file(&name, options)
                     .map_err(|e| e.to_string())?;
@@ -466,7 +490,7 @@ pub async fn download_zip(
                 zip_writer
                     .add_directory(&name, SimpleFileOptions::default())
                     .map_err(|e| e.to_string())?;
-                add_dir_to_zip_sync(&mut zip_writer, &full_path, &name, options, &mut budget)?;
+                add_dir_to_zip_sync(&mut zip_writer, &sb, &rel, &name, options, &mut budget)?;
             }
         }
         zip_writer.finish().map_err(|e| e.to_string())?;
@@ -570,43 +594,41 @@ impl ZipBudget {
     }
 }
 
-// 辅助：同步递归添加目录到 ZIP（符号链接跳过，预算逐条扣减）
+// 辅助：同步递归添加目录到 ZIP（符号链接跳过，预算逐条扣减；沙箱内遍历）
 fn add_dir_to_zip_sync(
     zip_writer: &mut zip::ZipWriter<std::fs::File>,
-    dir_path: &std::path::Path,
+    sb: &crate::fsutil::Sandbox,
+    dir_rel: &str,
     zip_prefix: &str,
     options: SimpleFileOptions,
     budget: &mut ZipBudget,
 ) -> Result<(), String> {
-    for entry in std::fs::read_dir(dir_path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for item in sb.read_dir(dir_rel).map_err(|e| e.to_string())? {
+        let name = item.name.to_string_lossy().into_owned();
         // 跳过 "."/".." 条目（zip-slip 防御）
         if name == "." || name == ".." {
             continue;
         }
-        // dirent 的 file_type 不跟随符号链接：符号链接一律跳过（防递归环/越界打包）
-        let ftype = entry.file_type().map_err(|e| e.to_string())?;
-        if ftype.is_symlink() {
-            tracing::warn!("[Media] zip 跳过符号链接: {:?}", path);
+        let child_rel = format!("{dir_rel}/{name}");
+        // 符号链接一律跳过（防递归环/越界打包；沙箱 read_dir 本身也不跟随）
+        if item.is_symlink() {
+            tracing::warn!("[Media] zip 跳过符号链接: {child_rel}");
             continue;
         }
         let zip_name = format!("{}/{}", zip_prefix, name);
-        if ftype.is_file() {
-            let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-            budget.charge(meta.len())?;
-            let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        if item.is_file() {
+            budget.charge(item.size)?;
+            let mut file = sb.open(&child_rel).map_err(|e| e.to_string())?;
             zip_writer
                 .start_file(&zip_name, options)
                 .map_err(|e| e.to_string())?;
             std::io::copy(&mut file, zip_writer).map_err(|e| e.to_string())?;
-        } else if ftype.is_dir() {
+        } else if item.is_dir() {
             budget.charge(0)?;
             zip_writer
                 .add_directory(&zip_name, SimpleFileOptions::default())
                 .map_err(|e| e.to_string())?;
-            add_dir_to_zip_sync(zip_writer, &path, &zip_name, options, budget)?;
+            add_dir_to_zip_sync(zip_writer, sb, &child_rel, &zip_name, options, budget)?;
         }
     }
     Ok(())

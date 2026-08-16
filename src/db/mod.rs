@@ -65,8 +65,8 @@ pub async fn init(
     migrations::run(pool).await?;
     init_indexes(pool).await?;
     init_default_users(pool, config).await?;
-    // 清理过期会话
-    queries::clean_expired_sessions(pool).await?;
+    // 清理过期/超空闲会话（配置的空闲超时）
+    queries::clean_expired_sessions(pool, config.session_idle_minutes).await?;
     Ok(())
 }
 
@@ -128,7 +128,8 @@ async fn init_tables(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             token TEXT PRIMARY KEY,
             username TEXT NOT NULL,
             role TEXT NOT NULL,
-            expires_at DATETIME NOT NULL
+            expires_at DATETIME NOT NULL,
+            last_active_at DATETIME
         )",
     )
     .execute(pool)

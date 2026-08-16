@@ -6,7 +6,7 @@
 //   - 双方均缺失 → 告警并放弃该记录
 // 另含 WebDAV MOVE 覆盖的位移目标（uploads/.dav_disp）启动恢复（M9）。
 
-use crate::constants::{DAV_DISP_DIR, TRASH_DIR, UPLOADS_DIR};
+use crate::constants::{DAV_DISP_DIR, UPLOADS_DIR};
 use crate::error::{AppError, AppResult};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -103,18 +103,19 @@ async fn replay_rename_move(
     src: &str,
     dst: &str,
 ) -> AppResult<()> {
-    let base = std::path::Path::new(UPLOADS_DIR);
-    let src_p = crate::handlers::utils::safe_join_sandbox(base, &format!("{username}/{src}"))?;
-    let dst_p = crate::handlers::utils::safe_join_sandbox(base, &format!("{username}/{dst}"))?;
-    let dst_exists = tokio::fs::try_exists(&dst_p).await.unwrap_or(false);
-    let src_exists = tokio::fs::try_exists(&src_p).await.unwrap_or(false);
+    // P0-4：重放物理操作同样经 openat2 沙箱（崩溃恢复场景不得成为越界通道）
+    let sb = crate::fsutil::Sandbox::new(UPLOADS_DIR)
+        .map_err(|e| AppError::internal_log("打开沙箱", e))?;
+    let src_rel = format!("{username}/{src}");
+    let dst_rel = format!("{username}/{dst}");
+    let dst_exists = sb.try_exists(&dst_rel).unwrap_or(false);
+    let src_exists = sb.try_exists(&src_rel).unwrap_or(false);
     if dst_exists {
         // FS 已完成：只补 DB
         apply_db_rename_move(pool, username, op, src, dst).await?;
     } else if src_exists {
         // FS 未完成：重做物理移动 + DB
-        tokio::fs::rename(&src_p, &dst_p)
-            .await
+        sb.rename(&src_rel, &dst_rel)
             .map_err(|e| AppError::internal_log("重放物理移动", e))?;
         apply_db_rename_move(pool, username, op, src, dst).await?;
     } else {
@@ -127,10 +128,11 @@ async fn replay_rename_move(
 }
 
 async fn replay_trash(pool: &SqlitePool, username: &str, src: &str, uuid: &str) -> AppResult<()> {
-    let base = std::path::Path::new(UPLOADS_DIR);
-    let src_p = crate::handlers::utils::safe_join_sandbox(base, &format!("{username}/{src}"))?;
-    let trash_dir = std::path::Path::new(TRASH_DIR);
-    let trash_p = trash_dir.join(uuid);
+    let sb = crate::fsutil::Sandbox::new(UPLOADS_DIR)
+        .map_err(|e| AppError::internal_log("打开沙箱", e))?;
+    let src_rel = format!("{username}/{src}");
+    // TRASH_DIR = uploads/.trash → 相对 uploads 根的 rel 恒为 .trash/{uuid}
+    let trash_rel = format!(".trash/{uuid}");
     let row_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trash WHERE trash_uuid = ?)")
             .bind(uuid)
@@ -138,7 +140,7 @@ async fn replay_trash(pool: &SqlitePool, username: &str, src: &str, uuid: &str) 
             .await
             .unwrap_or(false);
 
-    if trash_p.exists() {
+    if sb.try_exists(&trash_rel).unwrap_or(false) {
         // FS 已完成：补 DB（trash 行 + 删除 files 行）
         if !row_exists {
             let _ = sqlx::query(
@@ -154,12 +156,9 @@ async fn replay_trash(pool: &SqlitePool, username: &str, src: &str, uuid: &str) 
         crate::handlers::file_ops::db_delete_file_rows(pool, username, &parent, &name).await?;
     } else if !row_exists {
         // DB 尚未登记：FS 未完成（或 src 已被外部处理）
-        if src_p.exists() {
-            tokio::fs::create_dir_all(trash_dir)
-                .await
-                .map_err(|e| AppError::internal_log("创建回收站目录", e))?;
-            tokio::fs::rename(&src_p, &trash_p)
-                .await
+        if sb.try_exists(&src_rel).unwrap_or(false) {
+            let _ = sb.create_dir_all(".trash");
+            sb.rename(&src_rel, &trash_rel)
                 .map_err(|e| AppError::internal_log("重放回收移动", e))?;
             let _ = sqlx::query(
                 "INSERT INTO trash (username, original_path, trash_uuid) VALUES (?, ?, ?)",
@@ -195,6 +194,11 @@ pub async fn recover_dav_disp(pool: &SqlitePool) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
     };
+    // P0-4：位移还原经 openat2 沙箱（root = uploads，.dav_disp 与目标同 root）
+    let sb = match crate::fsutil::Sandbox::new(UPLOADS_DIR) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let meta_path = entry.path();
         let Some(name) = meta_path.file_name().and_then(|n| n.to_str()) else {
@@ -203,7 +207,7 @@ pub async fn recover_dav_disp(pool: &SqlitePool) {
         let Some(uuid) = name.strip_suffix(".json") else {
             continue;
         };
-        let disp_path = dir.join(format!("{uuid}.d"));
+        let disp_rel = format!("{}/{}", DAV_DISP_DIR.trim_start_matches("uploads/"), uuid);
         let meta = match tokio::fs::read_to_string(&meta_path)
             .await
             .ok()
@@ -222,19 +226,13 @@ pub async fn recover_dav_disp(pool: &SqlitePool) {
             warn!("[journal] dav 位移元数据缺字段，跳过: {}", uuid);
             continue;
         }
-        let base = std::path::Path::new(UPLOADS_DIR);
-        let Ok(target) = crate::handlers::utils::safe_join_sandbox(
-            base,
-            &format!("{username}/{parent}/{fname}"),
-        ) else {
-            continue;
-        };
-        if target.exists() {
+        let target_rel = format!("{username}/{parent}/{fname}");
+        if sb.try_exists(&target_rel).unwrap_or(false) {
             // 覆盖已完成：位移文件可清理
-            let _ = tokio::fs::remove_dir_all(&disp_path).await;
+            let _ = sb.remove_dir_all(&disp_rel);
             let _ = tokio::fs::remove_file(&meta_path).await;
             info!("[journal] 已清理 dav 位移残留（覆盖已完成）: {parent}/{fname}");
-        } else if tokio::fs::rename(&disp_path, &target).await.is_ok() {
+        } else if sb.rename(&disp_rel, &target_rel).is_ok() {
             if let Some(arr) = meta["rows"].as_array() {
                 for r in arr {
                     let _ = sqlx::query(

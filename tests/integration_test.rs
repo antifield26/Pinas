@@ -4254,3 +4254,235 @@ async fn test_csp_and_templates_no_inline_handlers() {
         "drive 页应加载外部 app.js"
     );
 }
+
+// ====== v1.10.0 P0-4：符号链接逃逸回归（openat2 沙箱） ======
+
+/// 沙箱外符号链接：读路径（media/编辑器/WebDAV）必须全部拒绝
+#[tokio::test]
+async fn test_symlink_escape_blocked_read_paths() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    // 种一个指向沙箱外（/etc/passwd）的符号链接
+    std::os::unix::fs::symlink("/etc/passwd", format!("uploads/{}/evil.txt", username)).unwrap();
+
+    // 1. 媒体代理
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/media/{}", "evil.txt"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "media 越界链接必须 4xx: {}",
+        resp.status()
+    );
+
+    // 2. 在线编辑器读取
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/edit/get?path=evil.txt", &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "编辑器越界链接必须 404"
+    );
+
+    // 3. WebDAV GET
+    let resp = dav_send(&app, "GET", "/dav/evil.txt", Some(&auth), vec![], &[]).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "WebDAV 越界链接必须 404"
+    );
+
+    // 4. PROPFIND 不得列出（越界条目视为不存在）
+    let resp = dav_send(&app, "PROPFIND", "/dav/", Some(&auth), vec![], &[]).await;
+    let xml = read_body_text(resp).await;
+    assert!(
+        !xml.contains("evil.txt"),
+        "PROPFIND 不得暴露越界符号链接条目"
+    );
+}
+
+/// 写路径：经符号链接目录的创建/重命名/移动必须拒绝
+#[tokio::test]
+async fn test_symlink_escape_blocked_write_paths() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+    let auth = basic_auth_header(&username, "testpass123");
+
+    // 真实目录 + 指向沙箱外的符号链接目录
+    std::fs::create_dir_all(format!("uploads/{}/sub", username)).unwrap();
+    std::os::unix::fs::symlink("/tmp", format!("uploads/{}/evil_dir", username)).unwrap();
+
+    // 1. 在符号链接目录下建文件夹 → 拒绝
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/create_folder",
+            r#"{"name":"newdir","current_path":"evil_dir"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "经越界符号链接建目录必须拒绝: {}",
+        resp.status()
+    );
+
+    // 2. 重命名进符号链接目录 → 拒绝
+    std::fs::write(format!("uploads/{}/victim.txt", username), b"v").unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/rename",
+            r#"{"name":"victim.txt","new_name":"moved.txt","current_path":"evil_dir"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error() || resp.status() == StatusCode::NOT_FOUND,
+        "经越界符号链接重命名必须拒绝: {}",
+        resp.status()
+    );
+
+    // 3. 移动目标为符号链接目录 → 拒绝
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/move",
+            r#"{"name":"victim.txt","target_dir":"evil_dir","current_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error() || resp.status() == StatusCode::NOT_FOUND,
+        "移入越界符号链接目录必须拒绝: {}",
+        resp.status()
+    );
+
+    // 4. WebDAV PUT 到符号链接目录下 → 拒绝（非 2xx）
+    let resp = dav_send(
+        &app,
+        "PUT",
+        "/dav/evil_dir/x.txt",
+        Some(&auth),
+        b"x".to_vec(),
+        &[],
+    )
+    .await;
+    assert!(
+        !resp.status().is_success(),
+        "WebDAV 越界目录写入必须拒绝: {}",
+        resp.status()
+    );
+}
+
+/// 删除/重命名符号链接本身：只移除链接，绝不触碰链接目标
+#[tokio::test]
+async fn test_symlink_delete_unlinks_only_link() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    std::fs::write(format!("uploads/{}/real_target.txt", username), b"PRECIOUS").unwrap();
+    std::os::unix::fs::symlink(
+        format!("uploads/{}/real_target.txt", username),
+        format!("uploads/{}/lnk.txt", username),
+    )
+    .unwrap();
+
+    // 删除链接（经 API：delete_to_trash 沙箱 rename 只移走链接本身）
+    let resp = app
+        .clone()
+        .oneshot(post_json_with_token(
+            "/api/files/delete",
+            r#"{"name":"lnk.txt","current_path":""}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "删除符号链接应成功: {}",
+        resp.status()
+    );
+    assert!(
+        std::fs::read_to_string(format!("uploads/{}/real_target.txt", username)).unwrap()
+            == "PRECIOUS",
+        "链接目标不得被触碰"
+    );
+}
+
+/// 沙箱内相对符号链接仍可读（正常用户数据不受影响）
+#[tokio::test]
+async fn test_symlink_internal_relative_still_readable() {
+    let (_pool, app) = test_app().await;
+    let (token, username) = register_and_login_with_username(&app).await;
+
+    std::fs::write(format!("uploads/{}/inner.txt", username), b"ok").unwrap();
+    std::os::unix::fs::symlink("inner.txt", format!("uploads/{}/alias.txt", username)).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/media/{}", "alias.txt"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "沙箱内相对链接应可读");
+}
+
+// ====== v1.10.0 P1-2：X-Request-Id 贯穿 ======
+
+/// 所有响应（含未认证 401）必须携带 X-Request-Id；入站 ID 被沿用（dsh 链路关联）
+#[tokio::test]
+async fn test_request_id_header_present_and_echoed() {
+    let (_pool, app) = test_app().await;
+
+    // 未认证请求（401 也应带 ID）
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/files/list", "invalid-token"))
+        .await
+        .unwrap();
+    let rid = resp
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("401 响应必须携带 X-Request-Id")
+        .to_string();
+    assert!(!rid.is_empty());
+
+    // 入站携带 ID → 响应沿用同一 ID
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .header("x-request-id", "trace-abc-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "trace-abc-123",
+        "入站 X-Request-Id 必须原样沿用"
+    );
+}

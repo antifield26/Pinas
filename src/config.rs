@@ -10,6 +10,9 @@ pub struct Config {
     pub database_url: String,
     #[serde(default = "default_session_days")]
     pub session_days: i64,
+    /// 会话空闲超时（分钟）：超过该时长无任何请求则强制下线（滑动活跃时间，绝对过期仍生效）
+    #[serde(default = "default_session_idle_minutes")]
+    pub session_idle_minutes: i64,
     #[serde(default = "default_temp_cleanup_hours")]
     pub temp_cleanup_hours: u64,
     #[serde(default = "default_trash_cleanup_days")]
@@ -74,6 +77,10 @@ fn default_database_url() -> String {
 fn default_session_days() -> i64 {
     7
 }
+/// 默认空闲超时 24 小时（1440 分钟）——绝对过期（7 天）外的第二道闸
+fn default_session_idle_minutes() -> i64 {
+    1440
+}
 fn default_temp_cleanup_hours() -> u64 {
     24
 }
@@ -112,6 +119,7 @@ impl Default for Config {
             server_port: default_server_port(),
             database_url: default_database_url(),
             session_days: default_session_days(),
+            session_idle_minutes: default_session_idle_minutes(),
             temp_cleanup_hours: default_temp_cleanup_hours(),
             trash_cleanup_days: default_trash_cleanup_days(),
             trash_cleanup_interval_hours: default_trash_cleanup_interval_hours(),
@@ -170,8 +178,12 @@ fn load_dotenv_manual() {
             unsafe {
                 std::env::set_var(key, value);
             }
-            if key == "PINAS_ADMIN_PASSWORD" || key == "PINAS_GUEST_PASSWORD" {
-                // 安全：绝不打印密码值的任何部分（systemd 下会进 journald，可被离线猜测）
+            if key == "PINAS_ADMIN_PASSWORD"
+                || key == "PINAS_GUEST_PASSWORD"
+                || key == "PINAS_DEEPSEEK_API_KEY"
+                || key == "PINAS_MASTER_KEY"
+            {
+                // 安全：绝不打印密码/密钥值的任何部分（systemd 下会进 journald，可被离线猜测）
                 eprintln!(
                     "[Config]   {}={}",
                     key,
@@ -211,6 +223,12 @@ impl Config {
             eprintln!(
                 "[Config] 警告: session_days={}，会话将立即过期",
                 self.session_days
+            );
+        }
+        if self.session_idle_minutes < 1 {
+            eprintln!(
+                "[Config] 警告: session_idle_minutes={}，会话将立即过期（空闲超时）",
+                self.session_idle_minutes
             );
         }
     }

@@ -44,24 +44,26 @@ Browser                      Axum Server
 
 ```
 ├── src/
-│   ├── main.rs              # 入口 (配置/日志/DB/路由/CancellationToken/优雅关闭)
+│   ├── main.rs              # 入口 (配置/日志/DB/路由/CancellationToken/优雅关闭/主密钥)
 │   ├── config.rs            # Config 结构体 (PINAS_* 环境变量 + validate())
 │   ├── constants.rs         # 全局常量
 │   ├── error.rs             # AppError + AppResult<T>
-│   ├── router.rs            # build_router() — ~95 条路由
+│   ├── router.rs            # build_router() — ~105 条路由
+│   ├── fsutil.rs            # openat2 内核级路径沙箱（Sandbox：BENEATH + *at 族）
 │   ├── templates.rs         # AppTemplate<T> — Askama → IntoResponse
 │   ├── db/
 │   │   ├── mod.rs           # create_pool(), init_tables()
-│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表)
+│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表, 当前 v11)
 │   │   └── queries.rs       # 共享查询辅助
 │   ├── middleware/
-│   │   └── csp.rs           # Content-Security-Policy
+│   │   ├── csp.rs           # Content-Security-Policy
+│   │   └── request_id.rs    # X-Request-Id（响应头 + tracing span 贯穿）
 │   ├── tasks/
 │   │   └── cleanup.rs       # 后台任务 (支持 CancellationToken)
 │   └── handlers/
 │       ├── pages.rs         # 页面路由 (page_handler! 宏)
 │       ├── auth.rs          # 认证 (Argon2 + Secure Cookie)
-│       ├── file_ops.rs      # 文件 CRUD + HTMX 片段 (~630行)
+│       ├── file_ops/        # 文件 CRUD（P1-1 拆分：core 核心 / api JSON / fragments HTMX）
 │       ├── upload.rs        # 分片上传 (10MB/片 + 并发3 + 重试3)
 │       ├── media.rs         # 媒体代理 (流式播放 + Range)
 │       ├── share.rs         # 分享管理 + 分享页面
@@ -70,24 +72,26 @@ Browser                      Axum Server
 │       ├── system.rs        # 健康检查 + 系统监控
 │       ├── links.rs         # 链接收藏 CRUD
 │       ├── todos.rs         # 待办/日程 CRUD
-│       ├── agent.rs         # AI 对话 (DeepSeek)
+│       ├── agent.rs         # AI 对话 (DeepSeek, DNS 钉扎客户端)
 │       ├── conversations.rs # 对话管理 (CRUD + HTMX 片段)
 │       ├── settings.rs      # Agent 用户设置
 │       ├── minecraft.rs     # MC 服务器状态
-│       ├── dav.rs           # WebDAV 端点 (PROPFIND/PUT/MOVE/COPY 等, Basic 认证)
+│       ├── dav/             # WebDAV（P1-1 拆分：mod 入口 / auth 认证 / ops 方法）
 │       ├── rate_limit.rs    # 异步速率限制器
-│       └── utils.rs         # 路径沙箱/MIME/审计/配额
+│       └── utils.rs         # 配额/MIME/审计/字符串路径校验（纵深防御层）
 ├── core/
 │   ├── mod.rs               # UserSession + 密码学重导出
-│   ├── auth.rs              # auth_middleware
-│   └── crypto.rs            # hash_token/password/verify/generate
+│   ├── auth.rs              # auth_middleware（空闲超时滑动刷新）
+│   ├── crypto.rs            # hash_token/password/verify/generate
+│   └── secrets.rs           # 主密钥 + 敏感字段 ChaCha20-Poly1305 加解密
 ├── templates/
 │   ├── base.html            # 根布局 (nav/toast/modal/PWA/JS namespace)
 │   ├── pages/               # 10 页面模板 (7 个 page_struct! + 3 独立页)
-│   ├── components/          # 可复用 HTMX 片段 (22 个，含 upload_queue.html)
+│   ├── components/          # 可复用 HTMX 片段 (23 个，含 upload_queue.html)
 │   └── partials/            # 片段 include (theme_head.html 独立页暗色)
 ├── assets/                  # 静态资源 (CSS/JS/manifest)
 ├── static/sw.js             # PWA Service Worker v15
+├── deny.toml                # cargo-deny 供应链策略（P1-3）
 └── uploads/                 # 运行时文件存储
 ```
 
@@ -170,13 +174,15 @@ Browser                      Axum Server
 PINAS_SERVER_HOST=0.0.0.0          PINAS_SERVER_PORT=3000
 PINAS_DATABASE_URL=sqlite:cloud_disk.db
 PINAS_UPLOAD_LIMIT_MB=100          PINAS_DEFAULT_QUOTA_MB=10240
-PINAS_SESSION_DAYS=7               PINAS_DATA_DIR=
+PINAS_SESSION_DAYS=7               PINAS_SESSION_IDLE_MINUTES=1440   # 空闲超时（默认 24h）
+PINAS_DATA_DIR=
 PINAS_TEMP_CLEANUP_HOURS=24        PINAS_TRASH_CLEANUP_DAYS=30
 PINAS_ADMIN_PASSWORD=              PINAS_GUEST_PASSWORD=
 PINAS_DEEPSEEK_API_KEY=            PINAS_DEEPSEEK_API_BASE=https://api.deepseek.com
 PINAS_DEEPSEEK_MODEL=deepseek-v4-flash     PINAS_ALLOW_REGISTRATION=false
 PINAS_COOKIE_SECURE=               PINAS_SYNC_PASSWORDS=false
 PINAS_AGENT_DAILY_QUOTA=200        MINECRAFT_HOST=127.0.0.1
+PINAS_MASTER_KEY=                  # 主密钥（64 位 hex；缺省用 <data_dir>/secret.key，0600）
 MINECRAFT_PORT=25565
 ```
 
@@ -184,22 +190,31 @@ MINECRAFT_PORT=25565
 
 ### 安全约定
 - **`validate_name`**：文件/文件夹名白名单（拒绝 `/` `\` `..` 引号 尖括号 控制字符），挂于建文件夹/重命名/merge 写入路径
-- **`safe_join_sandbox` 返回 `AppResult`**：攻击检测失败返回 Err（不可回退到 base），18 个调用点 `?` 传播
+- **`safe_join_sandbox` 返回 `AppResult`**：字符串级纵深防御（拒绝 .. / 绝对路径/盘符），保留在 18 个调用点
+- **`fsutil::Sandbox`（v1.10 P0-4）**：全部物理文件操作的内核级沙箱——
+  `openat2(RESOLVE_BENEATH | NO_MAGICLINKS)` + `renameat/unlinkat/mkdirat/statat` 族，
+  符号链接越界（含绝对路径链接）由内核在单次系统调用内原子拒绝，TOCTOU 窗口归零；
+  沙箱内相对符号链接正常可用；删除/重命名只作用于链接本身（不跟随最终组件）
 - **强制下载类型** `is_force_download_mime`：html/svg/xml/js 一律 octet-stream + `Content-Disposition: attachment`（分享/媒体）
 - **模板内联 JS 零用户数据**：导航走 `data-nav-path`/`data-breadcrumb-path` 事件委托；`hx-vals` 一律 `|json` 过滤器
 - **限速可信源** `MaybePeer`：直连用真实对端 IP，回环(cloudflared)信任 CF-Connecting-IP，防伪造 XFF 绕过
 - **注册开关** `PINAS_ALLOW_REGISTRATION`（默认 false）；分片临时存储 5GB/用户上限；备份保留 7 份轮转
 - **WebDAV** `/dav/*`：Basic 认证（60s 缓存键含凭证指纹 sha256(user\0pass)，改密/重置即失效）
-  + 认证限速（10 次/60s/IP）+ 全路径沙箱 + DELETE 进回收站；路由级 5GiB body limit；
-  dav.rs 文件操作统一 std::fs（测试环境 tokio::fs 相对路径有 ENOENT 竞态）
+  + 认证限速（10 次/60s/IP）+ 全路径 openat2 沙箱 + DELETE 进回收站；路由级 5GiB body limit
 - 密码学函数从 `src/core` 导入（`hash_password`, `verify_password`, `hash_token`）；
   Argon2id m=19MiB/t=3/p=1（验证参数随哈希串自描述，旧哈希不受影响）
-- **媒体访问走短时效路径限定令牌** `/api/media/?mt=`（media_tokens 表，30 分钟，目录限定）；
-  会话 token 一律不进 URL 查询串
-- **回收站目录 `uploads/.trash`**（不在 uploads/tmp 内——24h 临时分片清扫只清白名单条目，
-  绝不触碰回收站）；MOVE 覆盖位移暂存 `uploads/.dav_disp`（启动恢复）
+- **敏感字段落库加密（v1.10 P0-3）**：AI API Key 经 ChaCha20-Poly1305 加密（`core::secrets`），
+  主密钥来自 `PINAS_MASTER_KEY`（hex）或 `<data_dir>/secret.key`（0600，自动生成）；
+  旧明文值读取兼容（无 enc:v1: 前缀原样返回），下次保存即升级；密钥文件损坏拒绝启动（防密文不可解）
 - **AI 端点双重限速**（5 分钟窗口 + 每日配额，本地时区日界，键定期清理）；分享匿名端点限速 + 每分享失败锁定；
   **api_base 深度校验**（https-only + 拒 IP/私网/重绑定域名后缀，写入与读取双侧）
+- **DNS 钉扎（v1.10 P0-1）**：AI 请求前真实解析 api_base 域名，任一结果落在
+  私网/环回/链路本地/CGNAT/文档网段即拒绝；客户端按 base 缓存 10 分钟并 `resolve()` 钉扎连接 IP
+  （SNI 仍为域名，证书校验不变）；禁止代理（绕过钉扎）
+- **会话双闸（v1.10 P0-2）**：绝对过期（7 天）+ 空闲超时（默认 24h，`PINAS_SESSION_IDLE_MINUTES`）；
+  中间件惰性刷新 last_active_at（≥5 分钟才写库），超时会话强制下线并定期清理
+- **X-Request-Id（v1.10 P1-2）**：所有响应携带请求 ID（沿用入站值），tracing span 注入
+  request_id 字段；dsh 反代读取扩展注入上游请求头
 - **Cookie 默认强制 Secure**（纯 HTTP 局域网需 PINAS_COOKIE_SECURE=false）
 
 ### 错误处理
@@ -252,15 +267,18 @@ MINECRAFT_PORT=25565
   离线仅静态壳/登录页兜底，HTMX 片段与页面离线不可用
 - 版本对齐：Cargo.toml → `/health` version；`?v=` 与 sw.js 预缓存 URL 严格一致（check-versions.sh 强制）
 
-### 已知边界与接受的残余风险（审计记录，2026-08）
+### 已知边界与接受的残余风险（审计记录，2026-08，v1.10 更新）
 - CSP script-src 保留 'unsafe-eval'（Alpine x-data 表达式编译 + htmx hx-on 依赖）；style-src 保留
-  'unsafe-inline'（动画延迟/进度条宽度等内联样式依赖）
-- api_base 校验为字符串级：任意合法域名仍可在请求时被 DNS 重绑定到私网（根治需请求时解析并钉扎 IP），
-  仅限用户自配 key 场景，全局 key 强制全局 base
-- AI API key 明文存 SQLite（user_settings/环境变量）；备份文件与 DB 同权限保护
-- 会话为绝对过期（默认 7 天），无空闲超时；分享失败锁定为内存态（重启清零）
+  'unsafe-inline'（动画延迟/进度条宽度等内联样式依赖）——**接受项**，移除需迁移 Alpine（收益不划算）
+- ~~api_base DNS 重绑定~~ **已根治（v1.10）**：请求时真实解析 + 任一私网地址即拒绝 + 连接 IP 钉扎；
+  残余：DNS 解析走系统解析器（可信），TLS 证书校验不变
+- ~~AI API key 明文存 SQLite~~ **已根治（v1.10）**：ChaCha20-Poly1305 加密落库；
+  残余：主密钥文件/环境变量与备份同权限保护（secret.key 0600，务必纳入备份——丢失即密文不可解）
+- ~~会话无空闲超时~~ **已根治（v1.10）**：绝对过期（7 天）+ 空闲超时（默认 24h）双闸；
+  分享失败锁定仍为内存态（重启清零）
 - upload_limit_mb 语义 = 全局 body limit（非单文件上限），单文件实际由配额约束；quota_mb=0 表示禁止上传
-- safe_join_sandbox 校验与后续文件操作之间理论上存在符号链接 swap 竞态（单可信用户家庭场景接受）
+- ~~符号链接 swap 竞态~~ **已根治（v1.10）**：openat2 内核级沙箱（RESOLVE_BENEATH）；
+  残余：绝对路径符号链接在沙箱内被整体拒绝（保守语义，比 std::fs 更严格）
 - 登录响应 JSON 回显会话 token（dsh-plugin-pinas Bearer 流程依赖）；页面 JS 不经手存储
 
 ### UI 规范（v1.5 起）
@@ -275,10 +293,11 @@ MINECRAFT_PORT=25565
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 51 个集成测试 + 17 个单元测试（含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
+- 81 个集成测试 + 25 个单元测试（数量以 CI 为准，本段为覆盖清单；含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
   子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义、AI 流式 503；
   v1.7 新增同名重传 409、重命名覆盖保护、中文多字节子树、回收站清扫豁免、FK 全连接、媒体令牌作用域、
-  分享爆破锁定、AI 配额、SSE 截断、带时间日程日历、HSTS 门控、大小写搜索等）
+  分享爆破锁定、AI 配额、SSE 截断、带时间日程日历、HSTS 门控、大小写搜索等；
+  v1.10 新增符号链接越界（读/写路径 4 项）、DNS 私网 IP 分类、密钥加解密往返、会话空闲超时、X-Request-Id）
 - 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署

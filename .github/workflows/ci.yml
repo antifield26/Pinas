@@ -38,6 +38,10 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      # P1-3：供应链治理——advisory（CVE/恶意包）+ 许可证 + yanked 版本
+      - name: cargo deny
+        uses: embiid/cargo-deny-action@v2
+
       # PWA 版本一致性（?v= 与 sw.js 预缓存清单严格对齐）——漏改即预缓存 miss
       - name: check-versions
         run: bash scripts/check-versions.sh
