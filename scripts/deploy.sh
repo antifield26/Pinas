@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ====== Antifield Cloud 部署脚本 (v1.8.3) ======
+# ====== Antifield Cloud 部署脚本 (v1.9.0) ======
 # 按 git HEAD 构建 → 部署到 ~/pinas → 记录版本 → 重启服务 → 验证
 # 用法: scripts/deploy.sh [--skip-build] [--allow-dirty]
 # 部署纪律：
@@ -7,6 +7,7 @@
 #     VERSION 文件与实际二进制对不上；默认拒绝，确需临时部署显式 --allow-dirty
 #   - 覆盖前自动备份现网二进制（pi_nas.bak.pre-{版本}），失败可回滚
 #   - systemd unit 的 Description 同步当前版本（/etc/systemd/system + 部署目录副本）
+#   v1.9.0：构建对齐 CI 加 RUSTFLAGS="-D warnings"；启动失败/健康探测失败自动回滚备份二进制
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,10 +31,10 @@ if [ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]; then
   echo "!! 警告: --allow-dirty 指定的脏树部署，产物不可复现"
 fi
 
-# 2. 构建
+# 2. 构建（与 CI 对齐：-D warnings 把警告当错误，防带警告产物上线）
 if [ "${1:-}" != "--skip-build" ]; then
-  echo "==> cargo build --release ..."
-  (cd "$PROJECT_DIR" && cargo build --release)
+  echo "==> cargo build --release (RUSTFLAGS=\"-D warnings\") ..."
+  (cd "$PROJECT_DIR" && RUSTFLAGS="-D warnings" cargo build --release)
 fi
 
 # 3. 停服务并部署（覆盖前备份现网二进制）
@@ -74,12 +75,48 @@ fi
 # 4. 记录部署版本(可复现溯源)
 echo "$VERSION commit=$COMMIT_SHA date=$COMMIT_DATE deployed=$(date '+%Y-%m-%d %H:%M:%S')" > "$DEPLOY_DIR/VERSION"
 
-# 5. 启动并验证
-sudo systemctl start "$SERVICE"
-sleep 2
-HEALTH="$(curl -s -m 5 http://localhost:3000/health || true)"
+# 5. 启动并验证（失败自动回滚到部署前备份）
+rollback() {
+  local reason="$1"
+  local bak="$DEPLOY_DIR/pi_nas.bak.pre-${VERSION}"
+  echo "==> 🔙 部署失败($reason)，开始回滚..."
+  if [ ! -f "$bak" ]; then
+    echo "!! ❌ 无回滚备份 $bak，无法回滚" >&2
+    return 1
+  fi
+  sudo cp "$bak" "$DEPLOY_DIR/pi_nas"
+  sudo chmod +x "$DEPLOY_DIR/pi_nas"
+  echo "==> 已回滚二进制: $bak → $DEPLOY_DIR/pi_nas"
+  sudo systemctl restart "$SERVICE"
+  local rhealth
+  rhealth="$(curl -s -m 5 http://localhost:3000/health || true)"
+  echo "==> 回滚后 /health: $rhealth"
+  # 回滚后进程存活且健康即视为回滚成功（不再校验旧版本号串）
+  if sudo systemctl is-active --quiet "$SERVICE" && echo "$rhealth" | grep -q .; then
+    echo "==> ✅ 已回滚并恢复服务 (systemd active)"
+    return 0
+  fi
+  echo "!! ❌ 回滚后服务仍异常: journalctl -u $SERVICE -n 50" >&2
+  return 1
+}
+
+echo "==> 启动并验证..."
+# start 失败（非零）→ 回滚；成功后再探 /health，3 秒内任一次探测不带当前版本号 → 回滚
+if ! sudo systemctl start "$SERVICE"; then
+  rollback "systemctl start 返回非零" || { echo "!! ❌ 回滚失败，退出"; exit 1; }
+  exit 0
+fi
+
+HEALTH=""
+for i in 1 2 3; do
+  sleep 1
+  HEALTH="$(curl -s -m 5 http://localhost:3000/health || true)"
+  if echo "$HEALTH" | grep -q "$VERSION"; then break; fi
+done
 echo "==> /health: $HEALTH"
 case "$HEALTH" in
   *"$VERSION"*) echo "==> ✅ 部署成功 ($VERSION)";;
-  *) echo "==> ❌ 健康检查异常,请查看: journalctl -u $SERVICE -n 50"; exit 1;;
+  *) echo "==> /health 3 秒内未带版本号 $VERSION，触发回滚";
+     rollback "health 探测失败" || { echo "!! ❌ 回滚失败，退出"; exit 1; };
+     exit 0;;
 esac

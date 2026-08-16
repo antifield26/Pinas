@@ -23,7 +23,30 @@ fn reject_no_token(uri_path: &str) -> Result<Response, StatusCode> {
     Ok(Redirect::to(&login_url).into_response())
 }
 
+/// 认证策略（P1-9 修复）：中间件的豁免能力按路由集显式声明，而非在中间件内
+/// 写死路径前缀——历史实现把 `/s/` 豁免写死在 auth_middleware 内，导致 dsh 反代
+/// 路由（`/{*path}` 全匹配）上的未认证 `/s/*` 请求被放行后因缺少 UserSession
+/// 扩展而 500（可演变为认证绕过）。现在：
+///   - 主路由：share_paths_public=true（/s/ 分享页走公开路由，中间件不拦截）、
+///     allow_media_token=true（媒体播放走短时效路径令牌）
+///   - dsh 路由：全 false——严格 admin 会话门禁，任何路径都不豁免
+#[derive(Clone, Copy, Debug)]
+pub struct AuthPolicy {
+    pub share_paths_public: bool,
+    pub allow_media_token: bool,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self {
+            share_paths_public: true,
+            allow_media_token: true,
+        }
+    }
+}
+
 pub async fn auth_middleware(
+    axum::extract::State(policy): axum::extract::State<AuthPolicy>,
     Extension(pool): Extension<sqlx::SqlitePool>,
     Extension(config): Extension<crate::config::Config>,
     mut req: Request,
@@ -31,7 +54,7 @@ pub async fn auth_middleware(
 ) -> Result<impl IntoResponse, StatusCode> {
     let uri_path = req.uri().path();
 
-    if uri_path.starts_with("/s/") {
+    if policy.share_paths_public && uri_path.starts_with("/s/") {
         return Ok(next.run(req).await);
     }
 
@@ -71,7 +94,8 @@ pub async fn auth_middleware(
 
     // /api/media/* 无 Cookie/Header 时走短时效路径限定媒体令牌（mt）。
     // 会话 token 不再接受 URL 查询串（完整会话凭证进日志/历史的风险已被媒体令牌取代）
-    if target_token.is_none()
+    if policy.allow_media_token
+        && target_token.is_none()
         && uri_path.starts_with("/api/media/")
         && let Some(mt) = extract_query_param(&req, "mt")
         && !mt.is_empty()
@@ -93,10 +117,16 @@ pub async fn auth_middleware(
             Some(row) => {
                 // 路径限定：令牌只能访问其签发路径前缀之下的资源（边界感知，防 "dir" 匹配 "dir2"）
                 let path_prefix: String = row.get("path_prefix");
-                let media_path = uri_path
-                    .strip_prefix("/api/media/")
-                    .unwrap_or_default()
-                    .trim_start_matches('/');
+                // P2-1：按解码后的路径逐段比较——uri.path() 是原始百分号编码，
+                // 而 media_proxy 经 axum Path<String> 拿到解码后的路径；两者不一致
+                // 会造成令牌作用域判定歧义。解码后比较与 handler 语义对齐
+                // （解码出现的 `..` 由 handler 的 safe_join_sandbox + openat2 沙箱拒绝，fail-closed）。
+                let media_path = pct_decode(
+                    uri_path
+                        .strip_prefix("/api/media/")
+                        .unwrap_or_default()
+                        .trim_start_matches('/'),
+                );
                 let prefix = path_prefix.trim_start_matches('/').trim_end_matches('/');
                 let within = if prefix.is_empty() {
                     true
@@ -207,4 +237,26 @@ pub async fn auth_middleware(
         must_change_pwd,
     });
     Ok(next.run(req).await)
+}
+
+/// 最小 percent-decode（RFC 3986）：仅解码 `%XX` 序列，其余字节原样保留。
+/// 用于把原始 uri.path() 对齐到 axum Path 提取器解码后的语义（P2-1）。
+/// 非法/截断的 % 序列按字面保留（fail-closed：不会放宽路径限定）。
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

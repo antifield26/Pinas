@@ -58,12 +58,16 @@ async fn test_app_with_config(config: Config) -> (SqlitePool, axum::Router) {
 
 /// 辅助函数：通过 JSON body 发送 POST 请求
 fn post_json(uri: &str, body: &str) -> Request<Body> {
-    Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
+        .header("content-type", "application/json");
+    if uri == "/api/login" {
+        // P2-4：响应 token 仅回显给显式 Authorization: Bearer 请求方——
+        // 测试统一按 dsh-plugin-pinas 的 Bearer 语义登录（其余场景走 HttpOnly Cookie）
+        builder = builder.header("authorization", "Bearer test-client");
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
 }
 
 /// 辅助函数：发送带 Bearer token 的 GET 请求
@@ -1116,13 +1120,21 @@ async fn register_and_login_with_username(app: &axum::Router) -> (String, String
         .unwrap();
     assert!(resp.status().is_success(), "注册失败: {}", resp.status());
 
-    // 登录
+    // 登录（带 Authorization: Bearer 头——P2-4 起响应 token 仅回显给显式 Bearer 请求方）
     let resp = app
         .clone()
-        .oneshot(post_json(
-            "/api/login",
-            &format!(r#"{{"username":"{}","password":"testpass123"}}"#, username),
-        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-client")
+                .body(Body::from(format!(
+                    r#"{{"username":"{}","password":"testpass123"}}"#,
+                    username
+                )))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();

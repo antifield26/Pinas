@@ -181,7 +181,11 @@ pub fn build_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         .route("/todos/{id}", delete(handlers::todos_delete_fragment))
         .route("/todos/form", get(handlers::todos_empty_form))
         .route("/todos/form/{id}", get(handlers::todos_edit_form))
-        .layer(middleware::from_fn(crate::core::auth::auth_middleware));
+        // P1-9：认证策略显式声明（主路由：分享页公开 + 媒体令牌可用）
+        .layer(middleware::from_fn_with_state(
+            crate::core::auth::AuthPolicy::default(),
+            crate::core::auth::auth_middleware,
+        ));
 
     // --- WebDAV 路由（独立 Basic 认证，不走 cookie auth_middleware） ---
     // 路由级 body limit 覆盖全局 100MB：WebDAV PUT 大文件流式落盘

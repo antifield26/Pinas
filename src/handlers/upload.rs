@@ -10,7 +10,7 @@ use crate::core::UserSession;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{
     bytes_to_mb_ceil, is_allowed_mime, is_allowed_mime_streaming_sandbox, is_blocked_extension,
-    log_audit, user_dir_path,
+    log_audit,
 };
 
 // --- DTOs ---
@@ -187,21 +187,57 @@ pub async fn upload_chunk(
     }
     validate_identifier(&params.identifier)?;
 
-    // 分片阶段磁盘上限：未合并分片累计 + 本片上限 > 5GB 时拒绝（防临时分片耗尽磁盘）
+    // 分片阶段磁盘上限（P1-4 原子化）：预检 + 预留并入同一写事务——
+    // 历史实现「SELECT SUM 预检」与「写盘后累加」分离，并发请求可同时通过预检
+    // 导致临时分片无限膨胀（5GB 上限形同虚设，系统盘 DoS）。
+    // 现在：抢写锁 → 串行快照下预检 → 通过即按单片上限预留计数；写盘后按实际
+    // 校正（-prev -MAX +actual），失败路径撤销预留（-prev -MAX，文件已删）。
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::internal_log("开启分片配额事务", e))?;
+    // 抢占写锁：deferred 事务先读后写会锁升级竞态，空 UPDATE 直接拿写锁，
+    // 保证 SUM 读到的是本事务线性化点之后的串行快照（并行请求在此排队）
+    sqlx::query("UPDATE upload_chunks SET bytes_received = bytes_received WHERE username = ?")
+        .bind(&session.username)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::internal_log("分片配额写锁", e))?;
     let pending_bytes: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(bytes_received), 0) FROM upload_chunks WHERE username = ?",
     )
     .bind(&session.username)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
-    .unwrap_or(0);
+    .map_err(|e| AppError::internal_log("查询分片占用", e))?;
     if pending_bytes as u64 + crate::constants::MAX_CHUNK_SIZE_BYTES
         > crate::constants::PENDING_CHUNKS_CAP_BYTES
     {
+        let _ = tx.rollback().await;
         return Err(AppError::too_many_requests(
             "临时分片存储超限，请先完成合并或等待清理",
         ));
     }
+    // 登记总片数 + 预留单片上限（写盘后按实际校正；失败路径撤销）
+    let _ = sqlx::query(
+        "INSERT OR IGNORE INTO upload_chunks (username, identifier, total_chunks) VALUES (?, ?, ?)",
+    )
+    .bind(&session.username)
+    .bind(&params.identifier)
+    .bind(params.total_chunks)
+    .execute(&mut *tx)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE upload_chunks SET bytes_received = bytes_received + ? WHERE username = ? AND identifier = ?",
+    )
+    .bind(crate::constants::MAX_CHUNK_SIZE_BYTES as i64)
+    .bind(&session.username)
+    .bind(&params.identifier)
+    .execute(&mut *tx)
+    .await;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::internal_log("分片配额预留提交", e))?;
 
     // 确保临时目录存在（H2：按用户隔离——历史实现全局共享 tmp/{identifier}，
     // 低权限用户可窃取/污染他人未合并上传、抢占 merge）
@@ -301,23 +337,15 @@ pub async fn upload_chunk(
         return Err(AppError::forbidden("非法执行文件伪装漏洞防护阻断"));
     }
 
-    // 记录总分数（若不存在则插入）
+    // 校正预留（P1-4）：预留按单片上限计入，写盘完成后替换为实际字节。
+    // 公式：SUM -= prev（旧贡献，重传覆盖场景——旧大小已在写盘前计入 SUM）
+    //     − MAX（撤销预留）+ actual（本次实际写盘）→ 净占用量精确反映磁盘
+    // 同索引重传先截断再写：prev_chunk_len 在截断之前读取（H1）。
     let _ = sqlx::query(
-        "INSERT OR IGNORE INTO upload_chunks (username, identifier, total_chunks) VALUES (?, ?, ?)",
-    )
-    .bind(&session.username)
-    .bind(&params.identifier)
-    .bind(params.total_chunks)
-    .execute(&pool)
-    .await;
-
-    // 累计分片字节（磁盘上限/配额核算依据）。
-    // 同索引重传（断点重试/覆盖）会先截断再写：必须减去该片旧大小再累加新值，
-    // 否则重复计入导致 5GB 上限被提前触发。prev_chunk_len 在截断之前读取（H1）。
-    let _ = sqlx::query(
-        "UPDATE upload_chunks SET bytes_received = MAX(0, bytes_received - ? + ?) WHERE username = ? AND identifier = ?",
+        "UPDATE upload_chunks SET bytes_received = MAX(0, bytes_received - ? - ? + ?) WHERE username = ? AND identifier = ?",
     )
     .bind(prev_chunk_len)
+    .bind(crate::constants::MAX_CHUNK_SIZE_BYTES as i64)
     .bind(total_written as i64)
     .bind(&session.username)
     .bind(&params.identifier)
@@ -362,13 +390,14 @@ async fn rollback_chunk_counter(
     chunk_index: i32,
     prev_len: i64,
 ) {
-    if prev_len <= 0 {
-        return;
-    }
+    // 撤销预留 + 旧贡献：分片文件已删除，磁盘贡献归零。
+    // 预留按单片上限（MAX_CHUNK_SIZE_BYTES）计入（P1-4 预检原子化），
+    // prev_len 为该片截断前的旧大小（SUM 中仍含）——两者一并扣回。
+    let removed = crate::constants::MAX_CHUNK_SIZE_BYTES as i64 + prev_len.max(0);
     let _ = sqlx::query(
         "UPDATE upload_chunks SET bytes_received = MAX(0, bytes_received - ?) WHERE username = ? AND identifier = ?",
     )
-    .bind(prev_len)
+    .bind(removed)
     .bind(username)
     .bind(identifier)
     .execute(pool)
@@ -487,7 +516,8 @@ pub async fn merge_chunks(
         }
     }
 
-    let parent_path = user_dir_path(Some(payload.parent_path));
+    // P0-1：parent 逐段白名单校验（拒绝 `..` 跨用户路径；target_rel 随后仍过沙箱兜底）
+    let parent_path = crate::handlers::utils::validate_rel_path(&payload.parent_path)?;
     // 目标目录可能尚未登记(文件夹上传到新子目录)：物理目录随后 create_dir_all,这里先补插目录行
     crate::handlers::file_ops::ensure_dir_rows(&pool, username, &parent_path).await?;
     let _base_path = std::path::Path::new(crate::constants::UPLOADS_DIR);

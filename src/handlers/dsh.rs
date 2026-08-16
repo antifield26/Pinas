@@ -546,7 +546,14 @@ pub fn build_dsh_router(config: Config, pool: sqlx::SqlitePool) -> Router {
         // 防大附件/文档上传被 413 卡死（L8）
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         // 后加的 layer 先执行：gate(外层) → auth_middleware(内层) → handler
-        .layer(middleware::from_fn(auth_middleware))
+        // P1-9：dsh 路由严格门禁——share/媒体令牌路径一律不豁免，仅认 admin 会话
+        .layer(middleware::from_fn_with_state(
+            crate::core::auth::AuthPolicy {
+                share_paths_public: false,
+                allow_media_token: false,
+            },
+            auth_middleware,
+        ))
         .layer(middleware::from_fn(dsh_auth_gate))
         .layer(Extension(pool))
         .layer(Extension(config))

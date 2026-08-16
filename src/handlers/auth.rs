@@ -123,19 +123,24 @@ fn should_secure_cookie(config: &Config) -> bool {
 /// - 直连(对端非回环):忽略一切客户端头,用真实对端 IP —— 杜绝伪造 X-Forwarded-For 绕过限速
 /// - 回环(cloudflared 本地隧道):信任 CF-Connecting-IP > X-Real-IP > X-Forwarded-For 最左侧。
 ///   **信任边界（审计记录）**：回环=本地进程信任域——本机任何进程都能伪造这些头，
-///   远程攻击者无法直接触达回环端口（3000 仅被 cloudflared 本地接入）。若未来有
-///   低权限本机多租户，需收敛为仅信任来自 CF 边缘 IP 段的 CF-Connecting-IP
+///   远程攻击者无法直接触达回环端口（3000 仅被 cloudflared 本地接入）。
+///   P2-3 收敛：仅信任 `cf-connecting-ip`（Cloudflare 边缘权威注入、cloudflared 本地
+///   透传的标准头）且值必须可解析为 IP；`x-real-ip`/`x-forwarded-for` 并非 cloudflared
+///   标准头、可被任意回环进程伪造，不再作为回环信任源（关闭伪造头清零限速的通道）。
 /// - 无 ConnectInfo(测试场景):回退信任头,无头则 None(调用方按用户名限速)
 pub fn extract_ip(peer_ip: Option<std::net::IpAddr>, headers: &HeaderMap) -> Option<String> {
     match peer_ip {
         Some(ip) if !ip.is_loopback() => return Some(ip.to_string()),
         Some(_) => {
-            for name in ["cf-connecting-ip", "x-real-ip", "x-forwarded-for"] {
-                if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
-                    let first = v.split(',').map(|s| s.trim()).find(|s| !s.is_empty());
-                    if let Some(ip) = first {
-                        return Some(ip.to_string());
-                    }
+            if let Some(v) = headers
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+            {
+                let first = v.split(',').map(|s| s.trim()).find(|s| !s.is_empty());
+                if let Some(ip) = first
+                    && ip.parse::<std::net::IpAddr>().is_ok()
+                {
+                    return Some(ip.to_string());
                 }
             }
             return Some("loopback".to_string());
@@ -270,10 +275,24 @@ pub async fn login(
                 secure_flag
             );
 
+            // P2-4：明文会话 token 仅回显给显式 Bearer 请求方（dsh-plugin-pinas 凭
+            // Authorization: Bearer 登录的流程依赖）；浏览器表单登录用 HttpOnly Cookie，
+            // 响应不回显 token——页面侧 XSS 时 cookie 不可读、token 也不可得（纵深防御）。
+            // 若未来页面 JS 确实需要 token，应改用独占的只读令牌而非会话 token。
+            let wants_bearer = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.starts_with("Bearer "))
+                .unwrap_or(false);
+
             let mut resp = (
                 StatusCode::OK,
                 Json(LoginResponse {
-                    token: token.clone(),
+                    token: if wants_bearer {
+                        token.clone()
+                    } else {
+                        String::new()
+                    },
                     username: payload.username,
                     role,
                     must_change_pwd: must_change,
@@ -438,15 +457,29 @@ pub async fn change_password(
         _ => return (StatusCode::UNAUTHORIZED, "未登录").into_response(),
     };
 
-    // 从 session 获取 username
+    // 从 session 获取 username（P2-5：与 auth_middleware 双闸一致——绝对过期 + 空闲超时，
+    // 空闲超时的会话视为已下线；DB 错误如实记录而非吞成 401）
     let token_hash = hash_token(&current_token);
-    let username: Option<String> = sqlx::query_scalar(
-        "SELECT username FROM sessions WHERE token = ? AND expires_at > datetime('now')",
+    let idle_mod = format!("-{} minutes", config.session_idle_minutes.max(1));
+    let username: Option<String> = match sqlx::query_scalar(
+        "SELECT username FROM sessions WHERE token = ? AND expires_at > datetime('now') \
+         AND (last_active_at IS NULL OR last_active_at >= datetime('now', ?))",
     )
     .bind(&token_hash)
+    .bind(&idle_mod)
     .fetch_optional(&pool)
     .await
-    .unwrap_or(None);
+    {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!("[Auth] 改密会话查询失败: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "服务器内部错误，请稍后重试",
+            )
+                .into_response();
+        }
+    };
 
     let username = match username {
         Some(u) => u,

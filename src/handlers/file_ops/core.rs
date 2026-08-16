@@ -51,24 +51,30 @@ pub(crate) async fn reconcile_files_on_disk(
     rows: &[(String, String, bool)], // (name, parent_path, is_dir)
 ) -> std::collections::HashSet<(String, String)> {
     use std::collections::HashSet;
+    // P2-16：循环外建一次沙箱（复用实例），避免每行重复 create_dir_all + 初始化
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(sb) => sb,
+        // 沙箱初始化失败（目录不可用）视为全部不存在，交由调用方清理 DB 记录
+        Err(_) => {
+            tracing::error!("[文件同步] uploads 目录不可用，跳过对账");
+            return std::collections::HashSet::new();
+        }
+    };
     let username_owned = username.to_string();
     let owned: Vec<(String, String, bool)> = rows.to_vec();
     let checks = owned.into_iter().map(move |(name, parent_path, is_dir)| {
         let username = username_owned.clone();
+        let sb = sb.clone();
         async move {
             let rel = user_file_path(&username, &parent_path, &name);
-            let exists = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
-                Ok(sb) => match sb.metadata(&rel) {
-                    Ok(meta) => {
-                        if is_dir {
-                            meta.is_dir()
-                        } else {
-                            meta.is_file()
-                        }
+            let exists = match sb.metadata(&rel) {
+                Ok(meta) => {
+                    if is_dir {
+                        meta.is_dir()
+                    } else {
+                        meta.is_file()
                     }
-                    Err(_) => false,
-                },
-                // 沙箱初始化失败（目录不可用）视为不存在，交由调用方清理 DB 记录
+                }
                 Err(_) => false,
             };
             ((name, parent_path), exists)
@@ -343,9 +349,13 @@ pub(crate) async fn rename_core(
     if old_name == new_name {
         return Ok(());
     }
+    // P0-1/P0-2：parent 与源名必须过白名单——`..` parent 可跨用户（openat2 BENEATH
+    // 允许根内 `..` 解析），源名 `..` 可把整棵用户子树移走
+    let parent = crate::handlers::utils::validate_rel_path(parent)?;
+    crate::handlers::utils::validate_name(old_name)?;
     crate::handlers::utils::validate_name(new_name)?;
-    let old_rel = user_file_path(username, parent, old_name);
-    let new_rel = user_file_path(username, parent, new_name);
+    let old_rel = user_file_path(username, &parent, old_name);
+    let new_rel = user_file_path(username, &parent, new_name);
     let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
         .map_err(|e| AppError::internal_log("打开沙箱", e))?;
 
@@ -356,7 +366,7 @@ pub(crate) async fn rename_core(
     )
     .bind(username)
     .bind(new_name)
-    .bind(parent)
+    .bind(&parent)
     .fetch_one(pool)
     .await
     .unwrap_or(true); // DB 异常时保守拒绝，绝不冒险覆盖
@@ -364,8 +374,8 @@ pub(crate) async fn rename_core(
         return Err(AppError::conflict("目标名称已存在，请先移动或删除"));
     }
 
-    let old_logical = logical_path(parent, old_name);
-    let new_logical = logical_path(parent, new_name);
+    let old_logical = logical_path(&parent, old_name);
+    let new_logical = logical_path(&parent, new_name);
     let jid =
         crate::handlers::journal::insert(pool, username, "rename", &old_logical, &new_logical)
             .await?;
@@ -405,8 +415,12 @@ pub(crate) async fn move_core(
     if src_parent == dst_parent {
         return Ok(());
     }
-    let src_rel = user_file_path(username, src_parent, name);
-    let dst_rel = user_file_path(username, dst_parent, name);
+    // P0-1/P0-2：src/dst parent 与源名必须过白名单（见 rename_core 注释）
+    let src_parent = crate::handlers::utils::validate_rel_path(src_parent)?;
+    let dst_parent = crate::handlers::utils::validate_rel_path(dst_parent)?;
+    crate::handlers::utils::validate_name(name)?;
+    let src_rel = user_file_path(username, &src_parent, name);
+    let dst_rel = user_file_path(username, &dst_parent, name);
     let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
         .map_err(|e| AppError::internal_log("打开沙箱", e))?;
 
@@ -416,7 +430,7 @@ pub(crate) async fn move_core(
     )
     .bind(username)
     .bind(name)
-    .bind(dst_parent)
+    .bind(&dst_parent)
     .fetch_one(pool)
     .await
     .unwrap_or(true);
@@ -425,8 +439,8 @@ pub(crate) async fn move_core(
     }
 
     // 意图日志先行（M1）：崩溃后启动重放补齐
-    let src_logical = logical_path(src_parent, name);
-    let dst_logical = logical_path(dst_parent, name);
+    let src_logical = logical_path(&src_parent, name);
+    let dst_logical = logical_path(&dst_parent, name);
     let jid = crate::handlers::journal::insert(pool, username, "move", &src_logical, &dst_logical)
         .await?;
 
@@ -465,8 +479,10 @@ pub(crate) async fn delete_to_trash(
     // 字符串级第一道闸：拒绝 "." / ".." / 路径分隔符（openat2 的 BENEATH 允许
     // 沙箱内 ".." 解析，此处必须先行拦截，防止 "admin/.." 指向整个 uploads 根）
     crate::handlers::utils::validate_name(name)?;
-    let full = logical_path(parent_path, name);
-    let rel = user_file_path(username, parent_path, name);
+    // P0-1：parent 同样必须过白名单（".." parent 可把受害者文件移入本用户回收站）
+    let parent_path = crate::handlers::utils::validate_rel_path(parent_path)?;
+    let full = logical_path(&parent_path, name);
+    let rel = user_file_path(username, &parent_path, name);
     let trash_uuid = Uuid::new_v4().to_string();
     let trash_rel = format!(".trash/{trash_uuid}");
     let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
@@ -488,15 +504,18 @@ pub(crate) async fn delete_to_trash(
         }
 
         let db_result = async {
-            let _ = sqlx::query(
-                "INSERT INTO trash (username, original_path, trash_uuid) VALUES (?, ?, ?)",
-            )
-            .bind(username)
-            .bind(&full)
-            .bind(&trash_uuid)
-            .execute(pool)
-            .await?;
-            db_delete_file_rows(pool, username, parent_path, name).await
+            // P1-10：trash 登记 + files 删除（父行+子行）包入单一事务——任一步失败整体回滚，
+            // 消除「trash 行已写、files 行残留」的崩溃半状态（fs_journal 仍作为最终兜底）
+            let mut tx = pool.begin().await?;
+            sqlx::query("INSERT INTO trash (username, original_path, trash_uuid) VALUES (?, ?, ?)")
+                .bind(username)
+                .bind(&full)
+                .bind(&trash_uuid)
+                .execute(&mut *tx)
+                .await?;
+            db_delete_file_rows_tx(&mut tx, username, &parent_path, name).await?;
+            tx.commit().await?;
+            Ok(())
         }
         .await;
 
@@ -509,7 +528,7 @@ pub(crate) async fn delete_to_trash(
         crate::handlers::journal::remove(pool, jid).await;
     } else {
         // 物理不存在：仅清理 DB 行（纯 DB 操作，天然原子，无需日志）
-        db_delete_file_rows(pool, username, parent_path, name).await?;
+        db_delete_file_rows(pool, username, &parent_path, name).await?;
     }
     Ok(())
 }
@@ -523,12 +542,25 @@ pub(crate) async fn db_delete_file_rows(
     parent_path: &str,
     name: &str,
 ) -> Result<(), AppError> {
+    let mut tx = pool.begin().await?;
+    db_delete_file_rows_tx(&mut tx, username, parent_path, name).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// db_delete_file_rows 的事务内变体（delete_to_trash 等需与其它写操作同事务时使用）
+pub(crate) async fn db_delete_file_rows_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    username: &str,
+    parent_path: &str,
+    name: &str,
+) -> Result<(), AppError> {
     use crate::db::queries::escape_like;
     sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
         .bind(username)
         .bind(name)
         .bind(parent_path)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     let child_prefix = if parent_path.is_empty() {
         format!("{}/%", escape_like(name))
@@ -538,7 +570,7 @@ pub(crate) async fn db_delete_file_rows(
     let _ = sqlx::query("DELETE FROM files WHERE username = ? AND parent_path LIKE ? ESCAPE '\\'")
         .bind(username)
         .bind(&child_prefix)
-        .execute(pool)
+        .execute(&mut **tx)
         .await;
     Ok(())
 }

@@ -1,5 +1,5 @@
 // ====== Antifield Cloud (Pi-NAS) ======
-// 自托管 NAS 网盘 + AI 助手
+// 自托管 NAS 网盘（内置 AI Chat 已于 v1.11 移除；AI 能力收敛到 dsh 反代 + dsh-plugin-pinas）
 // 入口点：配置加载、日志初始化、数据库启动、路由注册、后台任务
 
 use pi_nas::config::Config;

@@ -21,7 +21,9 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     // Content-Security-Policy
     // script-src（H8 收敛）：'unsafe-inline' 已移除——全部业务脚本外置于 /assets/app.js，
     // 内联事件处理器全部 data-* 委托；仅两处 head 主题预涂脚本（防闪白必需）内联，
-    // 经 sha256 哈希放行（哈希 = 脚本逐字节精确值，模板改动需同步更新并跑回归测试）。
+    // 经 sha256 哈希放行（哈希 = 脚本 innerText 逐字节精确值，模板改动需同步更新并跑回归测试）。
+    //   第一哈希 e9AA… → templates/base.html 主题预涂脚本
+    //   第二哈希 V1ON… → templates/partials/theme_head.html 独立页暗色预涂脚本
     // 'unsafe-eval' 保留：Alpine x-data 表达式编译与 htmx hx-on 求值依赖。
     // style-src 'unsafe-inline' 保留：动画延迟/进度条宽度等内联样式依赖。
     headers.insert(
@@ -30,7 +32,7 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
             "default-src 'self'; \
              script-src 'self' 'unsafe-eval' \
                'sha256-e9AA0UHheOX1XAtrSv68GkyqcYbpzWeof+Mi19hqhkE=' \
-               'sha256-fUQGwXEX59qhgqt5aIHkIEfspFhSo+izvQWS1OC/K5s='; \
+               'sha256-V1ONiGmI3S/fo/iVTzDdp1MvwZTNDqZJWdZu1ok6Ees='; \
              style-src 'self' 'unsafe-inline'; \
              img-src 'self' data: blob:; \
              media-src 'self' blob:; \

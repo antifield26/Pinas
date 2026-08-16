@@ -11,6 +11,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::core::UserSession;
+use crate::core::hash_token;
 use crate::error::{AppError, AppResult};
 use crate::handlers::utils::{hash_password, log_audit, safe_join_sandbox, verify_password};
 
@@ -28,17 +29,20 @@ static SHARE_FAILED: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> =
 const SHARE_MAX_FAILURES: u32 = 5;
 const SHARE_LOCKOUT_SECS: u64 = 15 * 60;
 
-async fn share_check_locked(code: &str) -> bool {
+/// 每 (IP, 分享) 密码失败尝试锁定：同一 IP 对同一分享 5 次错误密码 → 锁定 15 分钟。
+/// P1-5 修复：键为 `IP|code` 组合——历史实现按 code 跨 IP 共享计数，任意 IP 错 5 次
+/// 即可令一个合法分享对所有访问者锁定（轻量 DoS）；按 IP 维度后攻击者只能锁住自己。
+async fn share_check_locked(key: &str) -> bool {
     let map = SHARE_FAILED.lock().await;
-    match map.get(code) {
+    match map.get(key) {
         Some((n, t)) => *n >= SHARE_MAX_FAILURES && t.elapsed().as_secs() < SHARE_LOCKOUT_SECS,
         None => false,
     }
 }
 
-async fn share_record_failure(code: &str) {
+async fn share_record_failure(key: &str) {
     let mut map = SHARE_FAILED.lock().await;
-    let entry = map.entry(code.to_string()).or_insert((0, Instant::now()));
+    let entry = map.entry(key.to_string()).or_insert((0, Instant::now()));
     if entry.1.elapsed().as_secs() >= SHARE_LOCKOUT_SECS {
         // 锁定期已过：重新计数
         *entry = (1, Instant::now());
@@ -47,8 +51,13 @@ async fn share_record_failure(code: &str) {
     }
 }
 
-async fn share_clear_failures(code: &str) {
-    SHARE_FAILED.lock().await.remove(code);
+async fn share_clear_failures(key: &str) {
+    SHARE_FAILED.lock().await.remove(key);
+}
+
+/// 构造失败锁定的组合键（IP|code）
+fn share_lock_key(rate_key: &str, code: &str) -> String {
+    format!("{}|{}", rate_key, code)
 }
 
 // --- DTOs ---
@@ -63,6 +72,9 @@ pub struct CreateShareRequest {
 #[derive(Deserialize)]
 pub struct AccessShareRequest {
     pub password: Option<String>,
+    /// P2-9：一次性下载令牌（分享页密码验证通过后签发，替代明文密码进 URL）
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -200,10 +212,39 @@ pub async fn access_share(
     let db_password: Option<String> = row.get("password");
     let expires_at: Option<String> = row.get("expires_at");
 
-    // 密码校验（有密码的分享必须验证）
-    if let Some(pwd_hash) = db_password {
-        // 该分享已被连续错误尝试锁定
-        if share_check_locked(&code).await {
+    // P2-9：一次性下载令牌优先——分享页密码验证通过后签发，命中即视为已验证并删除
+    // （一次性）；失败走密码流程。顺带清理该分享的过期令牌（防表膨胀）
+    let mut token_ok = false;
+    if let Some(tk) = params.token.as_deref().filter(|t| !t.is_empty()) {
+        let tk_hash = hash_token(tk);
+        let valid: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM share_tokens WHERE token_hash = ? AND share_code = ? AND expires_at > datetime('now')",
+        )
+        .bind(&tk_hash)
+        .bind(&code)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if valid > 0 {
+            let _ = sqlx::query("DELETE FROM share_tokens WHERE token_hash = ?")
+                .bind(&tk_hash)
+                .execute(&pool)
+                .await;
+            token_ok = true;
+        }
+        let _ = sqlx::query(
+            "DELETE FROM share_tokens WHERE share_code = ? AND expires_at < datetime('now')",
+        )
+        .bind(&code)
+        .execute(&pool)
+        .await;
+    }
+
+    // 密码校验（有密码的分享必须验证；一次性令牌已通过则跳过）
+    if !token_ok && let Some(pwd_hash) = db_password {
+        // 该 (IP, 分享) 已被连续错误尝试锁定
+        let lock_key = share_lock_key(&rate_key, &code);
+        if share_check_locked(&lock_key).await {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 "尝试次数过多，分享已临时锁定",
@@ -217,10 +258,10 @@ pub async fn access_share(
                 .await
                 .unwrap_or(false);
         if !is_valid {
-            share_record_failure(&code).await;
+            share_record_failure(&lock_key).await;
             return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
         }
-        share_clear_failures(&code).await;
+        share_clear_failures(&lock_key).await;
     }
 
     // 过期校验
@@ -295,7 +336,9 @@ struct SharePage {
     file_count: usize,
     is_dir: bool,
     password_required: bool,
-    password: String,
+    /// P2-9：密码验证通过后签发的一次性下载令牌（访问接口接受 token 而非明文密码）。
+    /// 无密码分享为空串（下载链接不带查询参数即可访问）
+    download_token: String,
 }
 
 pub async fn share_page(
@@ -349,8 +392,9 @@ pub async fn share_page(
     // If password protected and wrong/missing password, show password form
     // Use spawn_blocking for Argon2 verification to avoid blocking async runtime
     let pwd_ok = if password_required {
-        // 该分享已被连续错误尝试锁定
-        if share_check_locked(code).await {
+        // 该 (IP, 分享) 已被连续错误尝试锁定
+        let lock_key = share_lock_key(&rate_key, code);
+        if share_check_locked(&lock_key).await {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 "尝试次数过多，分享已临时锁定",
@@ -363,14 +407,14 @@ pub async fn share_page(
             .await
             .unwrap_or(false);
         if ok {
-            share_clear_failures(code).await;
+            share_clear_failures(&lock_key).await;
         } else {
-            share_record_failure(code).await;
+            share_record_failure(&lock_key).await;
         }
         ok
     } else {
         true
-    };
+    }; // If password protected and wrong/missing password, show password form
     if password_required && !pwd_ok {
         return AppTemplate(SharePage {
             share_id: share_id.clone(),
@@ -379,10 +423,18 @@ pub async fn share_page(
             file_count: 0,
             is_dir: false,
             password_required: true,
-            password: String::new(),
+
+            download_token: String::new(),
         })
         .into_response();
     }
+
+    // P2-9：密码验证通过 → 签发一次性下载令牌（下载链接带 token 而非明文密码）
+    let download_token = if password_required {
+        issue_share_token(&pool, code).await
+    } else {
+        String::new()
+    };
 
     // Check if it's a directory（真实路径 = uploads/{owner}/{file_path}，与 share_subfile 一致）
     let base = std::path::Path::new(crate::constants::UPLOADS_DIR);
@@ -428,9 +480,38 @@ pub async fn share_page(
         file_count,
         is_dir,
         password_required: false,
-        password: submitted_password,
+
+        download_token,
     })
     .into_response()
+}
+
+/// 签发一次性分享下载令牌（30 分钟有效）：token 只以哈希落库，页面仅持有明文，
+/// access_share 校验通过即删除（一次性）。失败返回空串（调用方退化为不带 token 渲染，
+/// 用户仍可用密码直接访问下载端点）
+async fn issue_share_token(pool: &sqlx::SqlitePool, share_code: &str) -> String {
+    let token = Uuid::new_v4().to_string();
+    let token_hash = hash_token(&token);
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::minutes(30))
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::minutes(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    match sqlx::query(
+        "INSERT INTO share_tokens (token_hash, share_code, expires_at) VALUES (?, ?, ?)",
+    )
+    .bind(&token_hash)
+    .bind(share_code)
+    .bind(&expires_at)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => token,
+        Err(e) => {
+            tracing::error!("[Share] 下载令牌入库失败: {}", e);
+            String::new()
+        }
+    }
 }
 
 // --- 访问分享下的具体文件或子目录 ---
@@ -469,8 +550,9 @@ pub async fn share_subfile(
 
     // 2. 校验密码（如果有）— spawn_blocking 避免阻塞
     if let Some(pwd_hash) = db_password {
-        // 该分享已被连续错误尝试锁定
-        if share_check_locked(&share_id).await {
+        // 该 (IP, 分享) 已被连续错误尝试锁定
+        let lock_key = share_lock_key(&rate_key, &share_id);
+        if share_check_locked(&lock_key).await {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 "尝试次数过多，分享已临时锁定",
@@ -484,10 +566,10 @@ pub async fn share_subfile(
                 .await
                 .unwrap_or(false);
         if !is_valid {
-            share_record_failure(&share_id).await;
+            share_record_failure(&lock_key).await;
             return (StatusCode::UNAUTHORIZED, "密码错误").into_response();
         }
-        share_clear_failures(&share_id).await;
+        share_clear_failures(&lock_key).await;
     }
 
     // 3. 校验有效期
@@ -528,9 +610,15 @@ pub async fn share_subfile(
         Err(_) => return (StatusCode::NOT_FOUND, "文件或目录不存在").into_response(),
     };
 
-    // 4. 如果是目录，返回目录内容 JSON（沙箱内遍历，符号链接条目跳过不暴露）
+    // 4. 如果是目录，返回目录内容 JSON（沙箱内遍历，符号链接条目跳过不暴露；
+    // path 裁剪为相对分享根，匿名访客不可见 uploads 内部路径/拥有者用户名）
     if meta.is_dir() {
-        let items = list_directory_files(&sb, &target_rel).await;
+        let share_base_rel = share_base
+            .strip_prefix(base)
+            .unwrap_or(&share_base)
+            .to_string_lossy()
+            .into_owned();
+        let items = list_directory_files(&sb, &target_rel, &share_base_rel).await;
         return (StatusCode::OK, Json(items)).into_response();
     }
 
@@ -584,9 +672,13 @@ pub async fn share_subfile(
 }
 
 // --- 辅助函数：列出目录内容（供分享使用；沙箱内遍历，符号链接不跟随/不暴露）---
+/// base_rel：分享根相对 uploads 根的路径（形如 `victim/myshare`）。
+/// 返回的 `path` 裁剪为相对 base_rel 的子路径（P1-2 修复）——匿名访客不得拿到
+/// uploads 内部路径与拥有者用户名（历史实现直接回吐 `victim/myshare/sub/...`）。
 async fn list_directory_files(
     sb: &crate::fsutil::Sandbox,
     dir_rel: &str,
+    base_rel: &str,
 ) -> Vec<serde_json::Value> {
     let mut items = Vec::new();
     let Ok(entries) = sb.read_dir(dir_rel) else {
@@ -601,11 +693,20 @@ async fn list_directory_files(
         } else {
             format!("{}/{}", dir_rel, item.name.to_string_lossy())
         };
+        // 裁剪分享根前缀：path 对客户端锚定在分享根之下
+        let client_path = if base_rel.is_empty() {
+            relative_path.clone()
+        } else {
+            match relative_path.strip_prefix(&format!("{}/", base_rel)) {
+                Some(p) => p.to_string(),
+                None => relative_path.clone(), // 理论不可达（dir_rel 必在分享根内）
+            }
+        };
         items.push(serde_json::json!({
             "name": item.name.to_string_lossy(),
             "is_dir": item.is_dir(),
             "size": item.size,
-            "path": relative_path,
+            "path": client_path,
         }));
     }
     items

@@ -52,7 +52,7 @@ Browser                      Axum Server
 │   ├── templates.rs         # AppTemplate<T> — Askama → IntoResponse
 │   ├── db/
 │   │   ├── mod.rs           # create_pool(), init_tables()
-│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表, 当前 v12)
+│   │   ├── migrations.rs    # 版本化迁移 (schema_version 表, 当前 v13)
 │   │   └── queries.rs       # 共享查询辅助
 │   ├── middleware/
 │   │   ├── csp.rs           # Content-Security-Policy
@@ -150,7 +150,7 @@ Browser                      Axum Server
 
 ## 数据库
 
-12 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `media_tokens`, `fs_journal`（文件操作意图日志，启动重放）, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）；v1.11 起内置 AI Chat 相关表（user_settings/conversations/conversation_messages）已随迁移 v12 删除
+13 表 + 1 虚拟表：`users`, `sessions`, `files`, `upload_chunks`, `shares`, `trash`, `audit_logs`, `links`, `todos`, `media_tokens`, `share_tokens`（v13：分享下载一次性令牌）, `fs_journal`（文件操作意图日志，启动重放）, `schema_version` + FTS5 `files_fts`（trigram case_sensitive 0，触发器同步）；v1.11 内置 AI Chat 相关表已随迁移 v12 删除
 
 - **WAL 模式** (`Normal` synchronous)，连接池 16
 - **WAL checkpoint** 定时任务（每小时 `PRAGMA wal_checkpoint(TRUNCATE)`）
@@ -177,6 +177,8 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 ### 安全约定
 - **`validate_name`**：文件/文件夹名白名单（拒绝 `/` `\` `..` 引号 尖括号 控制字符），挂于建文件夹/重命名/merge 写入路径
 - **`safe_join_sandbox` 返回 `AppResult`**：字符串级纵深防御（拒绝 .. / 绝对路径/盘符），保留在 18 个调用点
+- **`validate_rel_path`（v1.12 P0-1）**：写路径 parent/src/dst 逐段白名单（拒绝 `..`/`.`/空段/反斜杠/控制字符），
+  rename/move/delete/merge 与 journal 恢复统一入口校验——openat2 BENEATH 允许根内 `..` 解析，`..` parent 可跨用户
 - **`fsutil::Sandbox`（v1.10 P0-4）**：全部物理文件操作的内核级沙箱——
   `openat2(RESOLVE_BENEATH | NO_MAGICLINKS)` + `renameat/unlinkat/mkdirat/statat` 族，
   符号链接越界（含绝对路径链接）由内核在单次系统调用内原子拒绝，TOCTOU 窗口归零；
@@ -248,10 +250,12 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
 ### 已知边界与接受的残余风险（审计记录，2026-08，v1.11 更新）
 - CSP script-src 保留 'unsafe-eval'（Alpine x-data 表达式编译 + htmx hx-on 依赖）；style-src 保留
   'unsafe-inline'（动画延迟/进度条宽度等内联样式依赖）——**接受项**，移除需迁移 Alpine（收益不划算）
-- 会话双闸（绝对 7 天 + 空闲 24h）已就位；分享失败锁定仍为内存态（重启清零）
+- 会话双闸（绝对 7 天 + 空闲 24h）已就位；分享失败锁定仍为内存态（重启清零），键为 IP|code 组合（v1.12）；
+  分享下载一次性令牌（share_tokens）30 分钟有效、校验即删
 - upload_limit_mb 语义 = 全局 body limit（非单文件上限），单文件实际由配额约束；quota_mb=0 表示禁止上传
 - openat2 沙箱（RESOLVE_BENEATH）已就位；残余：绝对路径符号链接在沙箱内被整体拒绝（保守语义）
-- 登录响应 JSON 回显会话 token（dsh-plugin-pinas Bearer 流程依赖）；页面 JS 不经手存储
+- 登录响应 JSON 的会话 token 仅回显给显式 Authorization: Bearer 请求方（dsh-plugin-pinas 依赖）；
+  浏览器表单登录走 HttpOnly Cookie，响应不回显 token（v1.12 P2-4）
 - v1.11 已移除内置 AI Chat（代码/路由/数据表/保存的 Key 全部清理）；AI 能力收敛到 dsh（DeepSeek Harness 反代 + dsh-plugin-pinas），
   pinas 保留 dsh 所需的功能 API（files/todos/links/system 等）
 
@@ -267,12 +271,14 @@ MINECRAFT_HOST=127.0.0.1           MINECRAFT_PORT=25565
   - 时长统一 ≤0.2s；`system_monitor_live`（1s 轮询）禁用动画
 
 ### 测试
-- 77 个集成测试 + 15 个单元测试（数量以 CI 为准，本段为覆盖清单；含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
+- 84 个集成测试 + 16 个单元测试（数量以 CI 为准，本段为覆盖清单；含安全回归：穿越 merge/delete ".."/非法名称/分享下载头/备份有效性/
   子树迁移/媒体 Range；v1.6 新增 WebDAV 全链路、全局搜索、FTS 触发器、嵌套 merge、markdown 预览转义；
   v1.7 新增同名重传 409、重命名覆盖保护、中文多字节子树、回收站清扫豁免、FK 全连接、媒体令牌作用域、
   分享爆破锁定、SSE 截断、带时间日程日历、HSTS 门控、大小写搜索等；
   v1.10 新增符号链接越界（读/写路径 4 项）、DNS 私网 IP 分类、密钥加解密往返、会话空闲超时、X-Request-Id；
-  v1.11 随内置 AI Chat 移除，AI 相关测试（agent/conversation/settings/api_base）同步删除）
+  v1.11 随内置 AI Chat 移除，AI 相关测试（agent/conversation/settings/api_base）同步删除；
+  v1.12 新增 P0 回归（tests/path_validation.rs：跨用户 move/rename/delete/merge 拒绝、源名 `..` 拒绝、
+  同用户正常操作）、分片清扫豁免活跃记录、CSP 哈希一致性等）
 - 覆盖：auth 流程（含 Cookie 登出/改密 Secure）、文件 CRUD、真实分片上传/配额强制、分享密码全流程、回收站、链接/待办 CRUD、健康检查
 
 ## 构建与部署

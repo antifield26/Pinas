@@ -405,6 +405,15 @@ pub async fn download_zip(
         user_root.join(&parent_path)
     };
 
+    // P2-16：沙箱在循环外建一次，exists 检查用 openat2 原子判定（同步 std::fs::exists
+    // 退出 async 上下文，且非原子——见 P0-4）
+    let sb = match crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR) {
+        Ok(sb) => sb,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "文件系统不可用").into_response();
+        }
+    };
+
     let mut items = Vec::new();
     for name in &payload.names {
         // 使用 safe_join_sandbox 而非 Path::starts_with，后者不规范化 .. 组件，
@@ -412,13 +421,14 @@ pub async fn download_zip(
         let Ok(target_path) = safe_join_sandbox(&base_dir, name) else {
             continue;
         };
-        if target_path.starts_with(&user_root) && target_path.exists() {
-            // 相对 uploads 根的 rel（供沙箱原子操作）
-            let rel = target_path
-                .strip_prefix(base_path)
-                .unwrap_or(&target_path)
-                .to_string_lossy()
-                .into_owned();
+        // 相对 uploads 根的 rel（供沙箱原子操作）
+        let rel = target_path
+            .strip_prefix(base_path)
+            .unwrap_or(&target_path)
+            .to_string_lossy()
+            .into_owned();
+        // 沙箱判定存在性（符号链接越界 → 不存在 → 跳过），替代同步 exists()
+        if target_path.starts_with(&user_root) && sb.try_exists(&rel).unwrap_or(false) {
             items.push((name.clone(), rel));
         }
     }

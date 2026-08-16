@@ -124,6 +124,34 @@ pub fn validate_name(name: &str) -> crate::error::AppResult<()> {
     Ok(())
 }
 
+/// 校验用户可控的**相对目录路径**（写路径 parent/src/dst 统一入口，P0-1 修复）。
+/// 多用户共享 uploads/ 根沙箱，而 openat2 RESOLVE_BENEATH 允许根内 ".." 解析——
+/// 若 parent 含 ".."，`{username}/{parent}/{name}` 可落进其他用户子树。
+/// 此处逐段拒绝 `..`/`.`/空段/反斜杠/控制字符，返回规范化（去首尾/重复斜杠）后的相对路径；
+/// 空串或 "/" 表示用户根目录。
+pub fn validate_rel_path(path: &str) -> crate::error::AppResult<String> {
+    use crate::error::AppError;
+    let p = path.trim();
+    if p.is_empty() || p == "/" {
+        return Ok(String::new());
+    }
+    if p.starts_with('/') || p.starts_with('\\') {
+        return Err(AppError::bad_request("非法路径"));
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        let seg = seg.trim();
+        if seg.is_empty() || seg == "." || seg == ".." {
+            tracing::warn!("[路径安全] 拒绝非法相对路径段: path='{}'", path);
+            return Err(AppError::bad_request("非法路径"));
+        }
+        // 每段复用名称白名单（拒 \、控制字符、引号/尖括号等）
+        validate_name(seg)?;
+        out.push(seg);
+    }
+    Ok(out.join("/"))
+}
+
 /// 这些 MIME 类型若以内联方式渲染会执行脚本/标记（存储型 XSS 通道），必须强制下载
 pub fn is_force_download_mime(mime: &str) -> bool {
     let m = mime.to_lowercase();

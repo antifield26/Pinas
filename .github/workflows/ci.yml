@@ -39,8 +39,11 @@ jobs:
         run: cargo test --workspace
 
       # P1-3：供应链治理——advisory（CVE/恶意包）+ 许可证 + yanked 版本
+      # 供应链 pin：原本的 embiid/cargo-deny-action@v2 经 API 查证不存在（embiid 用户无此仓库，
+      # 引用该 action 导致 CI 在 "Set up job" 阶段失败），真身为 EmbarkStudios/cargo-deny-action。
+      # 现 pin 到 v2 tag 的完整提交 SHA（= v2.1.1, 2026-07-27），升级需显式更新此 SHA。
       - name: cargo deny
-        uses: embiid/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # @v2
 
       # PWA 版本一致性（?v= 与 sw.js 预缓存清单严格对齐）——漏改即预缓存 miss
       - name: check-versions

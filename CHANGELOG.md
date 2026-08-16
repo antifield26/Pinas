@@ -1,6 +1,56 @@
 # Changelog
 
-## v1.11.0 (2026-08-16)
+## v1.12.0 (2026-08-17)
+
+### Fixed（P0 安全修复——跨用户文件越权，code_review.md 实证）
+- **P0-1 写路径 `..` 未拦截 → 跨用户文件操作**：rename/move/delete/merge 的 parent/src/dst
+  仅经 trim 透传，多用户共享 uploads/ 根沙箱 + openat2 BENEATH 允许根内 `..` 解析，
+  任意登录用户可移动/删除/窃取他人文件（隔离测试实证：move 200 窃取成功、delete 200 成功）
+  - 新增 `validate_rel_path`（utils.rs）：逐段拒绝 `..`/`.`/空段/反斜杠/控制字符，返回规范化相对路径
+  - `rename_core`/`move_core`/`delete_to_trash`/`merge_chunks` 入口统一校验 parent/src/dst；
+    API/HTMX/JSON 入口显式校验返回 400
+- **P0-2 rename/move 源名未校验**：`old_name`/`name` 补 `validate_name`（`..` 源名可移走整棵
+  用户子树，物理/DB 错位后 reconcile 大规模误清）
+- **回归测试**：新增 `tests/path_validation.rs`（7 项：跨用户 move/rename/delete/merge 拒绝 +
+  源名 `..` 拒绝 + 同用户正常操作不受影响）
+
+### Fixed（P1 高优先级）
+- **分享目录路径泄露**：目录分享 JSON 的 `path` 裁剪为相对分享根（此前回吐 uploads 内部路径
+  与拥有者用户名，匿名访客可枚举）
+- **分享失败锁定可 DoS**：按 `IP|code` 组合键计数（此前按 code 跨 IP 共享，任意 IP 错 5 次
+  即锁死合法分享 15 分钟）
+- **CSP 第二哈希失配**：theme_head.html 暗色预涂脚本哈希更新为实测值
+  `sha256-V1ONiGmI3S/fo/iVTzDdp1MvwZTNDqZJWdZu1ok6Ees=`（此前 /login、/change-password、
+  /s/* 预涂脚本被 CSP 拦截，白闪）；`check-versions.sh` 新增「内联脚本→sha256」自动校验防再漂移
+- **dsh 路由认证边界**：`auth_middleware` 的 `/s/` 豁免与媒体令牌允许改为 `AuthPolicy` 显式声明
+  （主路由放行，dsh 路由全禁）——dsh 域未认证 `/s/*` 实测 500（潜在绕过）修复为 401 fail-closed
+- **分片 5GB 上限 TOCTOU**：预检 + 预留并入同一 SQLite 写事务（抢写锁串行快照），写盘后按实际
+  校正（-prev -MAX +actual）、失败撤销预留——并发绕过 5GB 上限的通道关闭
+- **VACUUM 阻塞 async worker**：备份移入 `spawn_blocking`（闭包内新建独立连接）+ 备份互斥信号量
+- **DAV 位移/恢复校验**：Destination 目的父路径过 `validate_rel_path`（源侧同补）；
+  `journal::recover_dav_disp` 对 username/parent/fname 逐项校验 + 首段断言（崩溃恢复期跨用户
+  写入通道关闭）
+- **回收站清空/永久删除非事务化**：物理失败不再吞错删行（磁盘孤儿）；清空改「先物理全部成功
+  再单事务批量删行」；`delete_to_trash` 的 trash 登记 + files 删除包入单事务
+- **DAV 无 Content-Length PUT 写盘放大**：chunked PUT 落盘路径补 PENDING 约束校验与日志
+
+### Changed（P2 改进）
+- 限速器按条目自身 window 清理（跨端点键耗尽 DoS 关闭）；仅信任 `cf-connecting-ip` 且校验
+  IP 格式（伪造 XFF 清零限速关闭）
+- 登录响应 token 仅回显给显式 `Authorization: Bearer` 请求方（浏览器走 HttpOnly Cookie，
+  页面侧 XSS 拿不到 token）；change_password 会话校验与中间件双闸一致（空闲超时生效）
+- 媒体令牌路径比对改为百分号解码后逐段比较（与 handler 语义对齐）
+- 分享下载链接用一次性令牌（迁移 v13 `share_tokens` 表）替代明文密码进 URL
+- `reconcile_files_on_disk` 复用单一 Sandbox；download_zip 存在性判定走沙箱原子操作
+- 请求 ID 截断 ≤128；随机密码拒绝采样消取模偏差；config.rs 移除 v1.11 残留键名；
+  main.rs 注释移除"AI 助手"；admin_users.html 补 `|json`；deploy.sh 失败自动回滚 +
+  `-D warnings` 构建；check-versions.sh 扩展懒加载库版本校验；cargo-deny-action pin SHA
+  （修正为真身 EmbarkStudios）
+- 回收站后台清理与还原互斥（per-uuid 锁表）；分片目录清扫豁免 DB 存活记录
+
+### Tests
+- 集成测试 77 → 84（新增 7 项 P0 回归）；单元测试 15 → 18（限速器/回收站锁/临时清扫豁免）
+- schema 版本 v12 → v13
 
 ### Removed（内置 AI Chat 移除，AI 能力收敛到 dsh）
 - **代码**：handlers 删除 agent.rs / conversations.rs / settings.rs（含 validate_api_base）；

@@ -156,11 +156,7 @@ fn load_dotenv_manual() {
             unsafe {
                 std::env::set_var(key, value);
             }
-            if key == "PINAS_ADMIN_PASSWORD"
-                || key == "PINAS_GUEST_PASSWORD"
-                || key == "PINAS_DEEPSEEK_API_KEY"
-                || key == "PINAS_MASTER_KEY"
-            {
+            if key == "PINAS_ADMIN_PASSWORD" || key == "PINAS_GUEST_PASSWORD" {
                 // 安全：绝不打印密码/密钥值的任何部分（systemd 下会进 journald，可被离线猜测）
                 eprintln!(
                     "[Config]   {}={}",

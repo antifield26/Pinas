@@ -4,7 +4,7 @@
 use sqlx::{Row, SqlitePool};
 
 /// 当前最新 schema 版本号
-const CURRENT_VERSION: i32 = 12;
+const CURRENT_VERSION: i32 = 13;
 
 /// 执行所有待迁移的 schema 变更。
 /// SQLite DDL 事务化：整批迁移一个事务，失败整体回滚，杜绝半迁移状态；
@@ -120,6 +120,14 @@ pub async fn run(pool: &SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
             .execute(&mut *tx)
             .await?;
         tracing::info!("[DB] Schema 迁移到 v12 完成");
+    }
+
+    if current < 13 {
+        apply_v13_migrations(&mut tx).await?;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (13)")
+            .execute(&mut *tx)
+            .await?;
+        tracing::info!("[DB] Schema 迁移到 v13 完成");
     }
 
     tx.commit().await?;
@@ -344,6 +352,30 @@ async fn apply_v4_migrations(
 
 /// v12: 移除内置 AI Chat（v1.11）——user_settings（含加密的 API Key）、
 /// conversations、conversation_messages 三张表整体删除，保存的 Key 一并清理
+/// v13: 分享下载一次性令牌表 — P2-9。分享页密码验证通过后签发短时效一次性令牌，
+/// 下载链接携带 token 而非明文密码（消除密码进 URL/历史/日志的问题）
+async fn apply_v13_migrations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS share_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            share_code TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_share_tokens_code ON share_tokens (share_code)")
+        .execute(&mut **tx)
+        .await?;
+    tracing::info!("[DB] v13 迁移: share_tokens 表（分享下载一次性令牌）已建立");
+    Ok(())
+}
+
+/// v12: 移除内置 AI Chat 相关表（user_settings/conversations/conversation_messages）
+/// 随 v1.11 的 AI 功能移除一并清理；保存的 API Key 等敏感数据不再存储
 async fn apply_v12_migrations(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), sqlx::Error> {

@@ -1,5 +1,6 @@
 // ====== 后台清理任务 ======
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -129,12 +130,15 @@ fn spawn_wal_checkpoint(pool: SqlitePool, cancel: CancellationToken) {
     });
 }
 
-/// 清理过期临时分片
-fn spawn_temp_chunk_cleanup(_pool: SqlitePool, hours: u64, cancel: CancellationToken) {
+/// 清理过期临时分片。
+/// P2-15：清扫前查询 DB 中仍存活的 upload_chunks 记录，`clean_expired_temp_chunks`
+/// 对 (username, identifier) 仍有记录的目录豁免清理（见该函数注释）。_pool 参数
+/// 由原 _pool 占位改为使用，供豁免查询。
+fn spawn_temp_chunk_cleanup(pool: SqlitePool, hours: u64, cancel: CancellationToken) {
     // interval(0) 会 panic（period must be non-zero），release panic=abort 即整站启动崩溃
     let hours = hours.max(1);
     tokio::spawn(async move {
-        if let Err(e) = clean_expired_temp_chunks(hours).await {
+        if let Err(e) = clean_expired_temp_chunks(&pool, hours).await {
             tracing::error!("初始清理临时分片失败: {}", e);
         }
         let mut interval = tokio::time::interval(Duration::from_secs(hours * 3600));
@@ -142,7 +146,7 @@ fn spawn_temp_chunk_cleanup(_pool: SqlitePool, hours: u64, cancel: CancellationT
             tokio::select! {
                 _ = cancel.cancelled() => { tracing::info!("临时分片清理任务已停止"); break; }
                 _ = interval.tick() => {
-                    if let Err(e) = clean_expired_temp_chunks(hours).await {
+                    if let Err(e) = clean_expired_temp_chunks(&pool, hours).await {
                         tracing::error!("清理过期临时分片失败: {}", e);
                     }
                 }
@@ -304,18 +308,55 @@ fn is_sweepable_temp_entry(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// 清理超过指定小时数的临时分片（白名单：仅限分片目录与 dav 临时文件）
-async fn clean_expired_temp_chunks(hours: u64) -> Result<(), std::io::Error> {
-    clean_expired_temp_chunks_in(std::path::Path::new(TMP_DIR), hours).await
+/// 清理超过指定小时数的临时分片（白名单：仅限分片目录与 dav 临时文件）。
+///
+/// P2-15：清扫前查询 DB 中仍存活的 upload_chunks 记录，构建 (username, identifier)
+/// 豁免集合传给 `clean_expired_temp_chunks_in`：
+/// - DB 记录存在 = 用户可能恢复断点续传，即使暂停超过 PINAS_TEMP_CLEANUP_HOURS 也
+///   不清理对应目录（防止 merge 中断）；
+/// - 只有该记录也已消失（merge 完成删行，或 spawn_chunk_rows_cleanup 按相同阈值
+///   清理过期分片行）后，目录才落入清扫窗口——两条清理任务阈值对齐（均取
+///   PINAS_TEMP_CLEANUP_HOURS），保证「行先清、目录后清」的配合关系。
+///
+/// DB 查询失败时中止本轮清扫（不豁免任何目录会误清活跃续传，宁可跳过）
+async fn clean_expired_temp_chunks(pool: &SqlitePool, hours: u64) -> Result<(), std::io::Error> {
+    let live = match collect_live_chunk_identifiers(pool).await {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::error!("查询存活分片记录失败，中止本轮临时清扫: {}", e);
+            return Err(std::io::Error::other("查询存活分片记录失败"));
+        }
+    };
+    clean_expired_temp_chunks_in(std::path::Path::new(TMP_DIR), hours, &live).await
+}
+
+/// P2-15 辅助：收集 DB 中仍存活的 (username, identifier) 集合（断点续传豁免名单）。
+async fn collect_live_chunk_identifiers(
+    pool: &SqlitePool,
+) -> Result<HashSet<(String, String)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT DISTINCT username, identifier FROM upload_chunks")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let username: String = r.get("username");
+            let identifier: String = r.get("identifier");
+            (username, identifier)
+        })
+        .collect())
 }
 
 /// 同 clean_expired_temp_chunks，显式指定 tmp 目录（供测试注入临时路径，避免依赖进程 CWD）。
 /// 支持两级结构（H2 修复后）：tmp/{username}/{identifier}/{chunk_idx}——
 /// 用户名目录本身不按 mtime 整体判（写入已有分片不更新父目录 mtime），
 /// 必须下钻到 identifier 目录逐个判定；兼容旧版扁平 tmp/{identifier} 结构。
+/// `live` 为 DB 中仍存活的 (username, identifier) 集合，命中者豁免清理（P2-15）。
+/// 旧版扁平 tmp/{identifier} 目录无用户名，无法与 DB 记录匹配，维持原 mtime 清扫语义。
 async fn clean_expired_temp_chunks_in(
     tmp_dir: &std::path::Path,
     hours: u64,
+    live: &HashSet<(String, String)>,
 ) -> Result<(), std::io::Error> {
     if !tmp_dir.exists() {
         return Ok(());
@@ -360,6 +401,16 @@ async fn clean_expired_temp_chunks_in(
                     continue;
                 }
                 if cmeta.is_dir() {
+                    // P2-15：DB 中仍存活的 (username, identifier) 豁免清理——
+                    // 用户暂停断点续传后可能恢复，只有记录也被清理（merge 完成/
+                    // spawn_chunk_rows_cleanup 清行）后目录才可清扫
+                    let identifier = cpath
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if live.contains(&(name.clone(), identifier)) {
+                        continue;
+                    }
                     let _ = tokio::fs::remove_dir_all(&cpath).await;
                     info!("清理过期临时分片目录: {:?}", cpath);
                 } else {
@@ -370,7 +421,7 @@ async fn clean_expired_temp_chunks_in(
             // 子项清空后移除空壳用户名目录（非空则静默失败）
             let _ = tokio::fs::remove_dir(&path).await;
         } else if metadata.modified().is_ok_and(|m| m <= cutoff) {
-            // 旧版扁平 identifier 目录（无子目录）：按自身 mtime 判
+            // 旧版扁平 identifier 目录（无子目录）：无用户名，无法匹配 DB 豁免名单
             let _ = tokio::fs::remove_dir_all(&path).await;
             info!("清理过期临时分片目录: {:?}", path);
         }
@@ -436,12 +487,39 @@ mod tests {
         std::fs::write(&odd, b"not a chunk").unwrap();
         age_to_old(&odd);
 
-        clean_expired_temp_chunks_in(tmp, 1).await.unwrap();
+        clean_expired_temp_chunks_in(tmp, 1, &HashSet::new())
+            .await
+            .unwrap();
 
         assert!(trash.join("victim.txt").exists(), "回收站内容不得被清扫");
         assert!(!chunk.exists(), "过期分片目录应被清除");
         assert!(!dav.exists(), "过期 dav 临时目录应被清除");
         assert!(odd.exists(), "非分片条目应保留");
+    }
+
+    /// P2-15 回归测试：DB 中仍存活的 (username, identifier) 分片目录豁免清扫——
+    /// 暂停超过阈值的断点续传不应被清；仅当记录不存在时才可清。
+    #[tokio::test]
+    async fn test_temp_sweep_exempts_live_chunk_records() {
+        let dir = tempdir().unwrap();
+        let tmp = dir.path();
+        // 两级结构 tmp/{username}/{identifier}，两个 identifier 目录都过期
+        let user = tmp.join("alice");
+        let live_chunk = user.join("live-ident");
+        let dead_chunk = user.join("dead-ident");
+        std::fs::create_dir_all(&live_chunk).unwrap();
+        std::fs::create_dir_all(&dead_chunk).unwrap();
+        age_to_old(&user);
+        age_to_old(&live_chunk);
+        age_to_old(&dead_chunk);
+
+        // 模拟 DB 中 alice/live-ident 仍有 upload_chunks 记录 → 豁免
+        let mut live = HashSet::new();
+        live.insert(("alice".to_string(), "live-ident".to_string()));
+        clean_expired_temp_chunks_in(tmp, 1, &live).await.unwrap();
+
+        assert!(live_chunk.exists(), "DB 存活的断点续传目录不得被清扫");
+        assert!(!dead_chunk.exists(), "无 DB 记录的过期分片目录应被清除");
     }
 
     #[tokio::test]

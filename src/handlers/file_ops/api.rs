@@ -240,10 +240,18 @@ pub async fn rename_item(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<RenameRequest>,
 ) -> impl IntoResponse {
-    if crate::handlers::utils::validate_name(&payload.new_name).is_err() {
+    if crate::handlers::utils::validate_name(&payload.new_name).is_err()
+        || crate::handlers::utils::validate_name(&payload.name).is_err()
+    {
         return (StatusCode::BAD_REQUEST, "名称包含非法字符").into_response();
     }
-    let parent = user_dir_path(payload.current_path);
+    // P0-1：parent 逐段白名单校验（拒绝 `..` 跨用户路径），失败直接 400
+    let parent = match crate::handlers::utils::validate_rel_path(
+        payload.current_path.as_deref().unwrap_or(""),
+    ) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
+    };
     let old_path = logical_path(&parent, &payload.name);
     match rename_core(
         &pool,
@@ -268,6 +276,7 @@ pub async fn rename_item(
             (StatusCode::OK, "重命名成功").into_response()
         }
         Err(AppError::Conflict(msg)) => (StatusCode::CONFLICT, msg).into_response(),
+        Err(AppError::BadRequest(msg)) => (StatusCode::BAD_REQUEST, msg).into_response(),
         Err(e) => {
             tracing::error!("[Files] 重命名失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "操作失败").into_response()
@@ -282,8 +291,21 @@ pub async fn move_item(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<MoveRequest>,
 ) -> impl IntoResponse {
-    let src = user_dir_path(payload.current_path);
-    let dst = user_dir_path(Some(payload.target_dir));
+    // P0-2：源名必须过白名单（`..` 源名可移走整棵用户子树）
+    if crate::handlers::utils::validate_name(&payload.name).is_err() {
+        return (StatusCode::BAD_REQUEST, "名称包含非法字符").into_response();
+    }
+    // P0-1：src/dst 逐段白名单校验（拒绝 `..` 跨用户路径）
+    let src = match crate::handlers::utils::validate_rel_path(
+        payload.current_path.as_deref().unwrap_or(""),
+    ) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
+    };
+    let dst = match crate::handlers::utils::validate_rel_path(&payload.target_dir) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "非法路径").into_response(),
+    };
     let old_path = logical_path(&src, &payload.name);
     match move_core(&pool, &session.username, &src, &dst, &payload.name).await {
         Ok(()) => {
@@ -300,6 +322,7 @@ pub async fn move_item(
             (StatusCode::OK, "迁移路径成功").into_response()
         }
         Err(AppError::Conflict(msg)) => (StatusCode::CONFLICT, msg).into_response(),
+        Err(AppError::BadRequest(msg)) => (StatusCode::BAD_REQUEST, msg).into_response(),
         Err(e) => {
             tracing::error!("[Files] 移动失败: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "操作失败").into_response()
@@ -443,7 +466,9 @@ pub async fn delete_item(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<DeleteRequest>,
 ) -> AppResult<(StatusCode, &'static str)> {
-    let parent = user_dir_path(payload.current_path);
+    // P0-1：parent 逐段白名单校验（拒绝 `..` 跨用户路径）
+    let parent =
+        crate::handlers::utils::validate_rel_path(payload.current_path.as_deref().unwrap_or(""))?;
     let full = logical_path(&parent, &payload.name);
     let rel = user_file_path(&session.username, &parent, &payload.name);
     let sb = crate::fsutil::Sandbox::new(crate::constants::UPLOADS_DIR)
@@ -472,7 +497,9 @@ pub async fn delete_batch(
     Extension(session): Extension<UserSession>,
     Json(payload): Json<BatchDeleteRequest>,
 ) -> AppResult<(StatusCode, &'static str)> {
-    let parent = user_dir_path(payload.current_path);
+    // P0-1：parent 逐段白名单校验（拒绝 `..` 跨用户路径）
+    let parent =
+        crate::handlers::utils::validate_rel_path(payload.current_path.as_deref().unwrap_or(""))?;
     let mut failed: Vec<String> = Vec::new();
     for name in &payload.names {
         if let Err(e) = delete_to_trash(&pool, &session.username, &parent, name).await {

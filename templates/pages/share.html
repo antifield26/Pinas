@@ -29,7 +29,7 @@
     <div class="space-y-3">
       <p class="text-xs text-gray-400">文件大小: {{ file_size }}</p>
       <div class="flex gap-3 justify-center">
-        <a href="/api/share/access/{{ share_id }}{% if !password.is_empty() %}?password={{ password }}{% endif %}"
+        <a href="/api/share/access/{{ share_id }}{% if !download_token.is_empty() %}?token={{ download_token }}{% endif %}"
            class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">↓ 下载文件</a>
       </div>
     </div>

@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row};
+use std::sync::LazyLock;
 
 use crate::config::Config;
 use crate::core::UserSession;
@@ -271,6 +272,12 @@ pub async fn get_audit_logs(
 
 const BACKUPS_DIR: &str = "backups";
 
+/// 备份并发互斥（P1-3）：VACUUM INTO 在大库上耗时秒级~十秒级且持主库写锁，
+/// 并发备份会让全站写操作 busy_timeout 后失败——单许可信号量串行化。
+/// 采用等待（acquire）而非直接 409：备份低频，等待即可完成，用户期望拿到结果
+static BACKUP_LOCK: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
 /// POST /api/admin/backup — 创建数据库备份（仅管理员）
 #[tracing::instrument(skip_all)]
 pub async fn create_backup(
@@ -282,27 +289,43 @@ pub async fn create_backup(
         return Err(AppError::forbidden("需要管理员权限"));
     }
 
+    // P1-3：串行化备份——大库 VACUUM 秒级~十秒级，并发备份会互相 busy_timeout 冻结全站。
+    // 等待（acquire）而非 409：备份低频，等待即可完成；guard 在函数结束（含 VACUUM）后自动释放
+    let _guard = BACKUP_LOCK
+        .acquire()
+        .await
+        .map_err(|e| AppError::internal_log("获取备份互斥锁", e))?;
+
     let _ = tokio::fs::create_dir_all(BACKUPS_DIR).await;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let filename = format!("cloud_disk_backup_{}.db", timestamp);
     let backup_path = format!("{}/{}", BACKUPS_DIR, filename);
 
-    // VACUUM INTO 需要独立连接
+    // P1-3：VACUUM INTO 是阻塞 IO（大库秒级~十秒级），不能占住 tokio async worker。
+    // SQLite 连接不可跨线程移动，故在 spawn_blocking 闭包内新建独立连接执行；
+    // sqlx 连接 API 是 async，经 Handle::block_on 在当前阻塞线程驱动（不会被迁移到其他 worker）
     let db_path = config
         .database_url
         .strip_prefix("sqlite:")
-        .unwrap_or("cloud_disk.db");
-    let opts = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(db_path)
-        .create_if_missing(false);
-    let mut conn = sqlx::SqliteConnection::connect_with(&opts).await?;
-
-    let sql = format!("VACUUM INTO '{}'", backup_path);
-    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-        .execute(&mut conn)
-        .await?;
-
-    let _ = conn.close().await;
+        .unwrap_or("cloud_disk.db")
+        .to_string();
+    let backup_path_cloned = backup_path.clone();
+    let res: Result<(), sqlx::Error> = tokio::task::spawn_blocking(move || {
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(false);
+        let mut conn = tokio::runtime::Handle::current()
+            .block_on(sqlx::sqlite::SqliteConnection::connect_with(&opts))?;
+        let sql = format!("VACUUM INTO '{}'", backup_path_cloned);
+        let r = tokio::runtime::Handle::current()
+            .block_on(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&mut conn))
+            .map(|_| ());
+        let _ = tokio::runtime::Handle::current().block_on(conn.close());
+        r
+    })
+    .await
+    .map_err(|e| AppError::internal_log("备份任务异常终止", e))?;
+    res?;
     let _ = log_audit(
         &pool,
         &session.username,
@@ -357,8 +380,14 @@ pub async fn download_backup(
     let filename = params
         .get("file")
         .ok_or_else(|| AppError::bad_request("缺少 file 参数"))?;
-    // 防止路径穿越
-    if filename.contains('/') || filename.contains("..") {
+    // P2-6：严格白名单——备份文件名由服务端生成（cloud_disk_backup_{YYYYmmdd_HHMMSS}.db，
+    // 如 cloud_disk_backup_20260801_120000.db），仅允许 [A-Za-z0-9._-]+ 且以 .db 结尾。
+    // 纯白名单校验天然排除路径穿越（`/`、`..`）、符号链接与任意文件读取
+    if !filename.ends_with(".db")
+        || !filename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
         return Err(AppError::bad_request("非法文件名"));
     }
     let path = format!("{}/{}", BACKUPS_DIR, filename);

@@ -15,13 +15,15 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub struct RequestId(pub String);
 
 pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
-    // 沿用入站 ID（dsh 反代等上游链路可关联）
+    // 沿用入站 ID（dsh 反代等上游链路可关联）；截断 ≤128 字符（P2-7）——
+    // 入站头不限长时会把巨型 ID 烤进每一行日志（日志膨胀/注入伪装）
+    const MAX_ID_LEN: usize = 128;
     let incoming = req
         .headers()
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
-        .map(str::to_string);
+        .map(|v| v.chars().take(MAX_ID_LEN).collect::<String>());
     let id = incoming.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     req.extensions_mut().insert(RequestId(id.clone()));
 

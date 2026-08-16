@@ -9,7 +9,7 @@ use sqlx::SqlitePool;
 
 use crate::constants::{TMP_DIR, UPLOADS_DIR};
 use crate::handlers::dav::DAV_MAX_BODY_BYTES;
-use crate::handlers::utils::{update_user_used_mb, validate_name};
+use crate::handlers::utils::{update_user_used_mb, validate_name, validate_rel_path};
 
 use super::auth::DavUser;
 use crate::handlers::dav::{
@@ -44,8 +44,19 @@ pub(crate) async fn propfind(
     let is_root = rel.is_empty();
     if !is_root {
         let full_rel = format!("{}/{}", user.username, rel);
-        if !sb.try_exists(&full_rel).unwrap_or(false) {
-            return StatusCode::NOT_FOUND.into_response();
+        // P2-17：try_exists 仅把 NotFound 归为“不存在”，其余 IO 异常是真实故障——
+        // 记警告后按不存在降级（对外 404 语义不变）
+        match sb.try_exists(&full_rel) {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::warn!(
+                    "[DAV] PROPFIND 目标存在性检查异常: path={} err={}",
+                    full_rel,
+                    e
+                );
+                return StatusCode::NOT_FOUND.into_response();
+            }
         }
     }
 
@@ -61,18 +72,37 @@ pub(crate) async fn propfind(
             String::new(),
         ));
         if deep {
-            let rows: Vec<(String, String, i64, f64, String)> = sqlx::query_as(
+            let rows: Vec<(String, String, i64, f64, String)> = match sqlx::query_as(
                 "SELECT name, parent_path, is_dir, size_mb, created_at FROM files \
                  WHERE username = ? AND parent_path = '' ORDER BY is_dir DESC, name COLLATE NOCASE",
             )
             .bind(&user.username)
             .fetch_all(pool)
             .await
-            .unwrap_or_default();
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "[DAV] PROPFIND 根目录查询失败，返回空列表: username={} err={}",
+                        user.username,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
             for (name, parent_path, is_dir, _size_mb, created_at) in rows {
                 let full_rel = format!("{}/{}", user.username, logical_path(&parent_path, &name));
-                if !sb.try_exists(&full_rel).unwrap_or(false) {
-                    continue;
+                match sb.try_exists(&full_rel) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[DAV] PROPFIND 条目存在性检查异常，跳过: path={} err={}",
+                            full_rel,
+                            e
+                        );
+                        continue;
+                    }
                 }
                 let meta = sb.metadata(&full_rel).ok();
                 let mtime = meta
@@ -128,7 +158,7 @@ pub(crate) async fn propfind(
             created_at.unwrap_or_default(),
         ));
         if deep && meta.is_dir() {
-            let rows: Vec<(String, String, i64, f64, String)> = sqlx::query_as(
+            let rows: Vec<(String, String, i64, f64, String)> = match sqlx::query_as(
                 "SELECT name, parent_path, is_dir, size_mb, created_at FROM files \
                  WHERE username = ? AND parent_path = ? ORDER BY is_dir DESC, name COLLATE NOCASE",
             )
@@ -136,11 +166,31 @@ pub(crate) async fn propfind(
             .bind(rel)
             .fetch_all(pool)
             .await
-            .unwrap_or_default();
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "[DAV] PROPFIND 子目录查询失败，返回空列表: username={} parent={} err={}",
+                        user.username,
+                        rel,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
             for (name, parent_path, is_dir, _size_mb, created_at) in rows {
                 let full_rel = format!("{}/{}", user.username, logical_path(&parent_path, &name));
-                if !sb.try_exists(&full_rel).unwrap_or(false) {
-                    continue;
+                match sb.try_exists(&full_rel) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[DAV] PROPFIND 条目存在性检查异常，跳过: path={} err={}",
+                            full_rel,
+                            e
+                        );
+                        continue;
+                    }
                 }
                 let meta = sb.metadata(&full_rel).ok();
                 let mtime = meta
@@ -372,13 +422,13 @@ pub(crate) async fn put_file(
         Ok(s) => s,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if sb.create_dir_all(&parent_rel).is_err() {
+    if let Err(e) = sb.create_dir_all(&parent_rel) {
+        tracing::error!("[DAV] PUT 创建父目录失败: path={} err={}", parent_rel, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    if crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &parent)
-        .await
-        .is_err()
+    if let Err(e) = crate::handlers::file_ops::ensure_dir_rows(pool, &user.username, &parent).await
     {
+        tracing::error!("[DAV] PUT 补插目录行失败: parent={} err={}", parent, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -403,7 +453,10 @@ pub(crate) async fn put_file(
     let tmp = absolute_uploads_path(std::path::Path::new(&tmp_uuid));
     let mut file = match tokio::fs::File::create(&tmp).await {
         Ok(f) => f,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!("[DAV] PUT 创建临时文件失败: path={} err={}", tmp_uuid, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     let mut stream = req.into_body().into_data_stream();
     let mut written: u64 = 0;
@@ -421,14 +474,16 @@ pub(crate) async fn put_file(
             return StatusCode::INSUFFICIENT_STORAGE.into_response();
         }
         use tokio::io::AsyncWriteExt;
-        if file.write_all(&chunk).await.is_err() {
+        if let Err(e) = file.write_all(&chunk).await {
             let _ = tokio::fs::remove_file(&tmp).await;
+            tracing::error!("[DAV] PUT 写入临时文件失败: path={} err={}", tmp_uuid, e);
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
     use tokio::io::AsyncWriteExt;
-    if file.flush().await.is_err() {
+    if let Err(e) = file.flush().await {
         let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::error!("[DAV] PUT 刷盘失败: path={} err={}", tmp_uuid, e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     drop(file);
@@ -440,12 +495,21 @@ pub(crate) async fn put_file(
         let _ = tokio::fs::remove_file(&tmp).await;
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !crate::handlers::utils::is_allowed_mime_streaming(&tmp)
-        .await
-        .unwrap_or(true)
-    {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return StatusCode::FORBIDDEN.into_response();
+    // P2-17：MIME 检测失败（IO 异常）不阻断写入以保持历史降级语义，但须记告警——
+    // 检测被静默跳过意味着内容策略可能被绕过而不自知
+    match crate::handlers::utils::is_allowed_mime_streaming(&tmp).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[DAV] PUT MIME 检测异常，跳过内容策略: tmp={} err={}",
+                tmp_uuid,
+                e
+            );
+        }
     }
 
     // 覆盖语义：rename(2) 对同文件系统原子替换，绝不先删旧文件再改名
@@ -455,15 +519,26 @@ pub(crate) async fn put_file(
     } else {
         format!("{}/{}/{}", user.username, parent, name)
     };
-    let existed = sb.try_exists(&target_rel).unwrap_or(false);
+    let existed = match sb.try_exists(&target_rel) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "[DAV] PUT 目标存在性检查异常，按不存在处理: path={} err={}",
+                target_rel,
+                e
+            );
+            false
+        }
+    };
 
     // 配额预留必须先于 rename（M3/M4 修复 + 覆盖保护）：
     // 事务内预检+增量（写锁串行化消除 TOCTOU）。delta = 新占用 - 旧占用（覆盖时旧大小释放）。
     // 注意顺序：若预留放在 rename 之后，超配拒绝时旧文件已被原子替换、删除新文件即销毁旧内容
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
-        Err(_) => {
+        Err(e) => {
             let _ = tokio::fs::remove_file(&tmp).await;
+            tracing::error!("[DAV] PUT 开启配额事务失败: err={}", e);
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -498,13 +573,20 @@ pub(crate) async fn put_file(
         }
         .into_response();
     }
-    if tx.commit().await.is_err() {
+    if let Err(e) = tx.commit().await {
         let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::error!("[DAV] PUT 配额事务提交失败: err={}", e);
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    if sb.rename(&tmp_rel, &target_rel).is_err() {
+    if let Err(e) = sb.rename(&tmp_rel, &target_rel) {
         let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::error!(
+            "[DAV] PUT 落盘 rename 失败: src={} dst={} err={}",
+            tmp_rel,
+            target_rel,
+            e
+        );
         // 预留已提交但落盘失败：全量重算自愈（事务化版本）
         let _ = update_user_used_mb(pool, &user.username).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -572,14 +654,32 @@ pub(crate) async fn mkcol(pool: &SqlitePool, user: &DavUser, path: &str) -> Resp
         Ok(s) => s,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if sb.try_exists(&full_rel).unwrap_or(false) {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    match sb.try_exists(&full_rel) {
+        Ok(true) => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                "[DAV] MKCOL 目标存在性检查异常: path={} err={}",
+                full_rel,
+                e
+            );
+        }
     }
     // 父目录必须已存在（RFC 4918：否则 409；沙箱内判定，越界视为不存在）
-    if !sb.try_exists(&parent_rel).unwrap_or(false) {
-        return StatusCode::CONFLICT.into_response();
+    match sb.try_exists(&parent_rel) {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::CONFLICT.into_response(),
+        Err(e) => {
+            tracing::warn!(
+                "[DAV] MKCOL 父目录存在性检查异常: path={} err={}",
+                parent_rel,
+                e
+            );
+            return StatusCode::CONFLICT.into_response();
+        }
     }
-    if sb.create_dir(&full_rel).is_err() {
+    if let Err(e) = sb.create_dir(&full_rel) {
+        tracing::error!("[DAV] MKCOL 创建目录失败: path={} err={}", full_rel, e);
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let _ =
@@ -624,6 +724,13 @@ pub(crate) async fn move_or_copy(
     if validate_name(&d_name).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // P1-7：d_parent 是相对用户根的目的父路径——会写入 .dav_disp 元数据，崩溃恢复期
+    // 按 {username}/{parent}/{fname} 还原。含 `..`/空段/绝对路径时，恶意 Destination
+    // 可经恢复流程把文件写进其他用户子树，必须逐段白名单校验（空串=用户根，规范化语义不变）
+    let d_parent = match validate_rel_path(&d_parent) {
+        Ok(p) => p,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     // 同位置移动 = 无操作
     if src_rel == dest_rel {
         return StatusCode::NO_CONTENT.into_response();
@@ -643,7 +750,19 @@ pub(crate) async fn move_or_copy(
         Ok(s) => s,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if sb.try_exists(&dst_rel_full).unwrap_or(false) && !overwrite {
+    // P2-17：目标存在性检查——Err 是真实异常，记警告后按“不存在”降级（对外行为不变）
+    let dst_exists = match sb.try_exists(&dst_rel_full) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "[DAV] MOVE/COPY 目标存在性检查异常: path={} err={}",
+                dst_rel_full,
+                e
+            );
+            false
+        }
+    };
+    if dst_exists && !overwrite {
         return StatusCode::PRECONDITION_FAILED.into_response();
     }
     // 覆盖目标：先移走旧目标（物理 + DB 行暂存），移动成功后再清理。
@@ -666,16 +785,28 @@ pub(crate) async fn move_or_copy(
         String,
         Vec<DisplacedFileRow>,
     )> = None;
-    if sb.try_exists(&dst_rel_full).unwrap_or(false) {
+    if dst_exists {
         // M9：位移目标放在 uploads/.dav_disp（不在 TMP_DIR 内——24h 临时清扫不得触碰），
         // 并落一份 JSON 元数据（目标路径 + 暂存 DB 行），崩溃后由启动任务 recover_dav_disp 还原
         let disp_uuid = uuid::Uuid::new_v4().to_string();
         let disp_dir = std::path::Path::new(crate::constants::DAV_DISP_DIR);
-        let _ = std::fs::create_dir_all(disp_dir);
+        if let Err(e) = std::fs::create_dir_all(disp_dir) {
+            tracing::error!(
+                "[DAV] 创建位移目录失败: path={} err={}",
+                disp_dir.display(),
+                e
+            );
+        }
         let disp_rel = format!("{}/{}.d", crate::constants::DAV_DISP_DIR, disp_uuid);
         let _disp_path = disp_dir.join(format!("{disp_uuid}.d"));
         let meta_path = disp_dir.join(format!("{disp_uuid}.json"));
-        if sb.rename(&dst_rel_full, &disp_rel).is_err() {
+        if let Err(e) = sb.rename(&dst_rel_full, &disp_rel) {
+            tracing::error!(
+                "[DAV] 覆盖目标位移 rename 失败: src={} dst={} err={}",
+                dst_rel_full,
+                disp_rel,
+                e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         let child_prefix = if d_parent.is_empty() {
@@ -688,7 +819,7 @@ pub(crate) async fn move_or_copy(
             )
         };
         // 暂存目标及其子树的 DB 行（失败回滚时重插）
-        let rows: Vec<DisplacedFileRow> = sqlx::query_as(
+        let rows: Vec<DisplacedFileRow> = match sqlx::query_as(
             "SELECT name, parent_path, is_dir, size_mb, identifier FROM files WHERE username = ? AND ((name = ? AND parent_path = ?) OR parent_path LIKE ? ESCAPE '\\')",
         )
         .bind(&user.username)
@@ -697,7 +828,17 @@ pub(crate) async fn move_or_copy(
         .bind(&child_prefix)
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "[DAV] 覆盖目标 DB 行暂存查询失败（失败回滚将无法重插旧行）: dest={} err={}",
+                    dest_rel,
+                    e
+                );
+                Vec::new()
+            }
+        };
         let _ =
             sqlx::query("DELETE FROM files WHERE username = ? AND name = ? AND parent_path = ?")
                 .bind(&user.username)
@@ -723,7 +864,13 @@ pub(crate) async fn move_or_copy(
                 "identifier": r.identifier,
             })).collect::<Vec<_>>(),
         });
-        let _ = std::fs::write(&meta_path, meta.to_string());
+        if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
+            tracing::error!(
+                "[DAV] 覆盖位移元数据写入失败（崩溃恢复将无法还原目标）: path={} err={}",
+                meta_path.display(),
+                e
+            );
+        }
         let displaced_logical = logical_path(&d_parent, &d_name);
         displaced = Some((
             disp_rel,
@@ -736,6 +883,16 @@ pub(crate) async fn move_or_copy(
     }
 
     let (s_parent, s_name) = split_last(src_rel);
+    // P1-7：src 侧同样逐段白名单——含 `..` 的请求路径会让 MOVE/COPY 的磁盘意图落到
+    // 其他用户子树。rename_core/move_core 内部已有同类校验，但 copy_recursive 没有，
+    // 统一在入口拦截可覆盖全部路径（父为空=用户根）
+    let s_parent = match validate_rel_path(&s_parent) {
+        Ok(p) => p,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if validate_name(&s_name).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let result = if is_move {
         // 目标父目录需存在（物理经沙箱逐级创建 + 目录行）
         let dst_parent_rel = format!("{}/{}", user.username, d_parent);
@@ -994,8 +1151,13 @@ pub(crate) async fn delete_item(pool: &SqlitePool, user: &DavUser, path: &str) -
         Ok(s) => s,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    if !sb.try_exists(&full_rel).unwrap_or(false) {
-        return StatusCode::NOT_FOUND.into_response();
+    match sb.try_exists(&full_rel) {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::warn!("[DAV] DELETE 存在性检查异常: path={} err={}", full_rel, e);
+            return StatusCode::NOT_FOUND.into_response();
+        }
     }
     let (parent, name) = split_last(rel);
     // 进回收站（可还原），与网页删除语义一致

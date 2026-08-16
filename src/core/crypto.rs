@@ -54,9 +54,20 @@ pub fn generate_random_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
     const LEN: usize = 24;
+    // 拒绝采样消除取模偏差（P2-10）：256 % 70 != 0，直接取模会让前 46 个字符
+    // 概率 4/256 vs 后 24 个字符 3/256。只接受 [0, 70*3) 区间的随机字节，
+    // 落在 [210, 256) 的字节拒绝重取——分布完全均匀。
+    let max_acceptable = (u8::MAX as usize / CHARSET.len()) * CHARSET.len(); // 3*70 = 210
     let mut buf = [0u8; LEN];
-    getrandom::fill(&mut buf).expect("RNG failure");
-    buf.iter()
-        .map(|&b| CHARSET[(b as usize) % CHARSET.len()] as char)
-        .collect()
+    let mut filled = 0;
+    while filled < LEN {
+        let mut byte = [0u8; 1];
+        getrandom::fill(&mut byte).expect("RNG failure");
+        let b = byte[0] as usize;
+        if b < max_acceptable {
+            buf[filled] = CHARSET[b % CHARSET.len()];
+            filled += 1;
+        }
+    }
+    buf.iter().map(|&c| c as char).collect()
 }

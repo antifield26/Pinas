@@ -226,7 +226,46 @@ pub async fn recover_dav_disp(pool: &SqlitePool) {
             warn!("[journal] dav 位移元数据缺字段，跳过: {}", uuid);
             continue;
         }
+        // P1-7：恢复目标 {username}/{parent}/{fname} 会经沙箱直接移动进 uploads 根——
+        // 元数据若含 `..`/空段/绝对路径（恶意 Destination 触发的历史元数据，或被篡改/畸形
+        // 数据），会在崩溃恢复期把文件写到其他用户子树。逐项白名单校验；
+        // 失败仅跳过并 warn、保留元数据文件供人工检查（保守，不删除）
+        let username = match crate::handlers::utils::validate_name(&username) {
+            Ok(()) => username,
+            Err(_) => {
+                warn!(
+                    "[journal] dav 位移元数据 username 非法，跳过（保留待人工检查）: {}",
+                    uuid
+                );
+                continue;
+            }
+        };
+        let parent = match crate::handlers::utils::validate_rel_path(&parent) {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    "[journal] dav 位移元数据 parent 非法，跳过（保留待人工检查）: {} parent={}",
+                    uuid, parent
+                );
+                continue;
+            }
+        };
+        if crate::handlers::utils::validate_name(&fname).is_err() {
+            warn!(
+                "[journal] dav 位移元数据 name 非法，跳过（保留待人工检查）: {} name={}",
+                uuid, fname
+            );
+            continue;
+        }
         let target_rel = format!("{username}/{parent}/{fname}");
+        // 防篡改兜底断言：拼接路径首段必须等于 username（用户目录恒为 uploads/{username}）
+        if target_rel.split('/').next() != Some(username.as_str()) {
+            warn!(
+                "[journal] dav 位移目标路径首段与 username 不符，跳过（保留待人工检查）: {}",
+                uuid
+            );
+            continue;
+        }
         if sb.try_exists(&target_rel).unwrap_or(false) {
             // 覆盖已完成：位移文件可清理
             let _ = sb.remove_dir_all(&disp_rel);
